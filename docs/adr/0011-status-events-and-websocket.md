@@ -89,6 +89,7 @@ recipient or the content.
   the two is lost. A client keeps, for each notification, the status with the latest `at`.
 - **Limits:**
   - 1000 subscriptions per connection; a batch counts as one;
+  - at most 100 ids per subscribe message, since each new id costs one snapshot read;
   - client messages up to 64 KiB;
   - 256 messages may be queued per connection, and a client that falls further behind is
     disconnected with close code 1008;

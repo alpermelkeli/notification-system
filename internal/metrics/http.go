@@ -46,12 +46,27 @@ func NewHTTP(reg prometheus.Registerer) *HTTP {
 }
 
 // Middleware records every request under its chi route pattern (e.g. /v1/notifications/{id}),
-// so ids do not explode the label set. It must run inside a chi router.
-func (m *HTTP) Middleware(next http.Handler) http.Handler {
-	if m == nil {
-		return next
+// so ids do not explode the label set. Requests to skipPaths, such as long-lived WebSocket
+// connections that have metrics of their own, are not recorded. It must run inside a chi router.
+func (m *HTTP) Middleware(skipPaths ...string) func(http.Handler) http.Handler {
+	skip := make(map[string]bool, len(skipPaths))
+	for _, p := range skipPaths {
+		skip[p] = true
 	}
+	return func(next http.Handler) http.Handler {
+		if m == nil {
+			return next
+		}
+		return m.record(next, skip)
+	}
+}
+
+func (m *HTTP) record(next http.Handler, skip map[string]bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if skip[r.URL.Path] {
+			next.ServeHTTP(w, r)
+			return
+		}
 		start := time.Now()
 		m.inFlight.Inc()
 		defer m.inFlight.Dec()
