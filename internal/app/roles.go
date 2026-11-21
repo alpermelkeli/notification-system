@@ -19,6 +19,7 @@ import (
 	"github.com/alpermelkeli/notification-system/internal/provider"
 	"github.com/alpermelkeli/notification-system/internal/queue"
 	"github.com/alpermelkeli/notification-system/internal/ratelimit"
+	"github.com/alpermelkeli/notification-system/internal/retry"
 	"github.com/alpermelkeli/notification-system/internal/storage"
 	"github.com/alpermelkeli/notification-system/internal/worker"
 	"github.com/alpermelkeli/notification-system/migrations"
@@ -96,7 +97,7 @@ func RunDispatcher(ctx context.Context, cfg config.Config, logger *slog.Logger) 
 	dead := queue.NewDeadLetters(kafka, dispatcher.PublishTimeout)
 	reaper := dispatcher.NewReaper(store, dispatcher.NewKafkaOffsets(kadm.NewClient(kafka)), dead, logger, dispatcher.ReaperOptions{
 		Interval: cfg.Dispatcher.ReaperInterval, Grace: cfg.Dispatcher.ReaperGrace,
-		StuckAfter: cfg.Dispatcher.ReaperStuckAfter, MaxAttempts: cfg.Worker.MaxAttempts,
+		StuckAfter: cfg.Dispatcher.ReaperStuckAfter, MaxAttempts: cfg.Retry.MaxAttempts,
 	})
 
 	var wg sync.WaitGroup
@@ -142,12 +143,24 @@ func RunWorker(ctx context.Context, cfg config.Config, logger *slog.Logger) erro
 	if err != nil {
 		return err
 	}
+	// Dead letters go through their own producer: the consumers' clients are per channel and leave
+	// their group on shutdown.
+	producer, err := platform.NewKafkaClient(cfg.KafkaBrokers,
+		append(dispatcher.ProducerOptions(), kgo.ClientID("worker-dlq-"+cfg.InstanceID))...)
+	if err != nil {
+		return err
+	}
+	defer producer.Close()
+
 	store := storage.New(pool, storage.Options{IdempotencyTTL: cfg.IdempotencyTTL})
 	policy := worker.DefaultPolicy()
 	policy.AgingRate, policy.MinShareEvery = cfg.Worker.AgingRate, cfg.Worker.MinShareEvery
 	opts := worker.Options{
 		Concurrency: cfg.Worker.Concurrency, Lease: cfg.Worker.Lease,
-		RetryDelay: cfg.Worker.RetryDelay, MaxAttempts: cfg.Worker.MaxAttempts, Policy: &policy,
+		Policy: &policy, DeadLetters: queue.NewDeadLetters(producer, dispatcher.PublishTimeout),
+		Retry: retry.Policy{
+			BaseDelay: cfg.Retry.BaseDelay, MaxDelay: cfg.Retry.MaxDelay, MaxAttempts: cfg.Retry.MaxAttempts,
+		},
 	}
 
 	var wg sync.WaitGroup

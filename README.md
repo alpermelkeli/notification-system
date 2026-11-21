@@ -94,8 +94,12 @@ curl localhost:8081/stats        # accepted/rejected per channel + rate in the l
 - Measured on the compose stack (1000 `low` SMS, then 100 `high`): all 1100 sent in 11.1 s with one
   worker and 11.4 s with three (the floor at 100/s is 11.0 s). The provider never saw more than 100
   SMS in a second, and the 100 `high` were delivered within 1.4 s despite the backlog.
-- Until Phase 6, every failed attempt is retried after `RETRY_DELAY` until `MAX_ATTEMPTS`, then the
-  notification is `failed`.
+- **Delivery outcome** ([ADR-0005](docs/adr/0005-delivery-retry-and-failure-handling.md)):
+  `2xx` is `sent`. Timeouts, connection errors, `5xx`, `408` and `425` are retried with exponential
+  backoff and equal jitter (`RETRY_BASE_DELAY` doubling up to `RETRY_MAX_DELAY`); a `429` is retried
+  after at least its `Retry-After` and pauses the whole fleet. Any other `4xx` is permanent. A
+  permanent failure, or a failure of the last of `MAX_ATTEMPTS` attempts, moves the notification to
+  `failed` and publishes a dead letter to `notifications.dlq`.
 
 ### Design decisions
 | ADR | Decision |
@@ -271,8 +275,9 @@ stop the process with a message listing every problem. Copy [`.env.example`](.en
 | `LEASE_DURATION` | `30s` | worker | Claim lifetime; must be at least `PROVIDER_TIMEOUT` + 5s. On shutdown a worker finishes in-flight sends, each bounded by the lease, so the worker's compose `stop_grace_period` (40s) must exceed it |
 | `RATE_LIMIT_SMS` / `_EMAIL` / `_PUSH` | `100` | worker | Messages per second per channel, across all workers (FR-2.2) |
 | `RATE_LIMIT_BURST` | `1` | worker | Sends allowed back to back after an idle period; above 1 a second can exceed the limit by `burst - 1` |
-| `RETRY_DELAY` | `5s` | worker | Delay before a failed attempt is retried (exponential backoff in Phase 6) |
-| `MAX_ATTEMPTS` | `5` | worker | Attempt budget; the last failure marks the notification `failed` |
+| `RETRY_BASE_DELAY` | `5s` | worker | Backoff ceiling of the first retry; it doubles per attempt and the delay is jittered between half the ceiling and the ceiling |
+| `RETRY_MAX_DELAY` | `5m` | worker | Cap of the backoff ceiling; must not be shorter than `RETRY_BASE_DELAY` |
+| `MAX_ATTEMPTS` | `5` | worker, dispatcher | Attempt budget; the last failure (or an expired lease on the last attempt) marks the notification `failed` |
 | `SCHEDULER_AGING_RATE` | `2` | worker | Priority points gained per second waited (capped per priority, [ADR-0006](docs/adr/0006-rate-limiting-and-priority-scheduling.md)) |
 | `SCHEDULER_MIN_SHARE` | `10` | worker | Every Nth send goes to `normal`/`low` under a `high` flood (0 disables) |
 | `MOCK_ADDR` | `:8081` | mockprovider | Listen address |

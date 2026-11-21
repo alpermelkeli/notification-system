@@ -25,6 +25,7 @@ import (
 	"github.com/alpermelkeli/notification-system/internal/logging"
 	"github.com/alpermelkeli/notification-system/internal/provider"
 	"github.com/alpermelkeli/notification-system/internal/queue"
+	"github.com/alpermelkeli/notification-system/internal/retry"
 )
 
 // Store is the persistence a worker needs. *storage.Store implements it.
@@ -39,6 +40,12 @@ type Store interface {
 // Sender delivers a message. *provider.Client implements it.
 type Sender interface {
 	Send(ctx context.Context, m provider.Message) (provider.Result, error)
+}
+
+// DeadLetterPublisher publishes the dead letters of failed notifications. *queue.DeadLetters
+// implements it.
+type DeadLetterPublisher interface {
+	Publish(ctx context.Context, ns ...domain.Notification) error
 }
 
 // Limiter hands out send tokens. *ratelimit.Limiter implements it.
@@ -58,10 +65,11 @@ type Options struct {
 	// Lease is how long a claim lasts. It must cover the provider timeout and the outcome write;
 	// an expired lease is reaped and the notification retried. Default 30s.
 	Lease time.Duration
-	// RetryDelay is the delay before a failed attempt is retried. Default 5s.
-	RetryDelay time.Duration
-	// MaxAttempts is the attempt budget; the last failure marks the notification failed. Default 5.
-	MaxAttempts int
+	// Retry is the backoff and attempt budget of failed sends. Zero fields take the ADR-0005
+	// defaults.
+	Retry retry.Policy
+	// DeadLetters, if set, receives every notification this worker moves to failed.
+	DeadLetters DeadLetterPublisher
 	// CommitInterval is how often watermarks are committed. Default 1s.
 	CommitInterval time.Duration
 	// RevokeTimeout bounds the wait for in-flight sends when partitions are revoked. Default 10s.
@@ -77,8 +85,7 @@ func (o *Options) defaults() {
 	setDefault(&o.HighWater, 50)
 	setDefault(&o.LowWater, 25)
 	setDefault(&o.Lease, 30*time.Second)
-	setDefault(&o.RetryDelay, 5*time.Second)
-	setDefault(&o.MaxAttempts, 5)
+	o.Retry = o.Retry.WithDefaults()
 	setDefault(&o.CommitInterval, time.Second)
 	setDefault(&o.RevokeTimeout, 10*time.Second)
 	if o.LowWater >= o.HighWater {

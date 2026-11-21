@@ -3,7 +3,8 @@ package worker
 import (
 	"context"
 	"errors"
-	"net/http"
+	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/alpermelkeli/notification-system/internal/domain"
@@ -44,7 +45,7 @@ func (w *Worker) process(ctx context.Context, r record) {
 			// No token, no send. Hand the attempt back; it is retried without consuming it.
 			log.WarnContext(ctx, "no rate-limit token after claim; releasing", "err", err)
 			if err := w.persist(ctx, func() error {
-				_, err := w.store.Release(ctx, lease, w.opts.RetryDelay, "rate limiter unavailable")
+				_, err := w.store.Release(ctx, lease, w.opts.Retry.BaseDelay, "rate limiter unavailable")
 				return err
 			}); err != nil {
 				log.ErrorContext(ctx, "release not persisted; the lease will expire and be retried", "err", err)
@@ -60,20 +61,54 @@ func (w *Worker) process(ctx context.Context, r record) {
 		Channel:        n.Channel,
 		Content:        n.Content,
 	})
+	w.settle(ctx, log, n, lease, res, sendErr)
+}
 
-	var outcome func() error
+// settle persists the outcome of a send (ADR-0005, FR-3.1–3.3):
+//
+//	2xx                      → sent
+//	permanent (other 4xx)    → failed + dead letter
+//	retryable or 429, budget → retrying after the jittered backoff (429: at least Retry-After)
+//	retryable or 429, last   → failed + dead letter
+func (w *Worker) settle(ctx context.Context, log *slog.Logger, n domain.Notification, lease domain.Lease,
+	res provider.Result, sendErr error,
+) {
+	class := provider.Classify(sendErr)
+	var cool time.Duration
+	if class == provider.ClassRateLimited {
+		cool = w.cooldown(ctx, sendErr) // pauses the fleet even when this attempt was the last
+	}
+
+	var (
+		outcome func() error
+		failed  *domain.Notification
+	)
+	fail := func(cause string) {
+		outcome = func() error {
+			row, err := w.store.MarkFailed(ctx, lease, cause)
+			if err == nil {
+				failed = &row
+			}
+			return err
+		}
+	}
 	switch {
-	case sendErr == nil:
+	case class == provider.ClassDelivered:
 		outcome = func() error { _, err := w.store.MarkSent(ctx, lease, res.MessageID); return err }
 		log.DebugContext(ctx, "delivered", "provider_message_id", res.MessageID)
-	case n.Attempts >= w.opts.MaxAttempts:
-		outcome = func() error { _, err := w.store.MarkFailed(ctx, lease, sendErr.Error()); return err }
-		log.ErrorContext(ctx, "delivery failed; attempts exhausted", "err", sendErr)
+	case class == provider.ClassPermanent:
+		fail(class.String() + ": " + sendErr.Error())
+		log.ErrorContext(ctx, "delivery failed permanently", "err", sendErr)
+	case w.opts.Retry.Exhausted(n.Attempts):
+		fail(fmt.Sprintf("attempts exhausted (%d), last %s: %s", n.Attempts, class, sendErr))
+		log.ErrorContext(ctx, "delivery failed; attempts exhausted", "err", sendErr, "class", class.String())
 	default:
-		delay := w.retryDelay(ctx, sendErr)
-		outcome = func() error { _, err := w.store.MarkRetrying(ctx, lease, delay, sendErr.Error()); return err }
-		log.WarnContext(ctx, "delivery failed; will retry", "err", sendErr, "retry_in", delay)
+		delay := max(w.opts.Retry.Delay(n.Attempts), cool)
+		cause := class.String() + ": " + sendErr.Error()
+		outcome = func() error { _, err := w.store.MarkRetrying(ctx, lease, delay, cause); return err }
+		log.WarnContext(ctx, "delivery failed; will retry", "err", sendErr, "class", class.String(), "retry_in", delay)
 	}
+
 	if err := w.persist(ctx, outcome); err != nil {
 		if errors.Is(err, domain.ErrLeaseLost) {
 			// The lease expired and the row was reaped; the newer claim owns the outcome.
@@ -81,26 +116,28 @@ func (w *Worker) process(ctx context.Context, r record) {
 			return
 		}
 		log.ErrorContext(ctx, "outcome not persisted; the lease will expire and be retried", "err", err)
+		return
+	}
+	if failed != nil && w.opts.DeadLetters != nil {
+		// Best effort, after the commit: the failed row is the source of truth (ADR-0005).
+		if err := w.opts.DeadLetters.Publish(ctx, *failed); err != nil {
+			log.WarnContext(ctx, "dead letter not published", "err", err)
+		}
 	}
 }
 
-// retryDelay returns the delay before the next attempt. A 429 also pauses the whole fleet for the
-// provider's Retry-After (ADR-0006). Phase 6 replaces the fixed delay with exponential backoff and
-// classifies permanent failures (ADR-0005).
-func (w *Worker) retryDelay(ctx context.Context, sendErr error) time.Duration {
-	delay := w.opts.RetryDelay
+// cooldown handles a 429: it pauses the whole fleet's sends on this channel for the provider's
+// Retry-After (ADR-0006) and returns the pause, which is also the minimum delay of the retry.
+func (w *Worker) cooldown(ctx context.Context, sendErr error) time.Duration {
 	var pe *provider.Error
-	if errors.As(sendErr, &pe) && pe.StatusCode == http.StatusTooManyRequests {
-		cool := min(pe.RetryAfter, ratelimit.MaxCooldown) // a bogus Retry-After must not park the row for days
-		if cool <= 0 {
-			cool = time.Second
-		}
-		if err := w.limiter.Cooldown(ctx, w.channel, cool); err != nil {
-			w.logger.WarnContext(ctx, "could not set the rate-limit cool-down", "err", err)
-		}
-		delay = max(delay, cool)
+	cool := time.Second
+	if errors.As(sendErr, &pe) && pe.RetryAfter > 0 {
+		cool = min(pe.RetryAfter, ratelimit.MaxCooldown) // a bogus Retry-After must not park the row for days
 	}
-	return delay
+	if err := w.limiter.Cooldown(ctx, w.channel, cool); err != nil {
+		w.logger.WarnContext(ctx, "could not set the rate-limit cool-down", "err", err)
+	}
+	return cool
 }
 
 // claim claims the record's notification. If the dispatcher has not committed the row as queued

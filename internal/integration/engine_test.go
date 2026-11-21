@@ -26,6 +26,7 @@ import (
 	"github.com/alpermelkeli/notification-system/internal/provider"
 	"github.com/alpermelkeli/notification-system/internal/queue"
 	"github.com/alpermelkeli/notification-system/internal/ratelimit"
+	"github.com/alpermelkeli/notification-system/internal/retry"
 	"github.com/alpermelkeli/notification-system/internal/storage"
 	"github.com/alpermelkeli/notification-system/internal/testinfra"
 	"github.com/alpermelkeli/notification-system/internal/worker"
@@ -180,7 +181,7 @@ func startEngine(t *testing.T, store *storage.Store, providerURL string, workers
 	}
 	for range workers {
 		w := worker.New(domain.ChannelSMS, store, sender, limiter, quiet, worker.Options{
-			RetryDelay: 200 * time.Millisecond, MaxAttempts: 3, Lease: 10 * time.Second,
+			Retry: retry.Policy{BaseDelay: 200 * time.Millisecond, MaxAttempts: 3}, Lease: 10 * time.Second,
 			CommitInterval: 100 * time.Millisecond,
 		})
 		cl, err := kgo.NewClient(append(w.ConsumerOptions(), kgo.SeedBrokers(kafkaAddr))...)

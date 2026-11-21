@@ -18,6 +18,7 @@ import (
 	"github.com/alpermelkeli/notification-system/internal/domain"
 	"github.com/alpermelkeli/notification-system/internal/provider"
 	"github.com/alpermelkeli/notification-system/internal/queue"
+	"github.com/alpermelkeli/notification-system/internal/retry"
 )
 
 var discard = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -27,12 +28,13 @@ type fakeStore struct {
 	mu         sync.Mutex
 	rows       map[uuid.UUID]*domain.Notification
 	outcomes   map[uuid.UUID]string // "sent", "retrying 5s", "failed"
+	causes     map[uuid.UUID]string // last_error of retrying and failed outcomes
 	claimErr   error
 	claimDelay time.Duration
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{rows: map[uuid.UUID]*domain.Notification{}, outcomes: map[uuid.UUID]string{}}
+	return &fakeStore{rows: map[uuid.UUID]*domain.Notification{}, outcomes: map[uuid.UUID]string{}, causes: map[uuid.UUID]string{}}
 }
 
 func (f *fakeStore) add(pr domain.Priority, status domain.Status, attempts int) domain.Notification {
@@ -76,7 +78,13 @@ func (f *fakeStore) Claim(_ context.Context, id uuid.UUID, _ time.Time, _ time.D
 	return *n, nil
 }
 
-func (f *fakeStore) finish(l domain.Lease, to domain.Status, outcome string) (domain.Notification, error) {
+func (f *fakeStore) cause(id uuid.UUID) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.causes[id]
+}
+
+func (f *fakeStore) finish(l domain.Lease, to domain.Status, outcome, cause string) (domain.Notification, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	n := f.rows[l.NotificationID]
@@ -84,24 +92,55 @@ func (f *fakeStore) finish(l domain.Lease, to domain.Status, outcome string) (do
 		return domain.Notification{}, domain.ErrLeaseLost
 	}
 	n.Status, n.LeaseToken = to, nil
+	if cause != "" {
+		n.LastError = &cause
+		f.causes[n.ID] = cause
+	}
 	f.outcomes[n.ID] = outcome
 	return *n, nil
 }
 
 func (f *fakeStore) MarkSent(_ context.Context, l domain.Lease, id string) (domain.Notification, error) {
-	return f.finish(l, domain.StatusSent, "sent "+id)
+	return f.finish(l, domain.StatusSent, "sent "+id, "")
 }
 
-func (f *fakeStore) MarkRetrying(_ context.Context, l domain.Lease, d time.Duration, _ string) (domain.Notification, error) {
-	return f.finish(l, domain.StatusRetrying, "retrying "+d.String())
+func (f *fakeStore) MarkRetrying(_ context.Context, l domain.Lease, d time.Duration, cause string) (domain.Notification, error) {
+	return f.finish(l, domain.StatusRetrying, "retrying "+d.String(), cause)
 }
 
 func (f *fakeStore) Release(_ context.Context, l domain.Lease, _ time.Duration, _ string) (domain.Notification, error) {
-	return f.finish(l, domain.StatusRetrying, "released")
+	return f.finish(l, domain.StatusRetrying, "released", "")
 }
 
-func (f *fakeStore) MarkFailed(_ context.Context, l domain.Lease, _ string) (domain.Notification, error) {
-	return f.finish(l, domain.StatusFailed, "failed")
+func (f *fakeStore) MarkFailed(_ context.Context, l domain.Lease, cause string) (domain.Notification, error) {
+	return f.finish(l, domain.StatusFailed, "failed", cause)
+}
+
+// fakeDeadLetters records published dead letters.
+type fakeDeadLetters struct {
+	mu   sync.Mutex
+	got  []domain.Notification
+	fail bool
+}
+
+func (d *fakeDeadLetters) Publish(_ context.Context, ns ...domain.Notification) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.got = append(d.got, ns...)
+	if d.fail {
+		return errors.New("broker down")
+	}
+	return nil
+}
+
+func (d *fakeDeadLetters) ids() []uuid.UUID {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var out []uuid.UUID
+	for _, n := range d.got {
+		out = append(out, n.ID)
+	}
+	return out
 }
 
 // fakeSender records the order of sends and answers with fn.
@@ -194,6 +233,7 @@ func (f *fakeFetch) events() []string {
 // harness runs a worker engine without Kafka; records are fed with enqueue.
 type harness struct {
 	w       *Worker
+	dead    *fakeDeadLetters
 	store   *fakeStore
 	sender  *fakeSender
 	limiter *fakeLimiter
@@ -215,9 +255,12 @@ func newHarness(t *testing.T, limiter *fakeLimiter, opts Options) *harness {
 		store: newFakeStore(), sender: &fakeSender{}, limiter: limiter,
 		fetch:     &fakeFetch{paused: map[string]bool{}},
 		committed: map[string]map[int32]int64{}, offsets: map[int32]int64{},
-		done: make(chan struct{}),
+		done: make(chan struct{}), dead: &fakeDeadLetters{},
 	}
 	opts.CommitInterval = 10 * time.Millisecond
+	if opts.DeadLetters == nil {
+		opts.DeadLetters = h.dead
+	}
 	h.w = New(domain.ChannelSMS, h.store, h.sender, limiter, discard, opts)
 	h.w.fetch = h.fetch
 	h.w.commit = func(_ context.Context, offsets map[string]map[int32]kgo.EpochOffset) error {
@@ -305,40 +348,83 @@ func TestDeliversAndCommitsWatermark(t *testing.T) {
 	}
 }
 
+// halfJitter makes the retry delay deterministic: the lower bound d/2 of equal jitter.
+func halfJitter() float64 { return 0 }
+
 func TestFailureOutcomes(t *testing.T) {
-	h := newHarness(t, nil, Options{RetryDelay: 5 * time.Second, MaxAttempts: 3})
+	h := newHarness(t, nil, Options{Retry: retry.Policy{BaseDelay: 4 * time.Second, MaxAttempts: 3, Rand: halfJitter}})
 	h.sender.fn = func(m provider.Message) (provider.Result, error) {
 		switch m.To {
 		case "throttled":
 			return provider.Result{}, &provider.Error{StatusCode: http.StatusTooManyRequests, RetryAfter: 9 * time.Second}
+		case "invalid":
+			return provider.Result{}, &provider.Error{StatusCode: http.StatusBadRequest, Body: "bad recipient"}
 		default:
 			return provider.Result{}, &provider.Error{StatusCode: http.StatusServiceUnavailable}
 		}
 	}
 	first := h.store.add(domain.PriorityNormal, domain.StatusQueued, 0)
+	second := h.store.add(domain.PriorityNormal, domain.StatusQueued, 1)
 	last := h.store.add(domain.PriorityNormal, domain.StatusQueued, 2) // this claim is attempt 3 of 3
 	throttled := h.store.add(domain.PriorityNormal, domain.StatusQueued, 0)
+	invalid := h.store.add(domain.PriorityNormal, domain.StatusQueued, 0)
 	h.store.mu.Lock()
 	h.store.rows[throttled.ID].Recipient = "throttled"
+	h.store.rows[invalid.ID].Recipient = "invalid"
 	h.store.mu.Unlock()
-	for _, n := range []domain.Notification{first, last, throttled} {
+	for _, n := range []domain.Notification{first, second, last, throttled, invalid} {
 		h.feed(t, n, 0)
 	}
-	eventually(t, "outcomes", func() bool { return h.committedAt(normalTopic, 0) == 3 })
+	eventually(t, "outcomes", func() bool { return h.committedAt(normalTopic, 0) == 5 })
 
-	if got := h.store.outcome(first.ID); got != "retrying 5s" {
-		t.Errorf("first attempt: %q", got)
-	}
-	if got := h.store.outcome(last.ID); got != "failed" {
-		t.Errorf("last attempt: %q", got)
-	}
-	if got := h.store.outcome(throttled.ID); got != "retrying 9s" {
-		t.Errorf("429: %q, want the Retry-After as delay", got)
+	for _, c := range []struct {
+		name          string
+		n             domain.Notification
+		outcome, last string
+	}{
+		// Backoff ceilings 4s, 8s; with halfJitter the delay is half the ceiling.
+		{"first attempt", first, "retrying 2s", "retryable: provider returned 503"},
+		{"second attempt", second, "retrying 4s", "retryable: provider returned 503"},
+		{"last attempt", last, "failed", "attempts exhausted (3), last retryable: provider returned 503"},
+		// The backoff is 2s, but the provider asked for 9s.
+		{"429", throttled, "retrying 9s", "rate_limited: provider returned 429"},
+		{"400", invalid, "failed", "permanent: provider returned 400: bad recipient"},
+	} {
+		if got := h.store.outcome(c.n.ID); got != c.outcome {
+			t.Errorf("%s: outcome %q, want %q", c.name, got, c.outcome)
+		}
+		if got := h.store.cause(c.n.ID); got != c.last {
+			t.Errorf("%s: last error %q, want %q", c.name, got, c.last)
+		}
 	}
 	h.limiter.mu.Lock()
-	defer h.limiter.mu.Unlock()
 	if !slices.Equal(h.limiter.cooldowns, []time.Duration{9 * time.Second}) {
 		t.Errorf("cool-downs = %v, want one fleet-wide 9s cool-down", h.limiter.cooldowns)
+	}
+	h.limiter.mu.Unlock()
+
+	// Exactly the two failed notifications are dead-lettered, carrying their last error.
+	ids := h.dead.ids()
+	if len(ids) != 2 || !slices.Contains(ids, last.ID) || !slices.Contains(ids, invalid.ID) {
+		t.Errorf("dead letters = %v, want %s and %s", ids, last.ID, invalid.ID)
+	}
+	for _, n := range h.dead.got {
+		if n.Status != domain.StatusFailed || n.LastError == nil {
+			t.Errorf("dead letter %s: status %s, last error %v", n.ID, n.Status, n.LastError)
+		}
+	}
+}
+
+func TestDeadLetterFailureDoesNotUndoTheOutcome(t *testing.T) {
+	h := newHarness(t, nil, Options{DeadLetters: &fakeDeadLetters{fail: true}})
+	h.sender.fn = func(provider.Message) (provider.Result, error) {
+		return provider.Result{}, &provider.Error{StatusCode: http.StatusUnprocessableEntity}
+	}
+	n := h.store.add(domain.PriorityHigh, domain.StatusQueued, 0)
+	h.feed(t, n, 0)
+	eventually(t, "committed", func() bool { return h.committedAt(queue.Topic(domain.ChannelSMS, domain.PriorityHigh), 0) == 1 })
+	if got := h.store.outcome(n.ID); got != "failed" {
+		t.Errorf("outcome %q, want failed", got)
 	}
 }
 
@@ -485,7 +571,7 @@ func TestSlowClaimTakesAFreshToken(t *testing.T) {
 }
 
 func TestHugeRetryAfterIsCapped(t *testing.T) {
-	h := newHarness(t, nil, Options{RetryDelay: time.Second})
+	h := newHarness(t, nil, Options{Retry: retry.Policy{BaseDelay: time.Second, Rand: halfJitter}})
 	h.sender.fn = func(provider.Message) (provider.Result, error) {
 		return provider.Result{}, &provider.Error{StatusCode: http.StatusTooManyRequests, RetryAfter: 24 * time.Hour}
 	}
