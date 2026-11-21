@@ -447,9 +447,11 @@ func (s *Store) ListenDue(ctx context.Context, notify func()) error {
 	}
 	// The LISTEN must not outlive this call on a connection returned to the pool.
 	defer func() {
-		if _, err := conn.Exec(context.WithoutCancel(ctx), "UNLISTEN *"); err != nil {
+		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		defer cancel()
+		if _, err := conn.Exec(cctx, "UNLISTEN *"); err != nil {
 			// Already failing; the pool drops closed connections.
-			_ = conn.Conn().Close(context.WithoutCancel(ctx))
+			_ = conn.Conn().Close(cctx)
 		}
 		conn.Release()
 	}()

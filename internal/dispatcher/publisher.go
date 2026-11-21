@@ -6,6 +6,7 @@ package dispatcher
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 
@@ -17,20 +18,29 @@ import (
 // Publisher publishes claim-check work messages (ADR-0002). The franz-go client is an
 // idempotent producer with acks=all by default, which the options below make explicit.
 type Publisher struct {
-	cl *kgo.Client
+	cl      *kgo.Client
+	timeout time.Duration
 }
+
+// PublishTimeout bounds one batch publish. The dispatcher holds the batch's row locks while it
+// publishes, and franz-go retries forever by default, so without a bound an unavailable partition
+// would keep up to BatchSize rows locked: their cancels would time out and the workers' claims of
+// records that did land would wait on the locks.
+const PublishTimeout = 10 * time.Second
 
 // ProducerOptions are the kgo options a publishing client must use.
 func ProducerOptions() []kgo.Opt {
 	return []kgo.Opt{
 		kgo.RequiredAcks(kgo.AllISRAcks()),
+		// Fail records that cannot be delivered in time instead of retrying forever.
+		kgo.RecordDeliveryTimeout(PublishTimeout),
 		// Records are keyed by notification id; the default partitioner hashes keys like the Java
 		// client, so a notification's records always land on the same partition.
 	}
 }
 
 // NewPublisher returns a publisher on cl, which must be built with ProducerOptions.
-func NewPublisher(cl *kgo.Client) *Publisher { return &Publisher{cl: cl} }
+func NewPublisher(cl *kgo.Client) *Publisher { return &Publisher{cl: cl, timeout: PublishTimeout} }
 
 // Publish implements storage.PublishFunc: it produces one record per notification, waits until
 // all are acknowledged and returns where each landed, in input order. If any record fails, the
@@ -47,6 +57,8 @@ func (p *Publisher) Publish(ctx context.Context, ns []domain.Notification) ([]st
 		records[i] = r
 		index[r] = i
 	}
+	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
 	results := p.cl.ProduceSync(ctx, records...)
 	if err := results.FirstErr(); err != nil {
 		return nil, fmt.Errorf("produce %d work records: %w", len(records), err)

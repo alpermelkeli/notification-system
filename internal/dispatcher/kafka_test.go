@@ -136,3 +136,24 @@ func commitSync(ctx context.Context, cl *kgo.Client, offsets map[string]map[int3
 	})
 	return commitErr
 }
+
+// TestPublishFailsWithinTheTimeout: a record that cannot be delivered (here its topic does not
+// exist and auto-creation is off) must fail the batch within the publish timeout, so the
+// dispatcher's transaction releases its row locks instead of waiting forever.
+func TestPublishFailsWithinTheTimeout(t *testing.T) {
+	cl := kafkaClient(t, ProducerOptions()...)
+	id := domain.NewIDAt(time.Now())
+	p := NewPublisher(cl)
+	p.timeout = time.Second
+	start := time.Now()
+	_, err := p.Publish(context.Background(), []domain.Notification{{
+		ID: id, CreatedAt: domain.IDTime(id), Channel: domain.ChannelPush, Priority: domain.PriorityHigh,
+		NextAttemptAt: time.Now(),
+	}})
+	if err == nil {
+		t.Fatal("publishing to a missing topic succeeded")
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("publish failed after %v, want about the 1s timeout", took)
+	}
+}

@@ -44,9 +44,11 @@ func NewRelay(store RelayStore, publish storage.PublishFunc, logger *slog.Logger
 	return &Relay{store: store, publish: publish, logger: logger, opts: opts, wake: make(chan struct{}, 1)}
 }
 
-// Run relays until ctx ends.
+// Run relays until ctx ends. It returns after its listener has released its connection.
 func (r *Relay) Run(ctx context.Context) {
-	go r.listen(ctx)
+	listening := make(chan struct{})
+	go func() { defer close(listening); r.listen(ctx) }()
+	defer func() { <-listening }()
 
 	backoff := newBackoff(100*time.Millisecond, 5*time.Second)
 	for {
