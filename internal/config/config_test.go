@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/alpermelkeli/notification-system/internal/domain"
 )
 
 func env(m map[string]string) lookupFunc {
@@ -41,7 +43,77 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadEngineDefaults(t *testing.T) {
+	cfg, err := load(env(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Dispatcher != (Dispatcher{
+		BatchSize: 500, PollInterval: 500 * time.Millisecond, ReaperInterval: 30 * time.Second,
+		ReaperGrace: time.Minute, ReaperStuckAfter: 24 * time.Hour,
+	}) {
+		t.Errorf("dispatcher defaults = %+v", cfg.Dispatcher)
+	}
+	w := cfg.Worker
+	if !reflect.DeepEqual(w.Channels, []domain.Channel{domain.ChannelSMS, domain.ChannelEmail, domain.ChannelPush}) ||
+		w.Concurrency != 20 || w.ProviderURL != "http://localhost:8081/" || w.ProviderTimeout != 10*time.Second ||
+		w.Lease != 30*time.Second || w.RateLimitBurst != 10 || w.RetryDelay != 5*time.Second ||
+		w.MaxAttempts != 5 || w.AgingRate != 2 || w.MinShareEvery != 10 {
+		t.Errorf("worker defaults = %+v", w)
+	}
+	for _, c := range domain.Channels {
+		if w.RateLimits[c] != 100 {
+			t.Errorf("rate limit of %s = %d, want 100", c, w.RateLimits[c])
+		}
+	}
+}
+
+func TestLoadEngineOverrides(t *testing.T) {
+	cfg, err := load(env(map[string]string{
+		"WORKER_CHANNELS":      "SMS, push,sms",
+		"PROVIDER_URL":         "https://webhook.site/abc",
+		"RATE_LIMIT_EMAIL":     "600",
+		"SCHEDULER_AGING_RATE": "0.5",
+		"SCHEDULER_MIN_SHARE":  "0",
+		"REAPER_GRACE":         "2m",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := cfg.Worker
+	if !reflect.DeepEqual(w.Channels, []domain.Channel{domain.ChannelSMS, domain.ChannelPush}) ||
+		w.ProviderURL != "https://webhook.site/abc" || w.RateLimits[domain.ChannelEmail] != 600 ||
+		w.AgingRate != 0.5 || w.MinShareEvery != 0 || cfg.Dispatcher.ReaperGrace != 2*time.Minute {
+		t.Errorf("worker = %+v, dispatcher = %+v", w, cfg.Dispatcher)
+	}
+}
+
+func TestLoadRejectsInvalidEngineSettings(t *testing.T) {
+	_, err := load(env(map[string]string{
+		"WORKER_CHANNELS":      "sms,fax",
+		"PROVIDER_URL":         "webhook.site/abc",
+		"SCHEDULER_AGING_RATE": "fast",
+		"RATE_LIMIT_SMS":       "0",
+	}))
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	for _, key := range []string{"WORKER_CHANNELS", "PROVIDER_URL", "SCHEDULER_AGING_RATE", "RATE_LIMIT_SMS"} {
+		if !strings.Contains(err.Error(), key) {
+			t.Errorf("error does not mention %s: %v", key, err)
+		}
+	}
+	if _, err := load(env(map[string]string{"PROVIDER_TIMEOUT": "30s", "LEASE_DURATION": "30s"})); err == nil ||
+		!strings.Contains(err.Error(), "LEASE_DURATION") {
+		t.Errorf("a lease shorter than the provider timeout + 5s must be rejected: %v", err)
+	}
+}
+
 func TestLoadOverrides(t *testing.T) {
+	defaults, err := load(env(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
 	cfg, err := load(env(map[string]string{
 		"LOG_LEVEL":          "DEBUG",
 		"LOG_FORMAT":         "text",
@@ -75,6 +147,9 @@ func TestLoadOverrides(t *testing.T) {
 		MaintenanceInterval:  time.Hour,
 		MaxScheduleAhead:     72 * time.Hour,
 		RequestTimeout:       10 * time.Second,
+
+		Dispatcher: defaults.Dispatcher,
+		Worker:     defaults.Worker,
 	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Errorf("got  %+v\nwant %+v", cfg, want)

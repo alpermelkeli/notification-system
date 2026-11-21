@@ -7,11 +7,19 @@ import (
 	"sync"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kgo"
+
 	"github.com/alpermelkeli/notification-system/internal/api"
 	"github.com/alpermelkeli/notification-system/internal/config"
+	"github.com/alpermelkeli/notification-system/internal/dispatcher"
+	"github.com/alpermelkeli/notification-system/internal/domain"
 	"github.com/alpermelkeli/notification-system/internal/health"
 	"github.com/alpermelkeli/notification-system/internal/platform"
+	"github.com/alpermelkeli/notification-system/internal/provider"
+	"github.com/alpermelkeli/notification-system/internal/ratelimit"
 	"github.com/alpermelkeli/notification-system/internal/storage"
+	"github.com/alpermelkeli/notification-system/internal/worker"
 	"github.com/alpermelkeli/notification-system/migrations"
 )
 
@@ -63,8 +71,9 @@ func RunAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	return serveHTTP(ctx, logger, cfg.HTTPAddr, router, cfg.ShutdownTimeout)
 }
 
-// RunDispatcher relays due notifications from PostgreSQL to Kafka (ADR-0003). It serves health
-// and metrics on cfg.AdminAddr.
+// RunDispatcher relays due notifications from PostgreSQL to Kafka, recovers notifications that
+// never reach a worker and runs data maintenance (ADR-0003, ADR-0008). Any number of replicas can
+// run. It serves health and metrics on cfg.AdminAddr.
 func RunDispatcher(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	pool, err := platform.NewPostgresPool(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -72,40 +81,45 @@ func RunDispatcher(ctx context.Context, cfg config.Config, logger *slog.Logger) 
 	}
 	defer pool.Close()
 
-	kafka, err := platform.NewKafkaClient(cfg.KafkaBrokers)
+	kafka, err := platform.NewKafkaClient(cfg.KafkaBrokers,
+		append(dispatcher.ProducerOptions(), kgo.ClientID("dispatcher-"+cfg.InstanceID))...)
 	if err != nil {
 		return err
 	}
 	defer kafka.Close()
 
 	store := storage.New(pool, storage.Options{IdempotencyTTL: cfg.IdempotencyTTL})
+	relay := dispatcher.NewRelay(store, dispatcher.NewPublisher(kafka).Publish, logger, dispatcher.RelayOptions{
+		BatchSize: cfg.Dispatcher.BatchSize, PollInterval: cfg.Dispatcher.PollInterval,
+	})
+	reaper := dispatcher.NewReaper(store, dispatcher.NewKafkaOffsets(kadm.NewClient(kafka)), logger, dispatcher.ReaperOptions{
+		Interval: cfg.Dispatcher.ReaperInterval, Grace: cfg.Dispatcher.ReaperGrace,
+		StuckAfter: cfg.Dispatcher.ReaperStuckAfter,
+	})
+
 	var wg sync.WaitGroup
-	defer wg.Wait() // background loops use the pool, which is closed by an earlier defer
+	defer wg.Wait() // background loops use the pool and the client, which earlier defers close
 	// Stop the background loops when this function returns for any reason, e.g. the admin
 	// server failing to listen; deferred after wg.Wait, so it runs first.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	wg.Go(func() { relay.Run(ctx) })
+	wg.Go(func() { reaper.Run(ctx) })
 	wg.Go(func() { runMaintenance(ctx, store, cfg, logger) })
-	// The relay loop and reaper are started here in Phase 5.
 
 	checks := []health.Check{platform.PostgresCheck(pool), platform.KafkaCheck(kafka)}
 	return serveAdmin(ctx, cfg, logger, checks)
 }
 
-// RunWorker consumes the channel topics and delivers notifications (ADR-0002, ADR-0006). It
-// serves health and metrics on cfg.AdminAddr.
+// RunWorker delivers notifications of cfg.Worker.Channels (ADR-0002, ADR-0006): one consumer
+// group member per channel, sharing the database pool, the provider client and the Redis rate
+// limiter. It serves health and metrics on cfg.AdminAddr.
 func RunWorker(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	pool, err := platform.NewPostgresPool(ctx, cfg.DatabaseURL)
 	if err != nil {
 		return err
 	}
 	defer pool.Close()
-
-	kafka, err := platform.NewKafkaClient(cfg.KafkaBrokers)
-	if err != nil {
-		return err
-	}
-	defer kafka.Close()
 
 	rdb := platform.NewRedisClient(cfg.RedisAddr, cfg.RedisPassword)
 	defer func() {
@@ -114,10 +128,48 @@ func RunWorker(ctx context.Context, cfg config.Config, logger *slog.Logger) erro
 		}
 	}()
 
-	checks := []health.Check{
-		platform.PostgresCheck(pool), platform.KafkaCheck(kafka), platform.RedisCheck(rdb),
+	sender, err := provider.New(cfg.Worker.ProviderURL, cfg.Worker.ProviderTimeout)
+	if err != nil {
+		return err
 	}
-	// The per-channel consumers, scheduler and senders are started here in Phase 5.
+	limits := map[domain.Channel]ratelimit.Limit{}
+	for c, perSecond := range cfg.Worker.RateLimits {
+		limits[c] = ratelimit.Limit{PerSecond: perSecond, Burst: cfg.Worker.RateLimitBurst}
+	}
+	limiter, err := ratelimit.New(rdb, sender.Name(), limits)
+	if err != nil {
+		return err
+	}
+	store := storage.New(pool, storage.Options{IdempotencyTTL: cfg.IdempotencyTTL})
+	policy := worker.DefaultPolicy()
+	policy.AgingRate, policy.MinShareEvery = cfg.Worker.AgingRate, cfg.Worker.MinShareEvery
+	opts := worker.Options{
+		Concurrency: cfg.Worker.Concurrency, Lease: cfg.Worker.Lease,
+		RetryDelay: cfg.Worker.RetryDelay, MaxAttempts: cfg.Worker.MaxAttempts, Policy: &policy,
+	}
+
+	var wg sync.WaitGroup
+	defer wg.Wait() // consumers use the pool and Redis, which earlier defers close
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	checks := []health.Check{platform.PostgresCheck(pool), platform.RedisCheck(rdb)}
+	for _, c := range cfg.Worker.Channels {
+		w := worker.New(c, store, sender, limiter, logger, opts)
+		cl, err := platform.NewKafkaClient(cfg.KafkaBrokers,
+			append(w.ConsumerOptions(), kgo.ClientID("worker-"+string(c)+"-"+cfg.InstanceID))...)
+		if err != nil {
+			return err
+		}
+		if len(checks) == 2 {
+			checks = append(checks, platform.KafkaCheck(cl))
+		}
+		wg.Go(func() {
+			w.Run(ctx, cl)
+			cl.Close() // leaves the group after in-flight sends are persisted and committed
+		})
+	}
+	logger.Info("worker started", "channels", cfg.Worker.Channels, "provider", sender.Name())
 	return serveAdmin(ctx, cfg, logger, checks)
 }
 

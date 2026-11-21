@@ -26,6 +26,8 @@ x-app: &app
     DATABASE_URL: postgres://notifier:notifier@postgres:5432/notifier?sslmode=disable
     KAFKA_BROKERS: kafka:29092
     REDIS_ADDR: redis:6379
+    # Workers deliver to the local mock provider unless .env points PROVIDER_URL at webhook.site.
+    PROVIDER_URL: ${PROVIDER_URL:-http://mockprovider:8081/}
 
 services:
   # ---------------------------------------------------------------- infrastructure
