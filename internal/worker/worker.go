@@ -37,6 +37,7 @@ type Store interface {
 	MarkRetrying(ctx context.Context, l domain.Lease, delay time.Duration, cause string) (domain.Notification, error)
 	MarkFailed(ctx context.Context, l domain.Lease, cause string) (domain.Notification, error)
 	Release(ctx context.Context, l domain.Lease, delay time.Duration, reason string) (domain.Notification, error)
+	GetNotification(ctx context.Context, id uuid.UUID) (domain.Notification, error)
 }
 
 // Sender delivers a message. *provider.Client implements it.
@@ -285,14 +286,14 @@ func (w *Worker) schedule(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		}
-		done, err := w.circuit.allow()
+		adm, err := w.circuit.allow()
 		if err != nil {
 			<-slots
 			sleep(ctx, breakerPoll)
 			continue
 		}
 		if err := w.limiter.Wait(ctx, w.channel); err != nil {
-			done(errNotAttempted)
+			adm.done(errNotAttempted)
 			<-slots
 			if ctx.Err() != nil {
 				return
@@ -310,7 +311,7 @@ func (w *Worker) schedule(ctx context.Context) {
 		}
 		w.mu.Unlock()
 		if it == nil { // its partition was revoked while waiting for the token
-			done(errNotAttempted)
+			adm.done(errNotAttempted)
 			<-slots
 			continue
 		}
@@ -321,7 +322,7 @@ func (w *Worker) schedule(ctx context.Context) {
 		go func(r record) {
 			defer w.inFlight.Done()
 			defer func() { <-slots }()
-			if w.process(ctx, r, done) {
+			if w.process(ctx, r, adm) {
 				w.tracker.done(r.part, r.kr.Offset, true)
 			} else {
 				w.tracker.abandon(r.part)

@@ -34,7 +34,10 @@ type fakeStore struct {
 	claimErr error
 	// claimErrAfterCommit is returned once by a claim that did take effect (answer lost).
 	claimErrAfterCommit error
-	claimDelay          time.Duration
+	// outcomeErr fails outcome writes without applying them while set; outcomeErrAfterCommit is
+	// returned once by an outcome write that did take effect.
+	outcomeErr, outcomeErrAfterCommit error
+	claimDelay                        time.Duration
 }
 
 func newFakeStore() *fakeStore {
@@ -98,6 +101,9 @@ func (f *fakeStore) cause(id uuid.UUID) string {
 func (f *fakeStore) finish(l domain.Lease, to domain.Status, outcome, cause string) (domain.Notification, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.outcomeErr != nil {
+		return domain.Notification{}, f.outcomeErr
+	}
 	n := f.rows[l.NotificationID]
 	if n.LeaseToken == nil || *n.LeaseToken != l.Token {
 		return domain.Notification{}, domain.ErrLeaseLost
@@ -108,6 +114,20 @@ func (f *fakeStore) finish(l domain.Lease, to domain.Status, outcome, cause stri
 		f.causes[n.ID] = cause
 	}
 	f.outcomes[n.ID] = outcome
+	if err := f.outcomeErrAfterCommit; err != nil {
+		f.outcomeErrAfterCommit = nil
+		return domain.Notification{}, err
+	}
+	return *n, nil
+}
+
+func (f *fakeStore) GetNotification(_ context.Context, id uuid.UUID) (domain.Notification, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n, ok := f.rows[id]
+	if !ok {
+		return domain.Notification{}, domain.ErrNotFound
+	}
 	return *n, nil
 }
 
@@ -119,8 +139,8 @@ func (f *fakeStore) MarkRetrying(_ context.Context, l domain.Lease, d time.Durat
 	return f.finish(l, domain.StatusRetrying, "retrying "+d.String(), cause)
 }
 
-func (f *fakeStore) Release(_ context.Context, l domain.Lease, _ time.Duration, _ string) (domain.Notification, error) {
-	return f.finish(l, domain.StatusRetrying, "released", "")
+func (f *fakeStore) Release(_ context.Context, l domain.Lease, d time.Duration, _ string) (domain.Notification, error) {
+	return f.finish(l, domain.StatusRetrying, "released "+d.String(), "")
 }
 
 func (f *fakeStore) MarkFailed(_ context.Context, l domain.Lease, cause string) (domain.Notification, error) {
@@ -397,8 +417,8 @@ func TestFailureOutcomes(t *testing.T) {
 		{"first attempt", first, "retrying 2s", "retryable: provider returned 503"},
 		{"second attempt", second, "retrying 4s", "retryable: provider returned 503"},
 		{"last attempt", last, "failed", "attempts exhausted (3), last retryable: provider returned 503"},
-		// The backoff is 2s, but the provider asked for 9s.
-		{"429", throttled, "retrying 9s", "rate_limited: provider returned 429"},
+		// The backoff is 2s, but the provider asked for 9s; a 429 does not consume the attempt.
+		{"429", throttled, "released 9s", ""},
 		{"400", invalid, "failed", "permanent: provider returned 400: bad recipient"},
 	} {
 		if got := h.store.outcome(c.n.ID); got != c.outcome {
@@ -494,6 +514,61 @@ func TestClaimWhoseAnswerWasLostIsRecovered(t *testing.T) {
 	eventually(t, "committed", func() bool { return h.committedAt(normalTopic, 0) == 1 })
 	if got := h.store.outcome(n.ID); got != "sent m" {
 		t.Errorf("outcome %q, want the claim recovered and sent", got)
+	}
+}
+
+// TestOutcomeWriteWaitsOutAnOutage: an outcome write is retried while the database is down, as
+// long as the lease lasts, so a delivered message is not reaped and sent again.
+func TestOutcomeWriteWaitsOutAnOutage(t *testing.T) {
+	h := newHarness(t, nil, Options{})
+	h.store.mu.Lock()
+	h.store.outcomeErr = dbDown
+	h.store.mu.Unlock()
+	n := h.store.add(domain.PriorityNormal, domain.StatusQueued, 0)
+	h.feed(t, n, 0)
+	eventually(t, "sent", func() bool { return len(h.sender.sent()) == 1 })
+	time.Sleep(time.Second) // longer than the old fixed retries' first steps
+	h.store.mu.Lock()
+	h.store.outcomeErr = nil
+	h.store.mu.Unlock()
+	eventually(t, "outcome persisted", func() bool { return h.store.outcome(n.ID) == "sent m" })
+}
+
+// TestFailedOutcomeWhoseAnswerWasLostIsDeadLettered: MarkFailed committed but reported a
+// transient error; the retry is rejected by the lease guard, the row is found failed, and the dead
+// letter is still published.
+func TestFailedOutcomeWhoseAnswerWasLostIsDeadLettered(t *testing.T) {
+	h := newHarness(t, nil, Options{})
+	h.sender.fn = func(provider.Message) (provider.Result, error) {
+		return provider.Result{}, &provider.Error{StatusCode: http.StatusBadRequest}
+	}
+	h.store.mu.Lock()
+	h.store.outcomeErrAfterCommit = dbDown
+	h.store.mu.Unlock()
+	n := h.store.add(domain.PriorityNormal, domain.StatusQueued, 0)
+	h.feed(t, n, 0)
+	eventually(t, "dead letter", func() bool { return len(h.dead.ids()) == 1 })
+	if got := h.store.outcome(n.ID); got != "failed" {
+		t.Errorf("outcome %q", got)
+	}
+}
+
+// TestTokenWaitAfterASlowClaimIsBounded: a long fleet cool-down must not eat the lease; the
+// attempt is handed back instead.
+func TestTokenWaitAfterASlowClaimIsBounded(t *testing.T) {
+	lim := &fakeLimiter{tokens: make(chan struct{}, 1)}
+	lim.tokens <- struct{}{} // the token before the pick; none after the slow claim
+	h := newHarness(t, lim, Options{})
+	h.store.claimDelay = 100 * time.Millisecond
+	n := h.store.add(domain.PriorityNormal, domain.StatusQueued, 0)
+	h.feed(t, n, 0)
+	start := time.Now()
+	eventually(t, "released", func() bool { return h.store.outcome(n.ID) == "released 5s" })
+	if took := time.Since(start); took > tokenWaitMax+time.Second {
+		t.Errorf("released after %v, want within the %v token budget", took, tokenWaitMax)
+	}
+	if len(h.sender.sent()) != 0 {
+		t.Error("sent without a fresh token")
 	}
 }
 
@@ -666,7 +741,7 @@ func TestHugeRetryAfterIsCapped(t *testing.T) {
 	n := h.store.add(domain.PriorityNormal, domain.StatusQueued, 0)
 	h.feed(t, n, 0)
 	eventually(t, "outcome", func() bool { return h.store.outcome(n.ID) != "" })
-	if got := h.store.outcome(n.ID); got != "retrying 1m0s" {
+	if got := h.store.outcome(n.ID); got != "released 1m0s" {
 		t.Errorf("outcome %q, want the delay capped at one minute", got)
 	}
 }

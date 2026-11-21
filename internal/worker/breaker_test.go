@@ -126,7 +126,7 @@ func TestClaimedRecordIsReleasedWhenTheBreakerOpens(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	trip(errUnavailable) // another send fails: the breaker opens
+	trip.done(errUnavailable) // another send fails: the breaker opens
 	if !h.w.circuit.open() {
 		t.Fatal("breaker did not open")
 	}
@@ -138,8 +138,8 @@ func TestClaimedRecordIsReleasedWhenTheBreakerOpens(t *testing.T) {
 		t.Fatal("record not buffered")
 	}
 	h.w.process(context.Background(), it.rec, admitted)
-	if got := h.store.outcome(n.ID); got != "released" {
-		t.Errorf("outcome %q, want released", got)
+	if got := h.store.outcome(n.ID); got != "released 1h0m0s" {
+		t.Errorf("outcome %q, want released until the breaker's open period ends", got)
 	}
 	if len(h.sender.sent()) != 0 {
 		t.Error("sent through an open breaker")
@@ -157,17 +157,45 @@ func TestBreakerOptionsDefaults(t *testing.T) {
 func TestBreakerTripsOnFailureRatio(t *testing.T) {
 	c := newCircuit("t", BreakerOptions{ConsecutiveFailures: 100, FailureRatio: 0.5, MinRequests: 10, Window: time.Minute, OpenTimeout: time.Hour}, discard)
 	for i := range 10 {
-		done, err := c.allow()
+		a, err := c.allow()
 		if err != nil {
 			t.Fatalf("send %d rejected early: %v", i, err)
 		}
 		if i%3 == 2 { // successes at 2, 5, 8: 7 of 10 fail, the 10th being a failure
-			done(nil)
+			a.done(nil)
 		} else {
-			done(errors.New("connection refused"))
+			a.done(errors.New("connection refused"))
 		}
 	}
 	if !c.open() {
 		t.Errorf("breaker state = %s, want open at 70%% failures over 10 sends", c.state())
+	}
+}
+
+// TestSendAdmittedBeforeATripIsRevokedInHalfOpen: only the probe may reach a recovering
+// provider; a send admitted while closed and delayed past the open period is released.
+func TestSendAdmittedBeforeATripIsRevokedInHalfOpen(t *testing.T) {
+	c := newCircuit("t", BreakerOptions{ConsecutiveFailures: 1, OpenTimeout: 50 * time.Millisecond}, discard)
+	early, err := c.allow()
+	if err != nil || early.probe {
+		t.Fatalf("closed admission: %+v, %v", early, err)
+	}
+	trip, _ := c.allow()
+	trip.done(errUnavailable)
+	time.Sleep(80 * time.Millisecond)
+	probe, err := c.allow()
+	if err != nil || !probe.probe {
+		t.Fatalf("half-open admission: probe=%v, %v", probe.probe, err)
+	}
+	if !c.revoked(early) {
+		t.Error("a send admitted before the trip must not go ahead in half-open")
+	}
+	if c.revoked(probe) {
+		t.Error("the probe must go ahead")
+	}
+	early.done(errNotAttempted)
+	probe.done(nil)
+	if c.state() != gobreaker.StateClosed {
+		t.Errorf("state after a successful probe = %s", c.state())
 	}
 }

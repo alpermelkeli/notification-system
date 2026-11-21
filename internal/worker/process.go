@@ -26,30 +26,42 @@ const (
 	claimBackoffMax = 5 * time.Second
 )
 
-// persistRetries bounds retries of an outcome write that failed because PostgreSQL was
-// unavailable. If all fail, the lease expires and the reaper retries the notification.
-var persistRetries = []time.Duration{200 * time.Millisecond, time.Second, 2 * time.Second}
+// Time budget of a claimed send, measured from the start of the claim, which is no later than
+// the database's lease start:
+//   - the send must finish outcomeReserve before the lease ends, so the outcome can be written
+//     while the lease still fences it (config requires LEASE_DURATION >= PROVIDER_TIMEOUT + 5s);
+//   - a fresh token after a slow claim is waited for at most tokenWaitMax: a long fleet
+//     cool-down must not eat the lease, so the attempt is handed back instead;
+//   - outcome writes are retried while PostgreSQL is unavailable until the lease ends, each try
+//     bounded by writeTimeout. After that the reaper owns the row.
+const (
+	outcomeReserve  = 5 * time.Second
+	tokenWaitMax    = 2 * time.Second
+	writeTimeout    = 2 * time.Second
+	writeBackoffMin = 200 * time.Millisecond
+	writeBackoffMax = 2 * time.Second
+)
 
-// process delivers one record: guarded claim, provider call, outcome. done reports the send to
-// the circuit breaker that admitted it; it is called exactly once. It returns false if the record
-// was given up without a decision (shutdown or revoke during a database outage) and must stay
-// below the watermark.
+// process delivers one record: guarded claim, provider call, outcome. adm is the circuit
+// breaker's admission of the send; its done is called exactly once. It returns false if the
+// record was given up without a decision (shutdown or revoke during a database outage) and must
+// stay below the watermark.
 //
-// runCtx is the worker's run context. Once claimed, a send is not abandoned on shutdown: it finishes
-// and persists its outcome within the lease, so the record is not delivered twice.
-func (w *Worker) process(runCtx context.Context, r record, done func(error)) bool {
+// runCtx is the worker's run context. Once claimed, a send is not abandoned on shutdown: it
+// finishes and persists its outcome within the lease, so the record is not delivered twice.
+func (w *Worker) process(runCtx context.Context, r record, adm admission) bool {
 	runCtx = withCorrelation(runCtx, r)
 	log := w.logger.With("notification_id", r.msg.ID.String(), "priority", string(r.msg.Priority))
 	reported := false
 	report := func(err error) {
 		if !reported {
 			reported = true
-			done(err)
+			adm.done(err)
 		}
 	}
 	defer report(errNotAttempted)
 
-	n, err := w.claimWithRetry(runCtx, log, r)
+	n, claimStart, err := w.claimWithRetry(runCtx, log, r)
 	switch {
 	case errors.Is(err, errStale):
 		log.DebugContext(runCtx, "skipping stale work record", "err", err)
@@ -63,100 +75,131 @@ func (w *Worker) process(runCtx context.Context, r record, done func(error)) boo
 		log.ErrorContext(runCtx, "claim failed", "err", err)
 		return true
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(runCtx), w.opts.Lease)
-	defer cancel()
-	lease, _ := n.Lease()
+	c := claimed{n: n, leaseEnd: claimStart.Add(w.opts.Lease)}
+	c.lease, _ = n.Lease()
+	base := context.WithoutCancel(runCtx)
 	log = log.With("attempt", n.Attempts)
 
-	// The breaker admitted this send before the claim. If it opened since (sends in flight
-	// failed), do not add to the provider's trouble: hand the attempt back (ADR-0005).
-	if w.circuit.open() {
-		log.InfoContext(ctx, "circuit breaker opened after the claim; releasing")
-		w.release(ctx, log, lease, w.circuit.timeout, "circuit breaker open")
+	// The breaker admitted this send before the claim. If it stopped admitting since (sends in
+	// flight failed), do not add to the provider's trouble: hand the attempt back (ADR-0005).
+	if w.circuit.revoked(adm) {
+		log.InfoContext(runCtx, "circuit breaker opened after the claim; releasing")
+		w.release(base, log, c, w.circuit.timeout, "circuit breaker open")
 		return true
 	}
 
+	sendDeadline := c.leaseEnd.Add(-outcomeReserve)
 	// The token was granted before the claim. If the claim was slow (e.g. it waited for the
 	// dispatcher's commit), sends whose claims finished together would reach the provider in a
 	// burst above the rate, so take a fresh token (ADR-0006).
 	if time.Since(r.tokenAt) > staleToken {
-		if err := w.limiter.Wait(ctx, w.channel); err != nil {
+		wctx, cancel := context.WithTimeout(base, min(tokenWaitMax, time.Until(sendDeadline)))
+		err := w.limiter.Wait(wctx, w.channel)
+		cancel()
+		if err != nil {
 			// No token, no send. Hand the attempt back; it is retried without consuming it.
-			log.WarnContext(ctx, "no rate-limit token after claim; releasing", "err", err)
-			w.release(ctx, log, lease, w.opts.Retry.BaseDelay, "rate limiter unavailable")
+			log.WarnContext(runCtx, "no rate-limit token after claim; releasing", "err", err)
+			w.release(base, log, c, w.opts.Retry.BaseDelay, "no rate-limit token")
 			return true
 		}
 	}
 
-	res, sendErr := w.sender.Send(ctx, provider.Message{
+	sctx, cancel := context.WithDeadline(base, sendDeadline)
+	res, sendErr := w.sender.Send(sctx, provider.Message{
 		IdempotencyKey: n.ID.String(),
 		CorrelationID:  n.CorrelationID,
 		To:             n.Recipient,
 		Channel:        n.Channel,
 		Content:        n.Content,
 	})
+	cancel()
 	report(sendErr)
-	w.settle(ctx, log, n, lease, res, sendErr)
+	w.settle(base, log, c, res, sendErr)
 	return true
+}
+
+// claimed is a notification this worker holds a lease on.
+type claimed struct {
+	n     domain.Notification
+	lease domain.Lease
+	// leaseEnd is a local bound of the lease: the claim started before the database's now(), so
+	// the real lease ends no earlier.
+	leaseEnd time.Time
 }
 
 // release hands a claimed notification back to retrying after delay without consuming the
 // attempt.
-func (w *Worker) release(ctx context.Context, log *slog.Logger, lease domain.Lease, delay time.Duration, reason string) {
-	if err := w.persist(ctx, func() error {
-		_, err := w.store.Release(ctx, lease, delay, reason)
+func (w *Worker) release(ctx context.Context, log *slog.Logger, c claimed, delay time.Duration, reason string) {
+	_, err := w.persist(ctx, c, func(ctx context.Context) error {
+		_, err := w.store.Release(ctx, c.lease, delay, reason)
 		return err
-	}); err != nil {
+	})
+	if err != nil {
 		log.ErrorContext(ctx, "release not persisted; the lease will expire and be retried", "err", err)
 	}
 }
 
 // settle persists the outcome of a send (ADR-0005, FR-3.1–3.3):
 //
-//	2xx                      → sent
-//	permanent (other 4xx)    → failed + dead letter
-//	retryable or 429, budget → retrying after the jittered backoff (429: at least Retry-After)
-//	retryable or 429, last   → failed + dead letter
-func (w *Worker) settle(ctx context.Context, log *slog.Logger, n domain.Notification, lease domain.Lease,
-	res provider.Result, sendErr error,
-) {
+//	2xx                    → sent
+//	permanent (other 4xx)  → failed + dead letter
+//	429                    → released: retried after max(backoff, Retry-After) without consuming
+//	                         the attempt, since the provider is healthy and only asks us to slow down
+//	retryable, budget left → retrying after the jittered backoff
+//	retryable, last        → failed + dead letter
+func (w *Worker) settle(ctx context.Context, log *slog.Logger, c claimed, res provider.Result, sendErr error) {
+	n := c.n
 	class := provider.Classify(sendErr)
-	var cool time.Duration
-	if class == provider.ClassRateLimited {
-		cool = w.cooldown(ctx, sendErr) // pauses the fleet even when this attempt was the last
-	}
-
 	var (
-		outcome func() error
-		failed  *domain.Notification
+		target domain.Status
+		write  func(context.Context) (domain.Notification, error)
 	)
 	fail := func(cause string) {
-		outcome = func() error {
-			row, err := w.store.MarkFailed(ctx, lease, cause)
-			if err == nil {
-				failed = &row
-			}
-			return err
-		}
+		target = domain.StatusFailed
+		write = func(ctx context.Context) (domain.Notification, error) { return w.store.MarkFailed(ctx, c.lease, cause) }
 	}
 	switch {
 	case class == provider.ClassDelivered:
-		outcome = func() error { _, err := w.store.MarkSent(ctx, lease, res.MessageID); return err }
+		target = domain.StatusSent
+		write = func(ctx context.Context) (domain.Notification, error) {
+			return w.store.MarkSent(ctx, c.lease, res.MessageID)
+		}
 		log.DebugContext(ctx, "delivered", "provider_message_id", res.MessageID)
 	case class == provider.ClassPermanent:
 		fail(class.String() + ": " + sendErr.Error())
 		log.ErrorContext(ctx, "delivery failed permanently", "err", sendErr)
+	case class == provider.ClassRateLimited:
+		delay := max(w.opts.Retry.Delay(n.Attempts), w.cooldown(ctx, sendErr))
+		log.WarnContext(ctx, "rate limited by the provider; releasing", "err", sendErr, "retry_in", delay)
+		w.release(ctx, log, c, delay, class.String()+": "+sendErr.Error())
+		return
 	case w.opts.Retry.Exhausted(n.Attempts):
 		fail(fmt.Sprintf("attempts exhausted (%d), last %s: %s", n.Attempts, class, sendErr))
 		log.ErrorContext(ctx, "delivery failed; attempts exhausted", "err", sendErr, "class", class.String())
 	default:
-		delay := max(w.opts.Retry.Delay(n.Attempts), cool)
+		delay := w.opts.Retry.Delay(n.Attempts)
 		cause := class.String() + ": " + sendErr.Error()
-		outcome = func() error { _, err := w.store.MarkRetrying(ctx, lease, delay, cause); return err }
+		target = domain.StatusRetrying
+		write = func(ctx context.Context) (domain.Notification, error) {
+			return w.store.MarkRetrying(ctx, c.lease, delay, cause)
+		}
 		log.WarnContext(ctx, "delivery failed; will retry", "err", sendErr, "class", class.String(), "retry_in", delay)
 	}
 
-	if err := w.persist(ctx, outcome); err != nil {
+	var row domain.Notification
+	ambiguous, err := w.persist(ctx, c, func(ctx context.Context) error {
+		var err error
+		row, err = write(ctx)
+		return err
+	})
+	if err != nil && ambiguous && isGuardError(err) {
+		// An earlier try may have committed before its answer was lost; then the guard rejects
+		// the retry. Check whether the row already holds this outcome.
+		if got, gerr := w.store.GetNotification(ctx, n.ID); gerr == nil && got.Status == target && got.Attempts == n.Attempts {
+			row, err = got, nil
+		}
+	}
+	if err != nil {
 		if errors.Is(err, domain.ErrLeaseLost) {
 			// The lease expired and the row was reaped; the newer claim owns the outcome.
 			log.WarnContext(ctx, "outcome discarded: lease lost", "err", err)
@@ -165,12 +208,18 @@ func (w *Worker) settle(ctx context.Context, log *slog.Logger, n domain.Notifica
 		log.ErrorContext(ctx, "outcome not persisted; the lease will expire and be retried", "err", err)
 		return
 	}
-	if failed != nil && w.opts.DeadLetters != nil {
+	if target == domain.StatusFailed && w.opts.DeadLetters != nil {
 		// Best effort, after the commit: the failed row is the source of truth (ADR-0005).
-		if err := w.opts.DeadLetters.Publish(ctx, *failed); err != nil {
+		dctx, cancel := context.WithTimeout(ctx, writeTimeout+outcomeReserve)
+		defer cancel()
+		if err := w.opts.DeadLetters.Publish(dctx, row); err != nil {
 			log.WarnContext(ctx, "dead letter not published", "err", err)
 		}
 	}
+}
+
+func isGuardError(err error) bool {
+	return errors.Is(err, domain.ErrLeaseLost) || errors.Is(err, domain.ErrInvalidTransition)
 }
 
 // cooldown handles a 429: it pauses the whole fleet's sends on this channel for the provider's
@@ -197,12 +246,15 @@ var errAbandoned = errors.New("claim abandoned")
 // which re-publishes by age and not by priority. Holding the claim also holds this sender slot,
 // so the worker stops taking work until the database is back. It gives up with errAbandoned only
 // on shutdown or revoke; the record then stays below the watermark.
-func (w *Worker) claimWithRetry(ctx context.Context, log *slog.Logger, r record) (domain.Notification, error) {
+//
+// It also returns when the successful try started, from which the caller bounds the lease.
+func (w *Worker) claimWithRetry(ctx context.Context, log *slog.Logger, r record) (domain.Notification, time.Time, error) {
 	backoff := claimBackoffMin
 	token := uuid.New() // the same token on every try makes a retried claim idempotent
 	for try := 1; ; try++ {
 		// Each try runs to completion even on shutdown: abandoning a claim that committed would
 		// leave the row processing until its lease expires.
+		start := time.Now()
 		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claimTimeout)
 		n, err := w.claim(cctx, r, token)
 		cancel()
@@ -210,15 +262,18 @@ func (w *Worker) claimWithRetry(ctx context.Context, log *slog.Logger, r record)
 			if err == nil && try > 1 {
 				log.InfoContext(ctx, "claim succeeded after database errors", "tries", try)
 			}
-			return n, err
+			return n, start, err
 		}
-		if try == 1 || try%10 == 0 {
-			log.WarnContext(ctx, "database unavailable; retrying the claim", "err", err, "tries", try)
+		switch {
+		case try == 1:
+			log.WarnContext(ctx, "database unavailable; retrying the claim", "err", err)
+		case try%30 == 0: // about every two minutes at the maximum backoff
+			log.ErrorContext(ctx, "database still unavailable; the claim keeps waiting", "err", err, "tries", try)
 		}
 		// Wait in short steps, so a revoke does not wait out a long backoff.
 		for waited := time.Duration(0); waited < backoff; waited += claimBackoffMin {
 			if ctx.Err() != nil || w.tracker.gone(r.part) {
-				return domain.Notification{}, errors.Join(errAbandoned, err)
+				return domain.Notification{}, time.Time{}, errors.Join(errAbandoned, err)
 			}
 			sleep(ctx, claimBackoffMin)
 		}
@@ -239,16 +294,21 @@ func (w *Worker) claim(ctx context.Context, r record, token uuid.UUID) (domain.N
 	return n, err
 }
 
-// persist runs an outcome write, retrying while PostgreSQL is unavailable. Other errors, such as
-// guard failures (lease lost, invalid transition), are final.
-func (w *Worker) persist(ctx context.Context, write func() error) error {
-	err := write()
-	for _, d := range persistRetries {
-		if err == nil || !storage.IsTransient(err) || ctx.Err() != nil {
-			return err
+// persist runs a write fenced by c's lease, retrying while PostgreSQL is unavailable until the
+// lease ends; each try has its own deadline, so a write after a long send still gets its full
+// budget. Other errors, such as guard failures (lease lost, invalid transition), are final.
+// ambiguous reports that an earlier try failed transiently and may have committed nonetheless.
+func (w *Worker) persist(ctx context.Context, c claimed, write func(context.Context) error) (ambiguous bool, err error) {
+	backoff := writeBackoffMin
+	for {
+		wctx, cancel := context.WithTimeout(ctx, writeTimeout)
+		err = write(wctx)
+		cancel()
+		if err == nil || !storage.IsTransient(err) || time.Now().Add(backoff).After(c.leaseEnd) {
+			return ambiguous, err
 		}
-		sleep(ctx, d)
-		err = write()
+		ambiguous = true
+		sleep(ctx, backoff)
+		backoff = min(backoff*2, writeBackoffMax)
 	}
-	return err
 }

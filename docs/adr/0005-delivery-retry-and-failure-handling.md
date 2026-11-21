@@ -73,6 +73,9 @@ terminal failures visible and replayable (B-1).
   the budget is spent, so `GET /v1/notifications?status=failed` shows why each row failed.
 - *Backoff* is `internal/retry` with the formula above. A `429` waits
   `max(backoff, min(Retry-After, 1m))`; the cap stops a bogus header from parking a row for days.
+  **Change:** a `429` releases the notification (`Release`) instead of consuming the attempt. A
+  provider whose real limit is below ours would otherwise fail healthy notifications after five
+  throttled answers. Throttled notifications wait instead, up to retention, like during an outage.
   `RETRY_DELAY` became `RETRY_BASE_DELAY` and `RETRY_MAX_DELAY`. `MAX_ATTEMPTS` is shared by the
   worker and the dispatcher's reaper.
 - *Expired lease on the last attempt.* The reaper keeps an expired lease's attempt counted (the
@@ -95,6 +98,25 @@ terminal failures visible and replayable (B-1).
     provider when it trips finish normally.
   - In half-open, exactly one probe is admitted. An admitted send that does not happen (stale
     record, no token) is reported as excluded, so the next probe is not blocked.
+- *Lease budget.* Deadlines run from the start of the claim, which is no later than the
+  database's `now()` that starts the lease:
+  - the provider call must end 5 s before the lease does, so its outcome is still fenced by the
+    lease;
+  - the fresh token after a slow claim is waited for at most 2 s, so a long cool-down hands the
+    attempt back instead of eating the lease;
+  - outcome writes are retried while the database is unavailable until the lease ends, each try
+    with its own 2 s deadline. A delivered message therefore survives a database outage shorter
+    than the lease without being reaped and sent again. Measured in compose before this change:
+    10 of 1000 were sent twice during a 15 s outage.
+  - A write retried after an ambiguous failure that the lease guard then rejects is checked
+    against the row: if the row already holds the outcome, it counts as written, so the dead
+    letter of a `failed` row is not skipped.
+- *Idempotent claim.* The worker generates the lease token once per record. A claim retried after
+  a lost answer gets its own claim back instead of skipping the record as stale. Without that, the
+  reaper would later count the attempt, and on the last attempt fail a notification that was never
+  sent.
+- *Half-open.* A send admitted while the breaker was closed is released if, after its claim, the
+  breaker is no longer closed. Only the probe reaches a recovering provider.
 - *PostgreSQL outage (from the Phase 5 review).* A claim that fails with a transient database
   error (`storage.IsTransient`: no connection, timeouts, shutdown, resource exhaustion,
   serialization failures) is retried with backoff from 100 ms up to 5 s instead of being given up.

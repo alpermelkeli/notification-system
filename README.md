@@ -97,8 +97,9 @@ curl localhost:8081/stats        # accepted/rejected per channel + rate in the l
   SMS in a second, and the 100 `high` were delivered within 1.4 s despite the backlog.
 - **Delivery outcome** ([ADR-0005](docs/adr/0005-delivery-retry-and-failure-handling.md)):
   `2xx` is `sent`. Timeouts, connection errors, `5xx`, `408` and `425` are retried with exponential
-  backoff and equal jitter (`RETRY_BASE_DELAY` doubling up to `RETRY_MAX_DELAY`); a `429` is retried
-  after at least its `Retry-After` and pauses the whole fleet. Any other `4xx` is permanent. A
+  backoff and equal jitter (`RETRY_BASE_DELAY` doubling up to `RETRY_MAX_DELAY`). A `429` pauses the
+  whole fleet and is retried after at least its `Retry-After` without consuming an attempt: the
+  provider is healthy and only asks us to slow down. Any other `4xx` is permanent. A
   permanent failure, or a failure of the last of `MAX_ATTEMPTS` attempts, moves the notification to
   `failed` and publishes a dead letter to `notifications.dlq`.
 - **Circuit breaker** (per channel and worker instance): opens after 5 retryable failures in a row,
@@ -282,7 +283,7 @@ stop the process with a message listing every problem. Copy [`.env.example`](.en
 | `RATE_LIMIT_BURST` | `1` | worker | Sends allowed back to back after an idle period; above 1 a second can exceed the limit by `burst - 1` |
 | `RETRY_BASE_DELAY` | `5s` | worker | Backoff ceiling of the first retry; it doubles per attempt and the delay is jittered between half the ceiling and the ceiling |
 | `RETRY_MAX_DELAY` | `5m` | worker | Cap of the backoff ceiling; must not be shorter than `RETRY_BASE_DELAY` |
-| `MAX_ATTEMPTS` | `5` | worker, dispatcher | Attempt budget; the last failure (or an expired lease on the last attempt) marks the notification `failed` |
+| `MAX_ATTEMPTS` | `5` | worker, dispatcher | Attempt budget; the last failure (or an expired lease on the last attempt) marks the notification `failed`. Set the same value on workers and dispatchers |
 | `BREAKER_CONSECUTIVE_FAILURES` | `5` | worker | Retryable failures in a row that open a channel's circuit breaker |
 | `BREAKER_FAILURE_RATIO` / `BREAKER_MIN_REQUESTS` / `BREAKER_WINDOW` | `0.5` / `20` / `1m` | worker | Also open it when more than this share of at least this many sends in the rolling window failed |
 | `BREAKER_OPEN_TIMEOUT` | `30s` | worker | How long the breaker stays open before one probe; notifications released while open are retried after it |

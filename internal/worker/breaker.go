@@ -88,9 +88,33 @@ func newCircuit(name string, o BreakerOptions, logger *slog.Logger) *circuit {
 	}
 }
 
-// allow admits one send. The returned done must be called exactly once with the send's error, or
-// errNotAttempted if the send did not happen.
-func (c *circuit) allow() (done func(error), err error) { return c.cb.Allow() }
+// admission is the breaker's permission for one send. done must be called exactly once with the
+// send's error, or errNotAttempted if the send did not happen. probe tells whether it was
+// admitted as the single half-open probe.
+type admission struct {
+	done  func(error)
+	probe bool
+}
+
+// allow admits one send.
+func (c *circuit) allow() (admission, error) {
+	done, err := c.cb.Allow()
+	if err != nil {
+		return admission{}, err
+	}
+	return admission{done: done, probe: c.cb.State() == gobreaker.StateHalfOpen}, nil
+}
+
+// revoked reports whether a send admitted earlier must not go ahead any more: a probe once the
+// breaker is open again, any other send once the breaker is no longer closed. So a send admitted
+// before a trip and delayed (e.g. by a slow claim) does not reach the provider next to the probe.
+func (c *circuit) revoked(a admission) bool {
+	st := c.cb.State()
+	if a.probe {
+		return st == gobreaker.StateOpen
+	}
+	return st != gobreaker.StateClosed
+}
 
 // open reports whether the breaker rejects sends right now.
 func (c *circuit) open() bool { return c.cb.State() == gobreaker.StateOpen }
