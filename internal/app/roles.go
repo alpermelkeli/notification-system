@@ -166,7 +166,7 @@ func RunWorker(ctx context.Context, cfg config.Config, logger *slog.Logger) erro
 		}
 		wg.Go(func() {
 			w.Run(ctx, cl)
-			cl.Close() // leaves the group after in-flight sends are persisted and committed
+			cl.CloseAllowingRebalance() // leaves the group after in-flight sends are persisted and committed
 		})
 	}
 	logger.Info("worker started", "channels", cfg.Worker.Channels, "provider", sender.Name())

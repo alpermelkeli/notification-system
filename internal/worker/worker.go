@@ -153,6 +153,9 @@ func (w *Worker) ConsumerOptions() []kgo.Opt {
 		kgo.BlockRebalanceOnPoll(),
 		// A new group must not skip records published before its first member joined.
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.OnPartitionsAssigned(func(_ context.Context, _ *kgo.Client, assigned map[string][]int32) {
+			w.logger.Info("partitions assigned", "partitions", assigned)
+		}),
 		kgo.OnPartitionsRevoked(func(ctx context.Context, _ *kgo.Client, revoked map[string][]int32) {
 			w.revoke(ctx, revoked)
 		}),
@@ -163,8 +166,8 @@ func (w *Worker) ConsumerOptions() []kgo.Opt {
 }
 
 // Run consumes with cl, which must be built with ConsumerOptions, until ctx ends. On return all
-// in-flight sends have finished and their watermarks are committed; the caller closes cl, which
-// leaves the group.
+// in-flight sends have finished and their watermarks are committed. The caller then closes cl with
+// CloseAllowingRebalance, which leaves the group (a plain Close waits for AllowRebalance).
 func (w *Worker) Run(ctx context.Context, cl *kgo.Client) {
 	w.fetch = cl
 	w.commit = func(ctx context.Context, offsets map[string]map[int32]kgo.EpochOffset) error {
@@ -173,6 +176,7 @@ func (w *Worker) Run(ctx context.Context, cl *kgo.Client) {
 	w.run(ctx, func(ctx context.Context) bool {
 		fetches := cl.PollFetches(ctx)
 		if fetches.IsClientClosed() || ctx.Err() != nil {
+			cl.AllowRebalance()
 			return false
 		}
 		fetches.EachError(func(topic string, partition int32, err error) {
