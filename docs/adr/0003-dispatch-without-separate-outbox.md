@@ -45,13 +45,51 @@ COMMIT;            -- on publish failure: ROLLBACK, back off, retry
 - **Reaper** (part of the dispatcher, runs every 30 s):
   - `processing` rows whose `lease_until` has expired go to `retrying`. This covers workers
     that crashed mid-send.
-  - `queued` rows older than the stuck threshold (default 10 min) go back to `pending` to be
-    re-published. This is a last-resort safety net for records that never reach a worker (e.g.
-    topic data loss or an operational mistake). Normal crash recovery is handled by watermark
-    offset commits (ADR-0002).
+  - `queued` rows whose Kafka record the workers have already **consumed past** go back to
+    `pending` to be re-published (see the amendment below; this replaces the original fixed
+    10-minute threshold). This is the safety net for records that never reach a worker. Normal
+    crash recovery is handled by watermark offset commits (ADR-0002).
 - **Status events** (`notification.events`) are published **best-effort after commit** by the
   component that changed the state. PostgreSQL remains the truth. Losing an event only delays a
   WebSocket update, and clients can always query the API.
+
+**Amendment (2026-11-21, before Phase 5): the `queued` reaper compares Kafka offsets, not ages.**
+
+*Problem with the original rule.* "Back to `pending` after 10 minutes in `queued`" cannot tell a
+lost record from one that is simply waiting. During a burst, `queued` rows legitimately wait in
+Kafka for hours (2 M SMS ≈ 5.6 h at 100 msg/s), so the rule would re-publish the whole backlog.
+It also could not be tuned: any fixed age is either too short for a large burst or too long for
+real loss.
+
+*Decision.*
+1. When the dispatcher marks a published batch `queued`, it also stores where each record
+   landed: `kafka_partition` and `kafka_offset` (from the produce acks it already waits for, in
+   the same `UPDATE`). The topic follows from `channel` and `priority`. This needs migration
+   00002 (two nullable columns).
+2. The reaper reads the committed offset of each work partition for the channel's consumer group
+   (`workers.{channel}`) through the Kafka admin API.
+3. A `queued` row is **lost** if its `kafka_offset` is below the committed offset of its
+   partition: with watermark commits (ADR-0002), the group only commits past a record after
+   handling it, so a record behind the committed offset was seen and dropped without a claim. A
+   short grace period (default 1 minute since `queued_at`) avoids racing a commit in flight. Lost
+   rows go back to `pending` with reason `kafka record consumed without claim`.
+4. A row whose offset is at or above the committed offset is still waiting in the backlog and is
+   never touched, however long the backlog is.
+5. Fallback: a much larger age threshold (default 24 h, configurable) catches cases offsets
+   cannot, such as a topic recreated with offsets starting from zero again, or a row without
+   stored offsets.
+
+*Why this matters beyond data loss.* It also closes a race in the normal path: the dispatcher
+commits `queued` only after Kafka acknowledges, so a fast worker can receive a record while its
+row is still `pending`. The guarded claim (`WHERE status = 'queued'`) then skips it, and the
+worker commits past it. The row becomes `queued` with an offset below the committed one, so the
+reaper re-publishes it after the grace period. (Phase 5 may additionally let the worker retry a
+claim briefly when the row is still `pending`, which makes this path rare.)
+
+*Consequences.* Burst backlogs are never re-published. Real loss is detected within about a
+reaper interval plus the grace period, not after an arbitrary age. The cost is two columns and one
+admin request per channel per reaper run (a handful of partitions), and the reaper needs access
+to the Kafka admin API.
 
 ## Consequences
 - ✅ No dual write: the row *is* the publish intent, so it cannot be lost.
