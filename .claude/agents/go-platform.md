@@ -20,6 +20,6 @@ You are a senior Go / DevOps engineer owning the **platform and observability** 
 
 ## Rules
 - `docker compose up` must work on a clean machine with only Docker installed.
-- Every new env var is documented in `.env.example` and README in the same change.
+- Every new env var is documented in `.env.example` and `docs/configuration.md` in the same change.
 - Stay inside your assigned files; flag any shared-file change in your report.
 - Report: files changed, commands verified, requirement IDs covered, open issues.

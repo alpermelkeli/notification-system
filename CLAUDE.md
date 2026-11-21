@@ -17,7 +17,7 @@ judged on architecture, reliability, code quality, tests, docs and **commit hist
 - **Architecture is decided with the user first.** Don't introduce a new dependency, broker, datastore or framework without an accepted ADR.
 - Work phase by phase from `docs/plan.md`; keep changes scoped to the current phase.
 - Every commit: builds, `make test` green, `make lint` clean, Conventional Commit message, one logical change.
-- Keep `README.md`, OpenAPI spec and `.env.example` in sync with behavior in the same commit.
+- Keep `README.md`, `docs/` (API guide, configuration, how it works), the OpenAPI spec and `.env.example` in sync with behavior in the same commit.
 - Never call the real webhook.site from tests; use `httptest`.
 - Never commit secrets or `docs/assesment.pdf`.
 

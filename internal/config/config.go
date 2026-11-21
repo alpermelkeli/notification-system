@@ -1,7 +1,7 @@
 // Package config loads the service configuration from environment variables.
 //
 // Configuration is parsed once at start-up into a typed struct. Every variable is documented in
-// README.md and .env.example.
+// docs/configuration.md and .env.example.
 package config
 
 import (
