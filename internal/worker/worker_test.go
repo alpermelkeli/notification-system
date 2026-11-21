@@ -46,12 +46,6 @@ func (f *fakeStore) add(pr domain.Priority, status domain.Status, attempts int) 
 	return *n
 }
 
-func (f *fakeStore) setStatus(id uuid.UUID, s domain.Status) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.rows[id].Status = s
-}
-
 func (f *fakeStore) outcome(id uuid.UUID) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -340,23 +334,16 @@ func TestStaleAndUndecodableRecordsAreSkipped(t *testing.T) {
 	h := newHarness(t, nil, Options{})
 	cancelled := h.store.add(domain.PriorityNormal, domain.StatusCancelled, 0)
 	h.feed(t, cancelled, 0)
+	// A record whose row is pending again (requeued by the reaper) is a stale duplicate.
+	h.feed(t, h.store.add(domain.PriorityNormal, domain.StatusPending, 0), 0)
 	h.feed(t, domain.Notification{ID: domain.NewIDAt(time.Now()), CreatedAt: time.Now(), Channel: domain.ChannelSMS, Priority: domain.PriorityNormal}, 0) // unknown id
-	h.w.enqueue(&kgo.Record{Topic: normalTopic, Partition: 0, Offset: 2, Value: []byte("garbage")})
-	h.offsets[0] = 3
+	h.w.enqueue(&kgo.Record{Topic: normalTopic, Partition: 0, Offset: 3, Value: []byte("garbage")})
+	h.offsets[0] = 4
 
-	eventually(t, "skips committed", func() bool { return h.committedAt(normalTopic, 0) == 3 })
+	eventually(t, "skips committed", func() bool { return h.committedAt(normalTopic, 0) == 4 })
 	if sent := h.sender.sent(); len(sent) != 0 {
 		t.Errorf("stale records were sent: %v", sent)
 	}
-}
-
-func TestClaimWaitsForTheDispatchCommit(t *testing.T) {
-	h := newHarness(t, nil, Options{})
-	n := h.store.add(domain.PriorityNormal, domain.StatusPending, 0)
-	h.feed(t, n, 0)
-	time.Sleep(60 * time.Millisecond)
-	h.store.setStatus(n.ID, domain.StatusQueued) // the dispatcher's transaction commits now
-	eventually(t, "delivery", func() bool { return h.store.outcome(n.ID) == "sent m" })
 }
 
 func TestClaimErrorLeavesRowForTheReaper(t *testing.T) {

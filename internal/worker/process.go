@@ -10,12 +10,6 @@ import (
 	"github.com/alpermelkeli/notification-system/internal/provider"
 )
 
-// Claim retries while the row is still in a dispatchable status: the dispatcher commits queued
-// only after Kafka acknowledged the record, so a fast worker can see the record first
-// (ADR-0003 amendment). Records that still find the row unclaimable are skipped, and the reaper
-// re-publishes the row if it was in fact lost.
-var claimRetries = []time.Duration{50 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond}
-
 // persistRetries bounds retries of an outcome write that failed because PostgreSQL was
 // unavailable. If all fail, the lease expires and the reaper retries the notification.
 var persistRetries = []time.Duration{200 * time.Millisecond, time.Second, 2 * time.Second}
@@ -88,34 +82,17 @@ func (w *Worker) retryDelay(ctx context.Context, sendErr error) time.Duration {
 	return delay
 }
 
-// claim claims the record's notification, retrying briefly while the dispatcher's commit may
-// still be in flight. It returns errStale when the record must be skipped.
+// claim claims the record's notification. If the dispatcher has not committed the row as queued
+// yet, the claim waits on its row lock (storage.apply), so an early record is not skipped. It
+// returns errStale when the record must be skipped.
 func (w *Worker) claim(ctx context.Context, r record) (domain.Notification, error) {
-	for i := 0; ; i++ {
-		n, err := w.store.Claim(ctx, r.msg.ID, r.msg.CreatedAt, w.opts.Lease)
-		if err == nil {
-			return n, nil
-		}
-		var te *domain.TransitionError
-		switch {
-		case errors.As(err, &te) && dispatchable(te.Current) && i < len(claimRetries):
-			sleep(ctx, claimRetries[i])
-			continue
-		case errors.As(err, &te), errors.Is(err, domain.ErrNotFound):
-			// Cancelled, already claimed or finished, or a duplicate publish (ADR-0004).
-			return domain.Notification{}, errors.Join(errStale, err)
-		}
-		return domain.Notification{}, err
+	n, err := w.store.Claim(ctx, r.msg.ID, r.msg.CreatedAt, w.opts.Lease)
+	var te *domain.TransitionError
+	if errors.As(err, &te) || errors.Is(err, domain.ErrNotFound) {
+		// Cancelled, already claimed or finished, or a duplicate publish (ADR-0004).
+		return domain.Notification{}, errors.Join(errStale, err)
 	}
-}
-
-func dispatchable(s domain.Status) bool {
-	for _, d := range domain.DispatchableStatuses {
-		if s == d {
-			return true
-		}
-	}
-	return false
+	return n, err
 }
 
 // persist runs an outcome write, retrying while PostgreSQL is unavailable. Guard failures
