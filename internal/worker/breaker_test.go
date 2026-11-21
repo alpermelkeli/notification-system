@@ -155,7 +155,7 @@ func TestBreakerOptionsDefaults(t *testing.T) {
 }
 
 func TestBreakerTripsOnFailureRatio(t *testing.T) {
-	c := newCircuit("t", BreakerOptions{ConsecutiveFailures: 100, FailureRatio: 0.5, MinRequests: 10, Window: time.Minute, OpenTimeout: time.Hour}, discard)
+	c := newCircuit("t", BreakerOptions{ConsecutiveFailures: 100, FailureRatio: 0.5, MinRequests: 10, Window: time.Minute, OpenTimeout: time.Hour}, discard, nil)
 	for i := range 10 {
 		a, err := c.allow()
 		if err != nil {
@@ -175,7 +175,7 @@ func TestBreakerTripsOnFailureRatio(t *testing.T) {
 // TestSendAdmittedBeforeATripIsRevokedInHalfOpen: only the probe may reach a recovering
 // provider; a send admitted while closed and delayed past the open period is released.
 func TestSendAdmittedBeforeATripIsRevokedInHalfOpen(t *testing.T) {
-	c := newCircuit("t", BreakerOptions{ConsecutiveFailures: 1, OpenTimeout: 50 * time.Millisecond}, discard)
+	c := newCircuit("t", BreakerOptions{ConsecutiveFailures: 1, OpenTimeout: 50 * time.Millisecond}, discard, nil)
 	early, err := c.allow()
 	if err != nil || early.probe {
 		t.Fatalf("closed admission: %+v, %v", early, err)

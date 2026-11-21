@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/alpermelkeli/notification-system/internal/domain"
+	"github.com/alpermelkeli/notification-system/internal/telemetry"
 )
 
 // Request headers sent with every delivery.
@@ -83,7 +84,8 @@ func New(rawURL string, timeout time.Duration) (*Client, error) {
 	return &Client{
 		url:  rawURL,
 		name: u.Host,
-		http: &http.Client{Timeout: timeout, Transport: transport},
+		// Each call gets a client span and a traceparent header (B-5).
+		http: &http.Client{Timeout: timeout, Transport: telemetry.HTTPTransport(transport)},
 	}, nil
 }
 

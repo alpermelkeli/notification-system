@@ -7,6 +7,7 @@ import (
 
 	"github.com/sony/gobreaker/v2"
 
+	"github.com/alpermelkeli/notification-system/internal/metrics"
 	"github.com/alpermelkeli/notification-system/internal/provider"
 )
 
@@ -52,7 +53,9 @@ type circuit struct {
 	timeout time.Duration
 }
 
-func newCircuit(name string, o BreakerOptions, logger *slog.Logger) *circuit {
+// newCircuit returns a breaker; onChange, if set, receives every state change as the metrics
+// gauge value and the new state's name.
+func newCircuit(name string, o BreakerOptions, logger *slog.Logger, onChange func(state int, to string)) *circuit {
 	return &circuit{
 		timeout: o.OpenTimeout,
 		cb: gobreaker.NewTwoStepCircuitBreaker[struct{}](gobreaker.Settings{
@@ -83,8 +86,23 @@ func newCircuit(name string, o BreakerOptions, logger *slog.Logger) *circuit {
 					log = logger.Info
 				}
 				log("circuit breaker state changed", "breaker", name, "from", from.String(), "to", to.String())
+				if onChange != nil {
+					onChange(gaugeValue(to), to.String())
+				}
 			},
 		}),
+	}
+}
+
+// gaugeValue maps a breaker state to the circuit_breaker_state gauge.
+func gaugeValue(s gobreaker.State) int {
+	switch s {
+	case gobreaker.StateOpen:
+		return metrics.BreakerOpen
+	case gobreaker.StateHalfOpen:
+		return metrics.BreakerHalfOpen
+	default:
+		return metrics.BreakerClosed
 	}
 }
 
