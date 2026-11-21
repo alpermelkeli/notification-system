@@ -99,6 +99,9 @@ func setDefault[T int | time.Duration](v *T, def T) {
 	}
 }
 
+// fetchMaxWait bounds how long a fetch waits for data; see ConsumerOptions.
+const fetchMaxWait = 200 * time.Millisecond
+
 // fetchControl pauses and resumes topics. *kgo.Client implements it.
 type fetchControl interface {
 	PauseFetchTopics(topics ...string) []string
@@ -157,6 +160,11 @@ func (w *Worker) ConsumerOptions() []kgo.Opt {
 		kgo.BlockRebalanceOnPoll(),
 		// A new group must not skip records published before its first member joined.
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		// A resumed topic is fetched only after the fetch in flight returns, and a fetch on idle
+		// partitions waits up to FetchMaxWait (default 5s). With backpressure pausing and resuming
+		// topics continuously, that default stalled delivery for 5s per resume (measured: ~50
+		// sends every 5s instead of 100/s), so keep the long poll short.
+		kgo.FetchMaxWait(fetchMaxWait),
 		kgo.OnPartitionsAssigned(func(_ context.Context, _ *kgo.Client, assigned map[string][]int32) {
 			w.logger.Info("partitions assigned", "partitions", assigned)
 		}),
