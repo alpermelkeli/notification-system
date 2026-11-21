@@ -73,8 +73,11 @@ recipient or the content.
 - When the client's buffer is full, the record is dropped instead of blocking. A record that is
   never acknowledged within the delivery timeout is also dropped.
 - Both cases are counted in `notifier_status_events_total{result}`.
-- The API now has its own Kafka producer. It is not part of the API's readiness check: with
-  Kafka down, creates and cancels still work and only the live updates pause.
+- Every role publishes events on a Kafka client of their own: leader acks, a 2000-record buffer
+  and a 3 s delivery timeout. On a shared client, event records waiting out a Kafka hiccup would
+  fill the buffer that the dispatcher's work records and the workers' dead letters block on.
+- The API's event client is not part of its readiness check: with Kafka down, creates and
+  cancels still work and only the live updates pause.
 
 **WebSocket** (`GET /v1/ws`, served by every API instance):
 - **Client → server:** `{"type":"subscribe","notificationIds":[…],"batchIds":[…]}` and
@@ -89,11 +92,17 @@ recipient or the content.
   the two is lost. A client keeps, for each notification, the status with the latest `at`.
 - **Limits:**
   - 1000 subscriptions per connection; a batch counts as one;
-  - at most 100 ids per subscribe message, since each new id costs one snapshot read;
-  - client messages up to 64 KiB;
-  - 256 messages may be queued per connection, and a client that falls further behind is
-    disconnected with close code 1008;
-  - a ping every 30 s detects dead peers.
+  - at most 100 ids per subscribe message;
+  - client messages up to 64 KiB, handled at most 10 per second and connection; 8 may wait, and
+    further ones are answered with `rate_limited`;
+  - snapshots of new notification ids are read with one query, and at most 4 snapshot reads run
+    at once per instance, so subscribers cannot take the database pool from the REST API;
+  - 256 events may be queued per connection, and a client that falls further behind is
+    disconnected with close code 1008; answers to the client's own requests have a separate
+    queue, so they never cause that;
+  - 10 000 connections per instance, beyond which connections are closed with 1013;
+  - a ping every 30 s, from its own goroutine, detects dead peers. The reader only reads, so
+    pongs are processed even while a request is handled.
 - **Origin:** browsers must connect from the API's own origin, which is the library's default.
   The demo page at `/ws-demo` is served from it. Non-browser clients send no `Origin` header.
 - **Shutdown:** on shutdown, open sockets are closed with 1001 (going away). Clients reconnect

@@ -377,15 +377,17 @@ paths:
         - `{"type":"status","event":StatusEvent}`: every later status change of a followed
           notification, or of any notification of a followed batch.
         - `{"type":"error","code","message","id"}`: codes `bad_request`, `invalid_id`, `not_found`
-          (the id is not kept), `too_many_subscriptions`, `snapshot_failed`. The connection stays open.
+          (the id is not kept), `too_many_subscriptions`, `snapshot_failed`, `rate_limited` (at most
+          10 messages per second are handled). The connection stays open.
 
         Updates are best effort and may arrive out of order: keep the event with the latest `at`
         per notification, and read the REST API when in doubt. On reconnect, subscribe again and
         the snapshots fill the gap.
 
         Close codes: `1001` server shutting down (reconnect), `1003` binary frame, `1008` client too
-        slow (more than 256 messages behind), `1009` message over 64 KiB. Browsers must connect from
-        the API's own origin.
+        slow (more than 256 events behind), `1009` message over 64 KiB, `1013` instance full (try
+        again). Browsers must connect from the API's own origin. Failed upgrades (403, 426) are
+        answered in plain text by the WebSocket library, not with the error envelope.
       responses:
         '101':
           description: Switching to the WebSocket protocol. Messages follow the description above; events use the StatusEvent schema.
@@ -393,10 +395,10 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/StatusEvent' }
         '403':
-          description: A browser connected from another origin.
+          description: A browser connected from another origin (plain text).
         '404': { $ref: '#/components/responses/NotFound' }
         '426':
-          description: The request was not a WebSocket upgrade.
+          description: The request was not a WebSocket upgrade (plain text).
   /healthz:
     get:
       tags: [operations]

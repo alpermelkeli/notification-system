@@ -25,15 +25,27 @@ const (
 	MaxSubscriptions = 1000
 	// MaxIDsPerMessage bounds the ids of one subscribe message; each new id costs a snapshot read.
 	MaxIDsPerMessage = 100
-	// sendQueue is how many messages may wait for a slow client before it is disconnected.
+	// MaxConnections bounds the connections of one API instance; more are closed with 1013.
+	MaxConnections = 10_000
+	// sendQueue is how many events may wait for a slow client before it is disconnected.
 	sendQueue = 256
+	// replyQueue is how many answers to the client's own requests may wait.
+	replyQueue = 32
+	// snapshotSlots bounds the snapshot reads running at once across all connections, so
+	// subscribers cannot take the database pool from the REST API.
+	snapshotSlots = 4
 )
 
-var errTooManySubscriptions = errors.New("too many subscriptions")
+var (
+	errTooManySubscriptions = errors.New("too many subscriptions")
+	errShuttingDown         = errors.New("shutting down")
+	errTooManyConnections   = errors.New("too many connections")
+)
 
 // client is the hub's side of one connection.
 type client struct {
-	out      chan []byte
+	out      chan []byte   // events
+	replies  chan []byte   // answers to the client's requests
 	slow     chan struct{} // closed when out overflowed
 	slowOnce sync.Once
 
@@ -44,7 +56,7 @@ type client struct {
 
 func newClient() *client {
 	return &client{
-		out: make(chan []byte, sendQueue), slow: make(chan struct{}),
+		out: make(chan []byte, sendQueue), replies: make(chan []byte, replyQueue), slow: make(chan struct{}),
 		notifications: map[uuid.UUID]struct{}{}, batches: map[uuid.UUID]struct{}{},
 	}
 }
@@ -70,9 +82,10 @@ type Hub struct {
 	clients        map[*client]struct{}
 	closing        bool
 
-	done     chan struct{} // closed by Shutdown
-	doneOnce sync.Once
-	conns    sync.WaitGroup
+	done      chan struct{} // closed by Shutdown
+	doneOnce  sync.Once
+	conns     sync.WaitGroup
+	snapshots chan struct{} // semaphore of snapshot reads
 
 	metrics *metrics.WebSocket
 	logger  *slog.Logger
@@ -85,21 +98,35 @@ func NewHub(m *metrics.WebSocket, logger *slog.Logger) *Hub {
 		byBatch:        map[uuid.UUID]map[*client]struct{}{},
 		clients:        map[*client]struct{}{},
 		done:           make(chan struct{}),
+		snapshots:      make(chan struct{}, snapshotSlots),
 		metrics:        m,
 		logger:         logger,
 	}
 }
 
-// register adds a connection. It returns false once the hub is shutting down.
-func (h *Hub) register(c *client) bool {
+// register adds a connection. It fails once the hub is shutting down or full.
+func (h *Hub) register(c *client) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.closing {
-		return false
+	switch {
+	case h.closing:
+		return errShuttingDown
+	case len(h.clients) >= MaxConnections:
+		return errTooManyConnections
 	}
 	h.clients[c] = struct{}{}
 	h.conns.Add(1)
-	return true
+	return nil
+}
+
+// withSnapshotSlot runs fn once a snapshot slot is free, or not at all if ctx ends first.
+func (h *Hub) withSnapshotSlot(ctx context.Context, fn func()) {
+	select {
+	case h.snapshots <- struct{}{}:
+		defer func() { <-h.snapshots }()
+		fn()
+	case <-ctx.Done():
+	}
 }
 
 // unregister removes a connection and all its subscriptions.

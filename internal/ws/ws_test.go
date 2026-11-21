@@ -31,14 +31,16 @@ type fakeStore struct {
 	batches       map[uuid.UUID]domain.Batch
 }
 
-func (f *fakeStore) GetNotification(_ context.Context, id uuid.UUID) (domain.Notification, error) {
+func (f *fakeStore) GetNotifications(_ context.Context, ids []uuid.UUID) (map[uuid.UUID]domain.Notification, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	n, ok := f.notifications[id]
-	if !ok {
-		return domain.Notification{}, domain.ErrNotFound
+	out := map[uuid.UUID]domain.Notification{}
+	for _, id := range ids {
+		if n, ok := f.notifications[id]; ok {
+			out[id] = n
+		}
 	}
-	return n, nil
+	return out, nil
 }
 
 func (f *fakeStore) GetBatch(_ context.Context, id uuid.UUID) (domain.Batch, error) {
@@ -411,4 +413,61 @@ func TestClientCloseIsCounted(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.waitDisconnects(t, metrics.WSClosedByClient)
+}
+
+// TestRepliesDoNotCrowdOutEvents: a subscribe of 100 ids queues 101 replies; events have a queue
+// of their own, so events arriving meanwhile neither get dropped nor disconnect the client.
+func TestRepliesDoNotCrowdOutEvents(t *testing.T) {
+	f := newFixture(t)
+	ids := make([]string, MaxIDsPerMessage)
+	var first domain.Notification
+	for i := range ids {
+		n := f.notification(domain.StatusPending, nil)
+		if i == 0 {
+			first = n
+		}
+		ids[i] = `"` + n.ID.String() + `"`
+	}
+	c := f.dial(t)
+	c.send(`{"type":"subscribe","notificationIds":[` + strings.Join(ids, ",") + `]}`)
+	time.Sleep(200 * time.Millisecond) // the subscription is in place; nothing has been read yet
+	for range sendQueue - 10 {
+		f.hub.Publish(event(first, domain.StatusQueued))
+	}
+	statuses := 0
+	for statuses < MaxIDsPerMessage+sendQueue-10 {
+		if m := c.next(); m["type"] == typeStatus {
+			statuses++
+		}
+	}
+	if got := f.disconnects(t, metrics.WSSlowConsumer); got != 0 {
+		t.Errorf("slow consumer disconnects = %v", got)
+	}
+}
+
+// TestRequestsAreRateLimited: requests are handled at most requestRate per second; a burst beyond
+// the pending queue is answered with rate_limited instead of blocking the reader.
+func TestRequestsAreRateLimited(t *testing.T) {
+	f := newFixture(t)
+	c := f.dial(t)
+	n := f.notification(domain.StatusPending, nil)
+	msg := fmt.Sprintf(`{"type":"unsubscribe","notificationIds":[%q]}`, n.ID)
+	const burst = 40
+	for range burst {
+		c.send(msg)
+	}
+	limited, acks := 0, 0
+	for limited+acks < burst {
+		switch m := c.next(); m["type"] {
+		case typeError:
+			if m["code"] == "rate_limited" {
+				limited++
+			}
+		case typeSubscribed:
+			acks++
+		}
+	}
+	if limited == 0 || acks < pendingRequests {
+		t.Errorf("%d answered, %d rate limited; want both", acks, limited)
+	}
 }

@@ -135,8 +135,11 @@ websocat ws://localhost:8080/v1/ws
 # {"type":"status","event":{"notificationId":"…","status":"sent","attempts":1,...}}
 ```
 
-Limits: 1000 subscriptions per connection (100 ids per message), and a client that falls 256
-messages behind is closed with `1008`. On shutdown, connections are closed with `1001`; the
+Limits:
+- 1000 subscriptions per connection, 100 ids per message, and 10 messages handled per second.
+- Snapshot reads are batched, and at most 4 run at once per instance.
+- A client that falls 256 events behind is closed with `1008`.
+- 10 000 connections per instance; further ones are closed with `1013`. On shutdown, connections are closed with `1001`; the
 client reconnects, subscribes again and gets fresh snapshots. Metrics: `notifier_ws_connections`,
 `notifier_ws_messages_total{type}`, `notifier_ws_disconnects_total{reason}`.
 

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -24,12 +25,17 @@ const (
 	pingInterval    = 30 * time.Second
 	writeTimeout    = 10 * time.Second
 	snapshotTimeout = 5 * time.Second
+	// requestRate bounds the client messages handled per second and connection; pendingRequests
+	// may wait, and further ones are answered with rate_limited.
+	requestRate     = 10
+	pendingRequests = 8
 )
 
 // Store reads the current state sent as a snapshot after a subscribe. *storage.Store implements
 // it.
 type Store interface {
-	GetNotification(ctx context.Context, id uuid.UUID) (domain.Notification, error)
+	// GetNotifications returns the notifications that exist among ids, by id.
+	GetNotifications(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]domain.Notification, error)
 	GetBatch(ctx context.Context, id uuid.UUID) (domain.Batch, error)
 }
 
@@ -100,6 +106,10 @@ func NewHandler(hub *Hub, store Store, logger *slog.Logger) *Handler {
 // ServeHTTP upgrades the request and serves the connection until either side closes it.
 // Browsers may only connect from the API's own origin (the library's default check); clients
 // without an Origin header, such as CLI tools and services, are accepted.
+//
+// Four goroutines serve a connection. The reader only reads, so pongs are always processed; the
+// processor handles requests one at a time, at most requestRate per second; the pinger checks
+// the peer; this goroutine writes and decides when the connection ends.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Accept(w, r, nil)
 	if err != nil {
@@ -110,50 +120,58 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	c := newClient()
-	if !h.hub.register(c) {
+	switch err := h.hub.register(c); {
+	case errors.Is(err, errShuttingDown):
 		_ = conn.Close(websocket.StatusGoingAway, "server shutting down")
+		return
+	case errors.Is(err, errTooManyConnections):
+		_ = conn.Close(websocket.StatusTryAgainLater, "too many connections; try again later")
 		return
 	}
 	h.metrics.Connected()
 	conn.SetReadLimit(maxMessageBytes)
 
-	var readErr error
-	readDone := make(chan struct{})
-	go func() { defer close(readDone); readErr = h.read(ctx, conn, c) }()
+	var (
+		wg      sync.WaitGroup
+		readErr error
+	)
+	readDone, pingFailed := make(chan struct{}), make(chan struct{})
+	requests := make(chan []byte, pendingRequests)
+	wg.Go(func() { defer close(readDone); readErr = h.read(ctx, conn, c, requests) })
+	wg.Go(func() { h.process(ctx, c, requests) })
+	wg.Go(func() { h.ping(ctx, conn, pingFailed) })
 
-	reason := h.write(ctx, conn, c, readDone, func() error { return readErr })
-	// Stop the reader before unregistering, so it cannot add subscriptions for a gone client.
+	reason := h.write(ctx, conn, c, readDone, pingFailed, func() error { return readErr })
+	// Stop the other goroutines before unregistering, so none can add subscriptions for a gone
+	// client.
 	cancel()
 	_ = conn.CloseNow()
-	<-readDone
+	wg.Wait()
 	h.hub.unregister(c)
 	h.metrics.Disconnected(reason)
 	h.logger.DebugContext(ctx, "websocket closed", "reason", reason)
 }
 
-// write sends queued messages and pings until the connection ends, closes it with the right code
-// and returns why it ended. readErr may be called once readDone is closed.
-func (h *Handler) write(ctx context.Context, conn *websocket.Conn, c *client, readDone <-chan struct{}, readErr func() error) string {
-	ping := time.NewTicker(pingInterval)
-	defer ping.Stop()
+// write sends replies and events until the connection ends, closes it with the right code and
+// returns why it ended. readErr may be called once readDone is closed.
+func (h *Handler) write(ctx context.Context, conn *websocket.Conn, c *client, readDone, pingFailed <-chan struct{}, readErr func() error) string {
+	send := func(msg []byte) bool {
+		wctx, cancel := context.WithTimeout(ctx, writeTimeout)
+		defer cancel()
+		return conn.Write(wctx, websocket.MessageText, msg) == nil
+	}
 	for {
 		select {
-		case msg := <-c.out:
-			wctx, cancel := context.WithTimeout(ctx, writeTimeout)
-			err := conn.Write(wctx, websocket.MessageText, msg)
-			cancel()
-			if err != nil {
-				_ = conn.CloseNow()
+		case msg := <-c.replies:
+			if !send(msg) {
 				return metrics.WSError
 			}
-		case <-ping.C:
-			pctx, cancel := context.WithTimeout(ctx, writeTimeout)
-			err := conn.Ping(pctx)
-			cancel()
-			if err != nil {
-				_ = conn.CloseNow()
-				return metrics.WSPingTimeout
+		case msg := <-c.out:
+			if !send(msg) {
+				return metrics.WSError
 			}
+		case <-pingFailed:
+			return metrics.WSPingTimeout
 		case <-c.slow:
 			_ = conn.Close(websocket.StatusPolicyViolation, "client too slow; reconnect and subscribe again")
 			return metrics.WSSlowConsumer
@@ -174,8 +192,33 @@ func (h *Handler) write(ctx context.Context, conn *websocket.Conn, c *client, re
 	}
 }
 
-// read handles client messages until the connection fails or the client closes it.
-func (h *Handler) read(ctx context.Context, conn *websocket.Conn, c *client) error {
+// ping pings the peer every pingInterval and closes pingFailed when a pong does not arrive in
+// time. It runs on its own, so a long write or request never delays the check.
+func (h *Handler) ping(ctx context.Context, conn *websocket.Conn, pingFailed chan<- struct{}) {
+	t := time.NewTicker(pingInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		pctx, cancel := context.WithTimeout(ctx, writeTimeout)
+		err := conn.Ping(pctx)
+		cancel()
+		if err != nil {
+			if ctx.Err() == nil {
+				close(pingFailed)
+			}
+			return
+		}
+	}
+}
+
+// read reads client messages and hands them to the processor until the connection fails or the
+// client closes it. It never blocks on a request: a client with pendingRequests requests waiting
+// gets an error for the next one.
+func (h *Handler) read(ctx context.Context, conn *websocket.Conn, c *client, requests chan<- []byte) error {
 	for {
 		typ, data, err := conn.Read(ctx)
 		if err != nil {
@@ -184,8 +227,32 @@ func (h *Handler) read(ctx context.Context, conn *websocket.Conn, c *client) err
 		if typ != websocket.MessageText {
 			return websocket.CloseError{Code: websocket.StatusUnsupportedData, Reason: "only JSON text messages are accepted"}
 		}
-		if err := h.handle(ctx, c, data); err != nil {
-			return err
+		select {
+		case requests <- data:
+		default:
+			h.tryReply(c, errorMessage{Type: typeError, Code: "rate_limited",
+				Message: fmt.Sprintf("too many requests in flight; at most %d per second are handled", requestRate)})
+		}
+	}
+}
+
+// process handles requests in order, at most requestRate per second.
+func (h *Handler) process(ctx context.Context, c *client, requests <-chan []byte) {
+	t := time.NewTicker(time.Second / requestRate)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case data := <-requests:
+			if err := h.handle(ctx, c, data); err != nil {
+				return
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
 		}
 	}
 }
@@ -234,31 +301,55 @@ func (h *Handler) handle(ctx context.Context, c *client, data []byte) error {
 }
 
 // snapshot sends the current state of newly subscribed ids. An id that does not exist is
-// unsubscribed again and reported.
+// unsubscribed again and reported. Snapshot reads share the API's database pool, so the hub
+// bounds how many run at once across all connections.
 func (h *Handler) snapshot(ctx context.Context, c *client, notifications, batches []uuid.UUID) error {
-	for _, id := range notifications {
-		sctx, cancel := context.WithTimeout(ctx, snapshotTimeout)
-		n, err := h.store.GetNotification(sctx, id)
-		cancel()
-		var msg any
-		switch {
-		case errors.Is(err, domain.ErrNotFound):
-			h.hub.unsubscribe(c, []uuid.UUID{id}, nil)
-			msg = errorMessage{Type: typeError, Code: "not_found", Message: "no notification with this id", ID: id.String()}
-		case err != nil:
-			h.logger.WarnContext(ctx, "websocket snapshot failed", "notification_id", id, "err", err)
-			msg = errorMessage{Type: typeError, Code: "snapshot_failed", Message: "current status unavailable; updates follow", ID: id.String()}
-		default:
-			msg = statusMessage{Type: typeStatus, Event: queue.NewStatusEvent(n), Snapshot: true}
+	if len(notifications) > 0 {
+		var (
+			found map[uuid.UUID]domain.Notification
+			err   error
+		)
+		h.hub.withSnapshotSlot(ctx, func() {
+			sctx, cancel := context.WithTimeout(ctx, snapshotTimeout)
+			defer cancel()
+			found, err = h.store.GetNotifications(sctx, notifications)
+		})
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-		if err := h.reply(ctx, c, msg); err != nil {
-			return err
+		for _, id := range notifications {
+			var msg any
+			n, ok := found[id]
+			switch {
+			case err != nil:
+				msg = errorMessage{Type: typeError, Code: "snapshot_failed", Message: "current status unavailable; updates follow", ID: id.String()}
+			case !ok:
+				h.hub.unsubscribe(c, []uuid.UUID{id}, nil)
+				msg = errorMessage{Type: typeError, Code: "not_found", Message: "no notification with this id", ID: id.String()}
+			default:
+				msg = statusMessage{Type: typeStatus, Event: queue.NewStatusEvent(n), Snapshot: true}
+			}
+			if err := h.reply(ctx, c, msg); err != nil {
+				return err
+			}
+		}
+		if err != nil {
+			h.logger.WarnContext(ctx, "websocket snapshot failed", "notifications", len(notifications), "err", err)
 		}
 	}
 	for _, id := range batches {
-		sctx, cancel := context.WithTimeout(ctx, snapshotTimeout)
-		b, err := h.store.GetBatch(sctx, id)
-		cancel()
+		var (
+			b   domain.Batch
+			err error
+		)
+		h.hub.withSnapshotSlot(ctx, func() {
+			sctx, cancel := context.WithTimeout(ctx, snapshotTimeout)
+			defer cancel()
+			b, err = h.store.GetBatch(sctx, id)
+		})
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		var msg any
 		switch {
 		case errors.Is(err, domain.ErrNotFound):
@@ -286,19 +377,33 @@ func (h *Handler) replySubscriptions(ctx context.Context, c *client) error {
 	return h.reply(ctx, c, subscribedMessage{Type: typeSubscribed, NotificationIDs: notifications, BatchIDs: batches})
 }
 
-// reply queues an answer to the client's own request. Unlike events it waits for room in the
-// queue: a client that sends many requests is slowed down, not disconnected.
+// reply queues an answer to the client's own request. Replies have a queue of their own, so they
+// never take the room events need, and unlike events they wait for room: a client that sends
+// many requests is slowed down, not disconnected.
 func (h *Handler) reply(ctx context.Context, c *client, msg any) error {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("encode websocket reply: %w", err)
 	}
 	select {
-	case c.out <- data:
+	case c.replies <- data:
 		h.metrics.Sent(messageType(msg))
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+// tryReply queues an answer if there is room, and drops it otherwise.
+func (h *Handler) tryReply(c *client, msg any) {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	select {
+	case c.replies <- data:
+		h.metrics.Sent(messageType(msg))
+	default:
 	}
 }
 

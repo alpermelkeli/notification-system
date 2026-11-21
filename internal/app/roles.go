@@ -100,9 +100,11 @@ func RunAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	defer cancel()
 	wg.Go(func() { hub.Consume(ctx, consumer) })
 	// http.Server.Shutdown does not track upgraded connections: close them as soon as the
-	// shutdown starts, and wait for their handlers before the pool closes.
+	// shutdown starts, and wait for their handlers before the pool closes. Shutdown runs again
+	// before the wait, so no handler can register while the wait runs.
 	wg.Go(func() { <-ctx.Done(); hub.Shutdown() })
 	defer func() {
+		hub.Shutdown()
 		wctx, wcancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.ShutdownTimeout)
 		defer wcancel()
 		if err := hub.Wait(wctx); err != nil {

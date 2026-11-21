@@ -120,6 +120,37 @@ func getNotification(ctx context.Context, q querier, id uuid.UUID) (domain.Notif
 	return n, nil
 }
 
+// GetNotifications returns the notifications that exist among ids, by id, in one query. Each id
+// carries its created_at, so only the partitions of the given ids are read.
+func (s *Store) GetNotifications(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]domain.Notification, error) {
+	var valid []uuid.UUID
+	var createdAts []time.Time
+	for _, id := range ids {
+		if domain.IsV7(id) {
+			valid, createdAts = append(valid, id), append(createdAts, domain.IDTime(id))
+		}
+	}
+	out := make(map[uuid.UUID]domain.Notification, len(valid))
+	if len(valid) == 0 {
+		return out, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+columns("n")+` FROM notifications n
+		  JOIN unnest($1::uuid[], $2::timestamptz[]) AS k(id, created_at)
+		    ON n.id = k.id AND n.created_at = k.created_at`, valid, createdAts)
+	if err != nil {
+		return nil, fmt.Errorf("get notifications: %w", err)
+	}
+	ns, err := collectNotifications(rows)
+	if err != nil {
+		return nil, fmt.Errorf("get notifications: %w", err)
+	}
+	for _, n := range ns {
+		out[n.ID] = n
+	}
+	return out, nil
+}
+
 // History returns the status changes of a notification, oldest first.
 func (s *Store) History(ctx context.Context, id uuid.UUID) ([]domain.StatusChange, error) {
 	if !domain.IsV7(id) {

@@ -188,3 +188,23 @@ func TestFindIdempotencyKey(t *testing.T) {
 		t.Errorf("replay = %+v, %v", replay, err)
 	}
 }
+
+func TestGetNotifications(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	a, _, err := s.CreateNotification(ctx, sms("a"), Origin{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _, err := s.CreateNotification(ctx, sms("b"), Origin{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetNotifications(ctx, []uuid.UUID{a.ID, b.ID, domain.NewIDAt(time.Now()), uuid.New()})
+	if err != nil || len(got) != 2 || got[a.ID].Content != "a" || got[b.ID].Content != "b" {
+		t.Errorf("GetNotifications = %+v, %v", got, err)
+	}
+	if got, err := s.GetNotifications(ctx, nil); err != nil || len(got) != 0 {
+		t.Errorf("no ids: %v, %v", got, err)
+	}
+}
