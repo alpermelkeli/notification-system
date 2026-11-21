@@ -62,9 +62,9 @@ func (m *HTTP) Middleware(next http.Handler) http.Handler {
 		if status == 0 {
 			status = http.StatusOK
 		}
-		route := httpx.RoutePattern(r)
-		m.requests.WithLabelValues(r.Method, route, strconv.Itoa(status)).Inc()
-		m.duration.WithLabelValues(r.Method, route).Observe(time.Since(start).Seconds())
+		route, method := httpx.RoutePattern(r), httpx.MethodLabel(r.Method)
+		m.requests.WithLabelValues(method, route, strconv.Itoa(status)).Inc()
+		m.duration.WithLabelValues(method, route).Observe(time.Since(start).Seconds())
 	})
 }
 

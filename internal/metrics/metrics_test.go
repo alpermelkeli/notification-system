@@ -27,6 +27,8 @@ func TestHTTPMiddlewareLabelsByRoutePattern(t *testing.T) {
 		httptest.NewRequest(http.MethodGet, "/v1/notifications/b", nil),
 		httptest.NewRequest(http.MethodPost, "/v1/notifications", nil),
 		httptest.NewRequest(http.MethodGet, "/nope", nil),
+		httptest.NewRequest("AAAA1", "/nope", nil),
+		httptest.NewRequest("AAAA2", "/nope", nil),
 	} {
 		r.ServeHTTP(httptest.NewRecorder(), req)
 	}
@@ -38,13 +40,15 @@ func TestHTTPMiddlewareLabelsByRoutePattern(t *testing.T) {
 		{[]string{"GET", "/v1/notifications/{id}", "404"}, 2},
 		{[]string{"POST", "/v1/notifications", "202"}, 1},
 		{[]string{"GET", "unmatched", "404"}, 1},
+		// Made-up methods share one series instead of one each.
+		{[]string{"_OTHER", "unmatched", "405"}, 2},
 	} {
 		if got := testutil.ToFloat64(m.requests.WithLabelValues(tc.labels...)); got != tc.want {
 			t.Errorf("requests%v = %v, want %v", tc.labels, got, tc.want)
 		}
 	}
-	if got := testutil.CollectAndCount(m.duration); got != 3 {
-		t.Errorf("duration series = %d, want 3 (one per method and route)", got)
+	if got := testutil.CollectAndCount(m.duration); got != 4 {
+		t.Errorf("duration series = %d, want 4 (one per method and route)", got)
 	}
 	if got := testutil.ToFloat64(m.inFlight); got != 0 {
 		t.Errorf("in flight after the requests = %v", got)

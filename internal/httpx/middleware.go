@@ -137,3 +137,15 @@ func RoutePattern(r *http.Request) string {
 	}
 	return "unmatched"
 }
+
+// MethodLabel returns m if it is a standard HTTP method and "_OTHER" otherwise, as the
+// OpenTelemetry conventions do. net/http accepts any token as a method, so a client could
+// otherwise create a metric series or span name per request.
+func MethodLabel(m string) string {
+	switch m {
+	case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch,
+		http.MethodDelete, http.MethodConnect, http.MethodOptions, http.MethodTrace:
+		return m
+	}
+	return "_OTHER"
+}
