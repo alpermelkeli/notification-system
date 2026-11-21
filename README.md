@@ -275,9 +275,27 @@ curl -XPOST localhost:8080/v1/notifications -H 'Content-Type: application/json' 
 | `email` | bare address (`user@example.com`, ≤ 254 bytes) | ≤ 64 KiB |
 | `push` | device token, 8–4096 printable ASCII chars | ≤ 4 KiB (APNs/FCM payload limit) |
 
-`scheduledAt` (optional) may be at most `MAX_SCHEDULE_AHEAD` (7 days) ahead; a past time means
-"as soon as possible", so idempotent retries keep working after the schedule passes. Unknown
-JSON fields are rejected. Status codes: `400` malformed request, `404` unknown id, `409`
+**Scheduled delivery (B-2):** set `scheduledAt` to deliver later.
+
+```bash
+curl -XPOST localhost:8080/v1/notifications -H 'Content-Type: application/json' \
+  -d '{"recipient":"user@example.com","channel":"email","content":"Your trial ends tomorrow",
+       "scheduledAt":"2026-11-22T09:00:00+03:00"}'
+# 202 {"status":"pending","scheduledAt":"2026-11-22T06:00:00Z","nextAttemptAt":"2026-11-22T06:00:00Z",...}
+```
+
+How it works:
+- The notification is stored as `pending` with `next_attempt_at = scheduledAt`, so it needs no
+  scheduler of its own.
+- The dispatcher's fallback poll (`DISPATCH_POLL_INTERVAL`, 500 ms) publishes it once it is due;
+  from then on it follows the normal priority and rate-limit path.
+- It can be cancelled until a worker claims it.
+- `scheduledAt` may be at most `MAX_SCHEDULE_AHEAD` (7 days) ahead, which keeps it inside the
+  data retention.
+- A time in the past means "as soon as possible", so idempotent retries keep working after the
+  scheduled time has passed.
+
+Unknown JSON fields are rejected. Status codes: `400` malformed request, `404` unknown id, `409`
 `invalid_state` or `idempotency_key_reused` (for batch items, `details` names the item), `413`
 body over 256 KiB (10 MiB for batches), `415` non-JSON body, `422` validation, `503` timeout.
 SMS segment counting follows carrier packing (an escape sequence or surrogate pair is never split
@@ -358,6 +376,9 @@ and are skipped by `make test-short`:
   the breaker stops the calls without burning attempts. One notification retried once is followed
   through a single trace: two dispatches under the stored request span, each delivery under its
   dispatch, and the `traceparent` reaching the provider on both calls.
+  A scheduled notification reaches the provider at its `scheduledAt` (not before, and within the
+  poll interval after it), one cancelled before its time is never sent, and one scheduled in the
+  past goes out at once.
 
 The worker engine (scheduler, watermarks, backpressure, rebalance, shutdown, outcome policy,
 circuit breaker, claim retry during a database outage) is unit-tested with fakes, without Kafka,
