@@ -86,10 +86,14 @@ func TestLimitHoldsAcrossLimiters(t *testing.T) {
 	}
 	wg.Wait()
 
-	// GCRA emits one token every 1/rate after the burst, so the first `tokens` grants need at
-	// least (tokens-burst)/rate.
-	if elapsed, min := times[tokens-1].Sub(start), time.Duration(tokens-burst)*time.Second/rate; elapsed < min*9/10 {
-		t.Errorf("%d tokens took %v, want at least %v", tokens, elapsed, min)
+	// Slots are 1/rate apart after the burst, so the first `tokens` grants need at least
+	// (tokens-burst)/rate; reservations are never lost, so they need little more.
+	elapsed, want := times[tokens-1].Sub(start), time.Duration(tokens-burst)*time.Second/rate
+	if elapsed < want*9/10 {
+		t.Errorf("%d tokens took %v, want at least %v", tokens, elapsed, want)
+	}
+	if elapsed > want*13/10 {
+		t.Errorf("%d tokens took %v; with 12 contending waiters the rate should still be about %d/s (%v)", tokens, elapsed, rate, want)
 	}
 	// No one-second window holds more than rate + burst grants.
 	for i := range times {
@@ -151,13 +155,13 @@ func TestCooldownPausesEveryLimiter(t *testing.T) {
 	if waited := time.Since(start); waited < 250*time.Millisecond {
 		t.Errorf("waited %v during a 300ms cool-down set by another worker", waited)
 	}
-	if ttl := rdb.PTTL(ctx, "ratelimit:push:p:cooldown").Val(); ttl > 0 {
+	if ttl := rdb.PTTL(ctx, "{ratelimit:push:p}:cooldown").Val(); ttl > 0 {
 		t.Errorf("cool-down still set: %v", ttl)
 	}
 	if err := a.Cooldown(ctx, domain.ChannelPush, time.Hour); err != nil {
 		t.Fatal(err)
 	}
-	if ttl := rdb.PTTL(ctx, "ratelimit:push:p:cooldown").Val(); ttl > MaxCooldown {
+	if ttl := rdb.PTTL(ctx, "{ratelimit:push:p}:cooldown").Val(); ttl > MaxCooldown {
 		t.Errorf("cool-down %v exceeds the cap", ttl)
 	}
 }
@@ -171,6 +175,29 @@ func TestRedisDownFailsClosed(t *testing.T) {
 	}
 	if err := l.Wait(context.Background(), domain.ChannelSMS); !IsUnavailable(err) {
 		t.Fatalf("err = %v, want a Redis error", err)
+	}
+}
+
+// TestReservationsStayNearNow: slots are never reserved more than maxReserveAhead
+// ahead, so a long queue of waiters cannot pre-book the channel far into the future.
+func TestReservationsStayNearNow(t *testing.T) {
+	rdb := newClient(t)
+	l, _ := New(rdb, "p", map[domain.Channel]Limit{domain.ChannelEmail: {PerSecond: 2, Burst: 1}})
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	var wg sync.WaitGroup
+	for range 10 { // 10 waiters at 2/s: only about 3 fit within the next second
+		wg.Go(func() { _ = l.Wait(ctx, domain.ChannelEmail) })
+	}
+	wg.Wait()
+	// The schedule must not extend far beyond now + maxReserveAhead.
+	tat, err := rdb.Get(context.Background(), l.Key(domain.ChannelEmail)).Int64()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ahead := time.Until(time.UnixMicro(tat))
+	if ahead > maxReserveAhead+time.Second {
+		t.Errorf("slots reserved %v ahead, want at most about %v", ahead, maxReserveAhead)
 	}
 }
 
