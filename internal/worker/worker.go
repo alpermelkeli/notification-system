@@ -1,11 +1,13 @@
 // Package worker consumes one channel's work topics and delivers notifications (ADR-0002,
 // ADR-0006):
 //
-//	Kafka batch fetch → route by topic → priority heaps → capped-aging pick → Redis token →
-//	guarded claim → provider → outcome in PostgreSQL → partition watermark → offset commit
+//	Kafka batch fetch → route by topic → priority heaps → circuit breaker → Redis token →
+//	capped-aging pick → guarded claim → provider → outcome in PostgreSQL (+ dead letter) →
+//	partition watermark → offset commit
 //
 // One Worker serves one channel. Kafka spreads the channel's partitions over all worker replicas
-// in the group workers.{channel}; the Redis limiter keeps the channel's global rate.
+// in the group workers.{channel}; the Redis limiter keeps the channel's global rate. Outcomes follow
+// ADR-0005: classification, backoff with jitter, dead letters and a per-instance circuit breaker.
 package worker
 
 import (
@@ -25,20 +27,28 @@ import (
 	"github.com/alpermelkeli/notification-system/internal/logging"
 	"github.com/alpermelkeli/notification-system/internal/provider"
 	"github.com/alpermelkeli/notification-system/internal/queue"
+	"github.com/alpermelkeli/notification-system/internal/retry"
 )
 
 // Store is the persistence a worker needs. *storage.Store implements it.
 type Store interface {
-	Claim(ctx context.Context, id uuid.UUID, createdAt time.Time, lease time.Duration) (domain.Notification, error)
+	Claim(ctx context.Context, id uuid.UUID, createdAt time.Time, lease time.Duration, token uuid.UUID) (domain.Notification, error)
 	MarkSent(ctx context.Context, l domain.Lease, providerMessageID string) (domain.Notification, error)
 	MarkRetrying(ctx context.Context, l domain.Lease, delay time.Duration, cause string) (domain.Notification, error)
 	MarkFailed(ctx context.Context, l domain.Lease, cause string) (domain.Notification, error)
 	Release(ctx context.Context, l domain.Lease, delay time.Duration, reason string) (domain.Notification, error)
+	GetNotification(ctx context.Context, id uuid.UUID) (domain.Notification, error)
 }
 
 // Sender delivers a message. *provider.Client implements it.
 type Sender interface {
 	Send(ctx context.Context, m provider.Message) (provider.Result, error)
+}
+
+// DeadLetterPublisher publishes the dead letters of failed notifications. *queue.DeadLetters
+// implements it.
+type DeadLetterPublisher interface {
+	Publish(ctx context.Context, ns ...domain.Notification) error
 }
 
 // Limiter hands out send tokens. *ratelimit.Limiter implements it.
@@ -58,14 +68,17 @@ type Options struct {
 	// Lease is how long a claim lasts. It must cover the provider timeout and the outcome write;
 	// an expired lease is reaped and the notification retried. Default 30s.
 	Lease time.Duration
-	// RetryDelay is the delay before a failed attempt is retried. Default 5s.
-	RetryDelay time.Duration
-	// MaxAttempts is the attempt budget; the last failure marks the notification failed. Default 5.
-	MaxAttempts int
+	// Retry is the backoff and attempt budget of failed sends. Zero fields take the ADR-0005
+	// defaults.
+	Retry retry.Policy
+	// DeadLetters, if set, receives every notification this worker moves to failed.
+	DeadLetters DeadLetterPublisher
 	// CommitInterval is how often watermarks are committed. Default 1s.
 	CommitInterval time.Duration
 	// RevokeTimeout bounds the wait for in-flight sends when partitions are revoked. Default 10s.
 	RevokeTimeout time.Duration
+	// Breaker configures the channel's circuit breaker.
+	Breaker BreakerOptions
 	// Policy is the priority policy. Default DefaultPolicy().
 	Policy *Policy
 	// Now returns the current time. Default time.Now.
@@ -77,8 +90,8 @@ func (o *Options) defaults() {
 	setDefault(&o.HighWater, 50)
 	setDefault(&o.LowWater, 25)
 	setDefault(&o.Lease, 30*time.Second)
-	setDefault(&o.RetryDelay, 5*time.Second)
-	setDefault(&o.MaxAttempts, 5)
+	o.Retry = o.Retry.WithDefaults()
+	o.Breaker.defaults()
 	setDefault(&o.CommitInterval, time.Second)
 	setDefault(&o.RevokeTimeout, 10*time.Second)
 	if o.LowWater >= o.HighWater {
@@ -126,6 +139,7 @@ type Worker struct {
 	ready  chan struct{} // signalled when a record is buffered
 
 	tracker  *tracker
+	circuit  *circuit
 	inFlight sync.WaitGroup
 	// commitMu serialises commits with revocations: a periodic commit computed before a revoke
 	// must not reach the broker after the revoke's commit and rewind the partition's offset.
@@ -138,11 +152,12 @@ type Worker struct {
 // New returns a worker for channel c.
 func New(c domain.Channel, store Store, sender Sender, limiter Limiter, logger *slog.Logger, opts Options) *Worker {
 	opts.defaults()
+	logger = logger.With("channel", string(c))
 	return &Worker{
-		channel: c, store: store, sender: sender, limiter: limiter,
-		logger: logger.With("channel", string(c)), opts: opts,
+		channel: c, store: store, sender: sender, limiter: limiter, logger: logger, opts: opts,
 		sched: newScheduler(*opts.Policy), paused: map[domain.Priority]bool{},
 		ready: make(chan struct{}, 1), tracker: newTracker(),
+		circuit: newCircuit("provider-"+string(c), opts.Breaker, logger),
 	}
 }
 
@@ -258,8 +273,11 @@ func (w *Worker) resumeIfDrained(pr domain.Priority) {
 	}
 }
 
-// schedule hands buffered records to senders: it waits for a free sender, then for a rate-limit
-// token, and only then picks, so the pick sees every record that arrived meanwhile (ADR-0006).
+// schedule hands buffered records to senders: it waits for a free sender, then for the circuit
+// breaker to admit a send, then for a rate-limit token, and only then picks, so the pick sees
+// every record that arrived meanwhile (ADR-0006). While the breaker is open nothing is picked:
+// records stay buffered, the full buffers pause fetching, and the watermark holds, so the backlog
+// waits safely in Kafka without burning attempts (ADR-0005).
 func (w *Worker) schedule(ctx context.Context) {
 	slots := make(chan struct{}, w.opts.Concurrency)
 	for w.waitForRecords(ctx) {
@@ -268,7 +286,14 @@ func (w *Worker) schedule(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		}
+		adm, err := w.circuit.allow()
+		if err != nil {
+			<-slots
+			sleep(ctx, breakerPoll)
+			continue
+		}
 		if err := w.limiter.Wait(ctx, w.channel); err != nil {
+			adm.done(errNotAttempted)
 			<-slots
 			if ctx.Err() != nil {
 				return
@@ -286,6 +311,7 @@ func (w *Worker) schedule(ctx context.Context) {
 		}
 		w.mu.Unlock()
 		if it == nil { // its partition was revoked while waiting for the token
+			adm.done(errNotAttempted)
 			<-slots
 			continue
 		}
@@ -296,12 +322,11 @@ func (w *Worker) schedule(ctx context.Context) {
 		go func(r record) {
 			defer w.inFlight.Done()
 			defer func() { <-slots }()
-			// A send is not abandoned on shutdown: it finishes and persists its outcome within the
-			// lease, so the record is not delivered twice.
-			sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.opts.Lease)
-			defer cancel()
-			w.process(sctx, r)
-			w.tracker.done(r.part, r.kr.Offset, true)
+			if w.process(ctx, r, adm) {
+				w.tracker.done(r.part, r.kr.Offset, true)
+			} else {
+				w.tracker.abandon(r.part)
+			}
 		}(it.rec)
 	}
 }
@@ -366,6 +391,7 @@ func (w *Worker) revoke(ctx context.Context, revoked map[string][]int32) {
 	if len(revoked) == 0 {
 		return
 	}
+	w.tracker.revoking(revoked)
 	dropped := w.drop(revoked)
 	deadline := time.Now().Add(w.opts.RevokeTimeout)
 	for w.tracker.inFlight(revoked) > 0 && time.Now().Before(deadline) && ctx.Err() == nil {

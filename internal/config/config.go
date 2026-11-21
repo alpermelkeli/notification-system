@@ -56,10 +56,23 @@ type Config struct {
 	// RequestTimeout bounds each public API request.
 	RequestTimeout time.Duration
 
+	// Retry is the delivery retry policy (ADR-0005): the worker's backoff, and the attempt budget
+	// that both the worker and the dispatcher's reaper enforce.
+	Retry Retry
 	// Dispatcher configures the relay and reaper (role: dispatcher).
 	Dispatcher Dispatcher
 	// Worker configures delivery (role: worker).
 	Worker Worker
+}
+
+// Retry configures exponential backoff with equal jitter (ADR-0005, FR-3.1).
+type Retry struct {
+	// BaseDelay is the backoff ceiling of the first retry; it doubles per attempt.
+	BaseDelay time.Duration
+	// MaxDelay caps the backoff ceiling.
+	MaxDelay time.Duration
+	// MaxAttempts is the attempt budget of a notification.
+	MaxAttempts int
 }
 
 // Dispatcher configures the dispatcher role (ADR-0003).
@@ -92,14 +105,25 @@ type Worker struct {
 	RateLimits map[domain.Channel]int
 	// RateLimitBurst is the burst allowance of each channel's bucket.
 	RateLimitBurst int
-	// RetryDelay is the delay before a failed attempt is retried.
-	RetryDelay time.Duration
-	// MaxAttempts is the attempt budget of a notification.
-	MaxAttempts int
+	// Breaker configures the per-channel circuit breaker of each worker (ADR-0005).
+	Breaker Breaker
 	// AgingRate is the scheduler's aging rate in points per second waited.
 	AgingRate float64
 	// MinShareEvery reserves one pick in this many for non-high traffic (0 disables).
 	MinShareEvery int
+}
+
+// Breaker configures the per-channel circuit breaker (ADR-0005, B-1).
+type Breaker struct {
+	// ConsecutiveFailures opens the breaker after this many retryable failures in a row.
+	ConsecutiveFailures int
+	// FailureRatio opens it when more than this share of at least MinRequests sends in Window
+	// failed.
+	FailureRatio float64
+	MinRequests  int
+	Window       time.Duration
+	// OpenTimeout is how long it stays open before a single probe.
+	OpenTimeout time.Duration
 }
 
 // Load reads the configuration from the process environment.
@@ -139,6 +163,11 @@ func load(lookup lookupFunc) (Config, error) {
 		MaxScheduleAhead:     p.duration("MAX_SCHEDULE_AHEAD", 7*24*time.Hour),
 		RequestTimeout:       p.duration("REQUEST_TIMEOUT", 10*time.Second),
 
+		Retry: Retry{
+			BaseDelay:   p.duration("RETRY_BASE_DELAY", 5*time.Second),
+			MaxDelay:    p.duration("RETRY_MAX_DELAY", 5*time.Minute),
+			MaxAttempts: p.integer("MAX_ATTEMPTS", 5, 1, 100),
+		},
 		Dispatcher: Dispatcher{
 			BatchSize:        p.integer("DISPATCH_BATCH_SIZE", 500, 1, 10_000),
 			PollInterval:     p.duration("DISPATCH_POLL_INTERVAL", 500*time.Millisecond),
@@ -158,18 +187,29 @@ func load(lookup lookupFunc) (Config, error) {
 				domain.ChannelPush:  p.integer("RATE_LIMIT_PUSH", 100, 1, 100_000),
 			},
 			RateLimitBurst: p.integer("RATE_LIMIT_BURST", 1, 1, 10_000),
-			RetryDelay:     p.duration("RETRY_DELAY", 5*time.Second),
-			MaxAttempts:    p.integer("MAX_ATTEMPTS", 5, 1, 100),
-			AgingRate:      p.float("SCHEDULER_AGING_RATE", 2, 0, 1000),
-			MinShareEvery:  p.integer("SCHEDULER_MIN_SHARE", 10, 0, 1000),
+			Breaker: Breaker{
+				ConsecutiveFailures: p.integer("BREAKER_CONSECUTIVE_FAILURES", 5, 1, 10_000),
+				FailureRatio:        p.float("BREAKER_FAILURE_RATIO", 0.5, 0.01, 0.99),
+				MinRequests:         p.integer("BREAKER_MIN_REQUESTS", 20, 1, 1_000_000),
+				Window:              p.duration("BREAKER_WINDOW", time.Minute),
+				OpenTimeout:         p.duration("BREAKER_OPEN_TIMEOUT", 30*time.Second),
+			},
+			AgingRate:     p.float("SCHEDULER_AGING_RATE", 2, 0, 1000),
+			MinShareEvery: p.integer("SCHEDULER_MIN_SHARE", 10, 0, 1000),
 		},
 	}
 
 	// A claim must outlive the provider call and the outcome write, or a slow but successful
-	// send is reaped and delivered twice.
-	if cfg.Worker.Lease < cfg.Worker.ProviderTimeout+5*time.Second {
-		p.errs = append(p.errs, fmt.Errorf("LEASE_DURATION (%v) must be at least PROVIDER_TIMEOUT (%v) + 5s",
+	// send is reaped and delivered twice. The worker's lease budget (internal/worker) is up to 5s
+	// for the claim, 2s for a fresh token and 5s reserved for the outcome, plus margin.
+	if cfg.Worker.Lease < cfg.Worker.ProviderTimeout+15*time.Second {
+		p.errs = append(p.errs, fmt.Errorf("LEASE_DURATION (%v) must be at least PROVIDER_TIMEOUT (%v) + 15s",
 			cfg.Worker.Lease, cfg.Worker.ProviderTimeout))
+	}
+
+	if cfg.Retry.MaxDelay < cfg.Retry.BaseDelay {
+		p.errs = append(p.errs, fmt.Errorf("RETRY_MAX_DELAY (%v) must not be shorter than RETRY_BASE_DELAY (%v)",
+			cfg.Retry.MaxDelay, cfg.Retry.BaseDelay))
 	}
 
 	// A live idempotency key must never point at a notification whose partition was dropped.

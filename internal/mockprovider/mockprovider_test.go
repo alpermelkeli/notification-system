@@ -46,6 +46,8 @@ func TestSend(t *testing.T) {
 		{"rate limited", Config{RateLimitRate: 0.3, RetryAfter: 2 * time.Second}, 0.2, validBody, http.StatusTooManyRequests, "2"},
 		{"failure", Config{RateLimitRate: 0.3, FailureRate: 0.3}, 0.5, validBody, http.StatusInternalServerError, ""},
 		{"roll above both rates", Config{RateLimitRate: 0.3, FailureRate: 0.3}, 0.7, validBody, http.StatusAccepted, ""},
+		{"permanent", Config{RateLimitRate: 0.3, FailureRate: 0.3, PermanentFailureRate: 0.2}, 0.7, validBody, http.StatusBadRequest, ""},
+		{"roll above all rates", Config{RateLimitRate: 0.3, FailureRate: 0.3, PermanentFailureRate: 0.2}, 0.85, validBody, http.StatusAccepted, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

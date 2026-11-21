@@ -4,7 +4,7 @@ An event-driven, multi-channel notification service written in Go. It accepts no
 requests over HTTP, processes them asynchronously through prioritized queue workers, and delivers
 them via SMS, Email and Push providers with rate limiting, retries and real-time status tracking.
 
-> **Status:** 🚧 Phase 5 done: notifications flow end to end (API → PostgreSQL → dispatcher → Kafka → priority-scheduled workers → Redis rate limiter → provider), with a reaper for lost records. Exponential backoff, failure classification, DLQ and the circuit breaker follow in Phase 6. See [`docs/plan.md`](docs/plan.md).
+> **Status:** 🚧 Phase 6 done: notifications flow end to end (API → PostgreSQL → dispatcher → Kafka → priority-scheduled workers → Redis rate limiter → provider), failures are classified and retried with exponential backoff and jitter, terminal failures are dead-lettered, and a per-channel circuit breaker holds the backlog during provider outages. Metrics and tracing follow in Phase 7. See [`docs/plan.md`](docs/plan.md).
 
 ## Features (target)
 - **Notification API:** single and batch create (up to 1000), status by ID / batch ID, cancel, filtered + paginated listing
@@ -77,7 +77,8 @@ curl localhost:8081/stats        # accepted/rejected per channel + rate in the l
   Kafka partition and offset of each record. It wakes on `NOTIFY notifications_due` and polls every
   500 ms as a fallback (scheduled and retrying rows). Replicas share the work through
   `FOR UPDATE SKIP LOCKED`.
-- **Reaper** (every 30 s, in every dispatcher): expired worker leases go to `retrying`. A `queued`
+- **Reaper** (every 30 s, in every dispatcher): expired worker leases go to `retrying`, or to
+  `failed` with a dead letter if it was the last attempt. A `queued`
   row whose offset is behind the committed offset of `workers.{channel}` was consumed without a
   claim, so it goes back to `pending` (after a 1-minute grace period). A burst backlog is never
   re-published, however long it waits. Rows queued for more than 24 h fall back to `pending`.
@@ -94,8 +95,17 @@ curl localhost:8081/stats        # accepted/rejected per channel + rate in the l
 - Measured on the compose stack (1000 `low` SMS, then 100 `high`): all 1100 sent in 11.1 s with one
   worker and 11.4 s with three (the floor at 100/s is 11.0 s). The provider never saw more than 100
   SMS in a second, and the 100 `high` were delivered within 1.4 s despite the backlog.
-- Until Phase 6, every failed attempt is retried after `RETRY_DELAY` until `MAX_ATTEMPTS`, then the
-  notification is `failed`.
+- **Delivery outcome** ([ADR-0005](docs/adr/0005-delivery-retry-and-failure-handling.md)):
+  `2xx` is `sent`. Timeouts, connection errors, `5xx`, `408` and `425` are retried with exponential
+  backoff and equal jitter (`RETRY_BASE_DELAY` doubling up to `RETRY_MAX_DELAY`). A `429` pauses the
+  whole fleet and is retried after at least its `Retry-After` without consuming an attempt: the
+  provider is healthy and only asks us to slow down. Any other `4xx` is permanent. A
+  permanent failure, or a failure of the last of `MAX_ATTEMPTS` attempts, moves the notification to
+  `failed` and publishes a dead letter to `notifications.dlq`.
+- **Circuit breaker** (per channel and worker instance): opens after 5 retryable failures in a row,
+  or more than 50% of at least 20 sends in a minute. While open the worker picks nothing: records
+  stay in its buffers and in Kafka, fetching pauses, and no attempts are burned. After 30 s one
+  probe is let through; its success closes the breaker. `4xx` and `429` answers do not count.
 
 ### Design decisions
 | ADR | Decision |
@@ -268,17 +278,22 @@ stop the process with a message listing every problem. Copy [`.env.example`](.en
 | `WORKER_CONCURRENCY` | `20` | worker | Sends in flight per channel |
 | `PROVIDER_URL` | `http://localhost:8081/` | worker | Delivery provider endpoint, e.g. `https://webhook.site/<uuid>`. Compose defaults to the mock provider |
 | `PROVIDER_TIMEOUT` | `10s` | worker | Timeout of each provider request |
-| `LEASE_DURATION` | `30s` | worker | Claim lifetime; must be at least `PROVIDER_TIMEOUT` + 5s. On shutdown a worker finishes in-flight sends, each bounded by the lease, so the worker's compose `stop_grace_period` (40s) must exceed it |
+| `LEASE_DURATION` | `30s` | worker | Claim lifetime; must be at least `PROVIDER_TIMEOUT` + 15s (up to 5s for the claim, 2s for a fresh rate-limit token, 5s reserved for writing the outcome). On shutdown a worker finishes in-flight sends, each bounded by the lease, so the worker's compose `stop_grace_period` (40s) must exceed it |
 | `RATE_LIMIT_SMS` / `_EMAIL` / `_PUSH` | `100` | worker | Messages per second per channel, across all workers (FR-2.2) |
 | `RATE_LIMIT_BURST` | `1` | worker | Sends allowed back to back after an idle period; above 1 a second can exceed the limit by `burst - 1` |
-| `RETRY_DELAY` | `5s` | worker | Delay before a failed attempt is retried (exponential backoff in Phase 6) |
-| `MAX_ATTEMPTS` | `5` | worker | Attempt budget; the last failure marks the notification `failed` |
+| `RETRY_BASE_DELAY` | `5s` | worker | Backoff ceiling of the first retry; it doubles per attempt and the delay is jittered between half the ceiling and the ceiling |
+| `RETRY_MAX_DELAY` | `5m` | worker | Cap of the backoff ceiling; must not be shorter than `RETRY_BASE_DELAY` |
+| `MAX_ATTEMPTS` | `5` | worker, dispatcher | Attempt budget; the last failure (or an expired lease on the last attempt) marks the notification `failed`. Set the same value on workers and dispatchers |
+| `BREAKER_CONSECUTIVE_FAILURES` | `5` | worker | Retryable failures in a row that open a channel's circuit breaker |
+| `BREAKER_FAILURE_RATIO` / `BREAKER_MIN_REQUESTS` / `BREAKER_WINDOW` | `0.5` / `20` / `1m` | worker | Also open it when more than this share of at least this many sends in the rolling window failed |
+| `BREAKER_OPEN_TIMEOUT` | `30s` | worker | How long the breaker stays open before one probe; notifications released while open are retried after it |
 | `SCHEDULER_AGING_RATE` | `2` | worker | Priority points gained per second waited (capped per priority, [ADR-0006](docs/adr/0006-rate-limiting-and-priority-scheduling.md)) |
 | `SCHEDULER_MIN_SHARE` | `10` | worker | Every Nth send goes to `normal`/`low` under a `high` flood (0 disables) |
 | `MOCK_ADDR` | `:8081` | mockprovider | Listen address |
 | `MOCK_LATENCY` / `MOCK_LATENCY_JITTER` | `50ms` / `100ms` | mockprovider | Simulated latency: base + uniform `[0, jitter)` |
 | `MOCK_FAILURE_RATE` | `0` | mockprovider | Probability of HTTP 500 |
 | `MOCK_RATE_LIMIT_RATE` | `0` | mockprovider | Probability of HTTP 429 with `Retry-After` |
+| `MOCK_PERMANENT_RATE` | `0` | mockprovider | Probability of HTTP 400 (a permanent failure: not retried, dead-lettered) |
 | `MOCK_RETRY_AFTER` | `1s` | mockprovider | `Retry-After` value for 429 |
 
 ## Testing
@@ -298,10 +313,12 @@ and are skipped by `make test-short`:
   shared rate across several limiters on Redis.
 - `internal/integration`: the engine end to end. Two workers share the group, every notification is
   delivered exactly once, a 503 is retried, a cancelled row is never sent, the rate holds, and a
-  lost record is recovered by the reaper.
+  lost record is recovered by the reaper. A 400 fails at once, a provider stuck on 503 exhausts
+  the attempts with growing backoff, both reach `notifications.dlq`, and during a provider outage
+  the breaker stops the calls without burning attempts.
 
-The worker engine (scheduler, watermarks, backpressure, rebalance, shutdown) is unit-tested with
-fakes, without Kafka.
+The worker engine (scheduler, watermarks, backpressure, rebalance, shutdown, outcome policy,
+circuit breaker, claim retry during a database outage) is unit-tested with fakes, without Kafka.
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs lint, race-enabled tests with
 coverage and a Docker image build on every push to `main` and every pull request. No test calls
 the real webhook.site; the provider is faked with `httptest` or the mock provider.

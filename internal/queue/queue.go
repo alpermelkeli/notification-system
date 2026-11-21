@@ -1,6 +1,6 @@
 // Package queue is the Kafka contract shared by the dispatcher and the workers (ADR-0002): topic
-// and consumer group names, and the claim-check work message. Nothing else in the codebase builds
-// topic names or encodes work records.
+// and consumer group names, the claim-check work message and the dead-letter record. Nothing else
+// in the codebase builds topic names or encodes records.
 package queue
 
 import (

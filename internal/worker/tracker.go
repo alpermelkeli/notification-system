@@ -31,7 +31,10 @@ type partition struct {
 	epoch     int32
 	committed int64
 	inFlight  int
-	detached  bool
+	// revoked is set when a revoke starts; work of the partition that has not reached the
+	// provider yet should give up.
+	revoked  bool
+	detached bool
 }
 
 type pendingRecord struct {
@@ -93,6 +96,34 @@ func (t *tracker) done(p *partition, offset int64, started bool) {
 		n++
 	}
 	p.pending = slices.Delete(p.pending, 0, n)
+}
+
+// abandon marks a started record of p as given up without an outcome: it stays below the
+// watermark, so the partition's next owner (or this worker after a restart) reads it again.
+func (t *tracker) abandon(p *partition) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	p.inFlight--
+}
+
+// revoking flags the given partitions as being revoked.
+func (t *tracker) revoking(parts map[string][]int32) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for topic, ps := range parts {
+		for _, partition := range ps {
+			if p, ok := t.parts[topicPartition{topic, partition}]; ok {
+				p.revoked = true
+			}
+		}
+	}
+}
+
+// gone reports whether p is being revoked or was detached.
+func (t *tracker) gone(p *partition) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return p.revoked || p.detached
 }
 
 // committable returns the watermarks that moved since the last successful commit.

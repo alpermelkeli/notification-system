@@ -51,7 +51,7 @@ func create(t *testing.T, s *Store) domain.Notification {
 // claim claims n and returns its lease.
 func claim(t *testing.T, s *Store, n domain.Notification, lease time.Duration) domain.Lease {
 	t.Helper()
-	c, err := s.Claim(context.Background(), n.ID, n.CreatedAt, lease)
+	c, err := s.Claim(context.Background(), n.ID, n.CreatedAt, lease, uuid.New())
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestDeliveryLifecycle(t *testing.T) {
 		t.Fatalf("after dispatch: status=%s queued_at=%v", got.Status, got.QueuedAt)
 	}
 
-	claimed, err := s.Claim(ctx, n.ID, n.CreatedAt, time.Minute)
+	claimed, err := s.Claim(ctx, n.ID, n.CreatedAt, time.Minute, uuid.New())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +246,7 @@ func TestConcurrentClaimsHaveOneWinner(t *testing.T) {
 	)
 	for range 8 {
 		wg.Go(func() {
-			_, err := s.Claim(context.Background(), n.ID, n.CreatedAt, time.Minute)
+			_, err := s.Claim(context.Background(), n.ID, n.CreatedAt, time.Minute, uuid.New())
 			switch {
 			case err == nil:
 				winners.Add(1)
@@ -279,7 +279,7 @@ func TestCancel(t *testing.T) {
 	if _, err := s.Cancel(ctx, queued.ID); err != nil {
 		t.Fatalf("cancel queued: %v", err)
 	}
-	if _, err := s.Claim(ctx, queued.ID, queued.CreatedAt, time.Minute); !errors.Is(err, domain.ErrInvalidTransition) {
+	if _, err := s.Claim(ctx, queued.ID, queued.CreatedAt, time.Minute, uuid.New()); !errors.Is(err, domain.ErrInvalidTransition) {
 		t.Fatalf("claim after cancel: err = %v, want ErrInvalidTransition", err)
 	}
 
@@ -337,9 +337,9 @@ func TestReapExpiredLeases(t *testing.T) {
 	claim(t, s, healthy, time.Hour)
 	time.Sleep(20 * time.Millisecond)
 
-	n, err := s.ReapExpiredLeases(ctx, 100)
-	if err != nil || n != 1 {
-		t.Fatalf("reaped %d, err %v; want 1", n, err)
+	res, err := s.ReapExpiredLeases(ctx, 5, 100)
+	if err != nil || res.Retried != 1 || len(res.Failed) != 0 {
+		t.Fatalf("reaped %+v, err %v; want 1 retried", res, err)
 	}
 	got, _ := s.GetNotification(ctx, expired.ID)
 	if got.Status != domain.StatusRetrying || got.Attempts != 1 || got.LeaseUntil != nil {
@@ -354,6 +354,43 @@ func TestReapExpiredLeases(t *testing.T) {
 	}
 }
 
+func TestReapExpiredLeaseOnTheLastAttemptFails(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	n := create(t, s)
+	for range 2 { // attempts 1 and 2 fail and are retried
+		dispatchAll(t, s)
+		if _, err := s.MarkRetrying(ctx, claim(t, s, n, time.Minute), 0, "503"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dispatchAll(t, s)
+	claim(t, s, n, time.Millisecond) // attempt 3 of 3; the worker dies
+	time.Sleep(20 * time.Millisecond)
+
+	res, err := s.ReapExpiredLeases(ctx, 3, 100)
+	if err != nil || res.Retried != 0 || len(res.Failed) != 1 {
+		t.Fatalf("reaped %+v, err %v; want 1 failed", res, err)
+	}
+	failed := res.Failed[0]
+	if failed.ID != n.ID || failed.Status != domain.StatusFailed || failed.Attempts != 3 || failed.LeaseToken != nil ||
+		failed.LastError == nil || *failed.LastError != "lease expired on the last attempt" {
+		t.Errorf("failed row = %+v", failed)
+	}
+	hist, err := s.History(ctx, n.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last := hist[len(hist)-1]; last.From == nil || *last.From != domain.StatusProcessing || last.To != domain.StatusFailed ||
+		last.Attempt != 3 {
+		t.Errorf("last history entry = %+v", last)
+	}
+	// Nothing is dispatched again.
+	if published := dispatchAll(t, s); len(published) != 0 {
+		t.Errorf("a failed row was dispatched again: %d", len(published))
+	}
+}
+
 // TestStaleLeaseCannotOverwriteANewerClaim is the ABA case: worker A stalls past its lease, the
 // row is reaped, re-dispatched and claimed by worker B, so it is processing again. A's late
 // outcome must not apply to B's claim.
@@ -364,8 +401,8 @@ func TestStaleLeaseCannotOverwriteANewerClaim(t *testing.T) {
 	dispatchAll(t, s)
 	leaseA := claim(t, s, n, time.Millisecond)
 	time.Sleep(20 * time.Millisecond)
-	if reaped, err := s.ReapExpiredLeases(ctx, 10); err != nil || reaped != 1 {
-		t.Fatalf("reap: %d, %v", reaped, err)
+	if res, err := s.ReapExpiredLeases(ctx, 5, 10); err != nil || res.Retried != 1 {
+		t.Fatalf("reap: %+v, %v", res, err)
 	}
 	dispatchAll(t, s)
 	leaseB := claim(t, s, n, time.Minute)
@@ -547,7 +584,7 @@ func TestCancelDuringDispatchWaitsAndWins(t *testing.T) {
 	if err := <-cancelled; err != nil {
 		t.Fatalf("cancel after dispatch: %v", err)
 	}
-	if _, err := s.Claim(ctx, n.ID, n.CreatedAt, time.Minute); !errors.Is(err, domain.ErrInvalidTransition) {
+	if _, err := s.Claim(ctx, n.ID, n.CreatedAt, time.Minute, uuid.New()); !errors.Is(err, domain.ErrInvalidTransition) {
 		t.Errorf("claim after cancel: err = %v", err)
 	}
 	hist, err := s.History(ctx, n.ID)
@@ -618,7 +655,7 @@ func TestClaimDuringDispatchWaitsForTheCommit(t *testing.T) {
 	claimed := make(chan error, 1)
 	if _, err := s.DispatchDue(ctx, 10, func(_ context.Context, ns []domain.Notification) ([]KafkaPosition, error) {
 		// The record is in Kafka now; a fast worker claims it before the dispatcher commits.
-		go func() { _, err := s.Claim(ctx, n.ID, n.CreatedAt, time.Minute); claimed <- err }()
+		go func() { _, err := s.Claim(ctx, n.ID, n.CreatedAt, time.Minute, uuid.New()); claimed <- err }()
 		select {
 		case err := <-claimed:
 			return nil, fmt.Errorf("claim did not wait for the dispatcher's commit: %w", err)
@@ -638,5 +675,43 @@ func TestClaimDuringDispatchWaitsForTheCommit(t *testing.T) {
 	hist, _ := s.History(ctx, n.ID)
 	if len(hist) != 3 || *hist[2].From != domain.StatusQueued || hist[2].To != domain.StatusProcessing {
 		t.Errorf("history = %+v", hist)
+	}
+}
+
+// TestClaimIsIdempotentPerToken: a claim retried with the same token after its answer was lost
+// gets the claim back with a renewed lease, without counting a second attempt; another token is
+// rejected.
+func TestClaimIsIdempotentPerToken(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	n := create(t, s)
+	dispatchAll(t, s)
+	token := uuid.New()
+	first, err := s.Claim(ctx, n.ID, n.CreatedAt, time.Minute, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := s.Claim(ctx, n.ID, n.CreatedAt, time.Minute, token)
+	if err != nil {
+		t.Fatalf("retry with the same token: %v", err)
+	}
+	if again.Attempts != 1 || *again.LeaseToken != token || again.LeaseUntil.Before(*first.LeaseUntil) {
+		t.Errorf("retried claim = attempts %d token %v lease %v", again.Attempts, again.LeaseToken, again.LeaseUntil)
+	}
+	if _, err := s.Claim(ctx, n.ID, n.CreatedAt, time.Minute, uuid.New()); !errors.Is(err, domain.ErrInvalidTransition) {
+		t.Errorf("claim with another token: err = %v, want ErrInvalidTransition", err)
+	}
+	hist, err := s.History(ctx, n.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := 0
+	for _, h := range hist {
+		if h.Reason == "claimed" {
+			claims++
+		}
+	}
+	if claims != 1 {
+		t.Errorf("%d claimed history entries, want 1", claims)
 	}
 }

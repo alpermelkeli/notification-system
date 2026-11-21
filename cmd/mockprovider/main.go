@@ -8,6 +8,7 @@
 //	MOCK_LATENCY_JITTER    random extra latency in [0, jitter) (default 100ms)
 //	MOCK_FAILURE_RATE      probability of a 500 response (default 0)
 //	MOCK_RATE_LIMIT_RATE   probability of a 429 response (default 0)
+//	MOCK_PERMANENT_RATE    probability of a 400 response, which is not retried (default 0)
 //	MOCK_RETRY_AFTER       Retry-After sent with 429 (default 1s)
 package main
 
@@ -64,11 +65,12 @@ func run(logger *slog.Logger) error {
 	}
 
 	cfg := mockprovider.Config{
-		Latency:       dur("MOCK_LATENCY", 50*time.Millisecond),
-		Jitter:        dur("MOCK_LATENCY_JITTER", 100*time.Millisecond),
-		FailureRate:   prob("MOCK_FAILURE_RATE"),
-		RateLimitRate: prob("MOCK_RATE_LIMIT_RATE"),
-		RetryAfter:    dur("MOCK_RETRY_AFTER", time.Second),
+		Latency:              dur("MOCK_LATENCY", 50*time.Millisecond),
+		Jitter:               dur("MOCK_LATENCY_JITTER", 100*time.Millisecond),
+		FailureRate:          prob("MOCK_FAILURE_RATE"),
+		RateLimitRate:        prob("MOCK_RATE_LIMIT_RATE"),
+		PermanentFailureRate: prob("MOCK_PERMANENT_RATE"),
+		RetryAfter:           dur("MOCK_RETRY_AFTER", time.Second),
 	}
 	addr := os.Getenv("MOCK_ADDR")
 	if addr == "" {

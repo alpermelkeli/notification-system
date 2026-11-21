@@ -10,8 +10,8 @@ Living document. Update phase status as work lands. Time budget ≈ 12h of focus
 | 3 | Domain + persistence: model, state machine, migrations (daily partitions, partial index, fillfactor, idempotency_keys), `notifier migrate` + compose migrate job, repository | done |
 | 4 | API: create / batch / get / cancel / list + validation + OpenAPI | done |
 | 5 | Processing engine: dispatcher, Kafka topics, workers, capped-aging scheduler, rate limiter, provider client | done |
-| 6 | Delivery & retry: backoff, classification, DLQ, circuit breaker | next |
-| 7 | Observability: metrics endpoint, correlation IDs, tracing | |
+| 6 | Delivery & retry: backoff, classification, DLQ, circuit breaker | done |
+| 7 | Observability: metrics endpoint, correlation IDs, tracing | next |
 | 8 | Bonus: scheduling, templates, WebSocket | |
 | 9 | Hardening: integration/e2e tests, load test vs capacity-planning numbers, `--scale` demo, README polish, final review | |
 
@@ -34,20 +34,18 @@ Living document. Update phase status as work lands. Time budget ≈ 12h of focus
 | Reaper coordination | No advisory lock: every dispatcher runs the reaper, `SKIP LOCKED` keeps it correct | [0003 amendment](adr/0003-dispatch-without-separate-outbox.md) |
 | Claim racing the dispatch commit | Guarded transitions lock the row by key and check guards on the locked version, so the claim waits for the dispatcher's commit | [0003 amendment](adr/0003-dispatch-without-separate-outbox.md) |
 | Rate limiter | Reserving GCRA Lua script instead of `redis_rate`; burst default 1 (measured: 100/s peak, ~99% throughput with 1 or 3 workers) | [0006 amendment](adr/0006-rate-limiting-and-priority-scheduling.md), [0007](adr/0007-technology-stack.md) |
+| Reaped lease at the attempt limit | The reaper fails it (with a dead letter) in the same statement instead of dispatching it again | [0005 amendment](adr/0005-delivery-retry-and-failure-handling.md) |
+| Breaker while open | Checked before the pick; records stay buffered and fetching pauses through backpressure, no attempts burned; sends claimed after the trip are released | [0005 amendment](adr/0005-delivery-retry-and-failure-handling.md) |
+| Claim during a PostgreSQL outage | Retried with backoff on transient errors so the watermark holds; abandoned below it on shutdown or revoke | [0005 amendment](adr/0005-delivery-retry-and-failure-handling.md) |
 
-## Phase 6 starting point
-The Phase 5 worker uses a placeholder outcome policy in `internal/worker/process.go`: any failure
-is retried after `RETRY_DELAY` until `MAX_ATTEMPTS`, and a `429` also sets the fleet cool-down.
-Phase 6 replaces it with ADR-0005: exponential backoff with jitter, retryable vs. permanent
-classification, the DLQ topic and the per-channel circuit breaker (`Release` already exists for
-it).
-
-Also from the Phase 5 review: while PostgreSQL is unavailable, every claim fails fast and its
-record is committed past, so the workers drain the Kafka backlog and recovery waits for the
-reaper (re-publishing in `queued_at` order, not by priority). Phase 6 should back off and retry
-the claim on an unavailability error instead, so the watermark holds.
+## Phase 7 starting point
+Metrics (FR-4.1) should cover at least: queue depth (Kafka consumer lag per topic and the
+pending/retrying/queued row counts), sends by outcome class, provider latency, circuit breaker
+state per channel, dead letters published, reaper recoveries, and claim retries during database
+outages. These events are logged today (the breaker's state changes at WARN/INFO, the reaper's
+recoveries at WARN), so the metrics hook into the same places.
 
 ## Open questions
 | Phase | Question | Notes |
 |-------|----------|-------|
-| 6 | Reaped lease at the attempt limit | `ReapExpiredLeases` keeps the attempt counted, so a row reaped at `max_attempts` is dispatched once more. Move it to `failed` at claim time (or in the reaper) when attempts ≥ max. |
+| 7 | Readiness of multi-channel workers | `/readyz` checks only the first channel's Kafka client. |

@@ -57,9 +57,14 @@ func TestLoadEngineDefaults(t *testing.T) {
 	w := cfg.Worker
 	if !reflect.DeepEqual(w.Channels, []domain.Channel{domain.ChannelSMS, domain.ChannelEmail, domain.ChannelPush}) ||
 		w.Concurrency != 20 || w.ProviderURL != "http://localhost:8081/" || w.ProviderTimeout != 10*time.Second ||
-		w.Lease != 30*time.Second || w.RateLimitBurst != 1 || w.RetryDelay != 5*time.Second ||
-		w.MaxAttempts != 5 || w.AgingRate != 2 || w.MinShareEvery != 10 {
+		w.Lease != 30*time.Second || w.RateLimitBurst != 1 || w.AgingRate != 2 || w.MinShareEvery != 10 {
 		t.Errorf("worker defaults = %+v", w)
+	}
+	if cfg.Retry != (Retry{BaseDelay: 5 * time.Second, MaxDelay: 5 * time.Minute, MaxAttempts: 5}) {
+		t.Errorf("retry defaults = %+v", cfg.Retry)
+	}
+	if w.Breaker != (Breaker{ConsecutiveFailures: 5, FailureRatio: 0.5, MinRequests: 20, Window: time.Minute, OpenTimeout: 30 * time.Second}) {
+		t.Errorf("breaker defaults = %+v", w.Breaker)
 	}
 	for _, c := range domain.Channels {
 		if w.RateLimits[c] != 100 {
@@ -76,6 +81,9 @@ func TestLoadEngineOverrides(t *testing.T) {
 		"SCHEDULER_AGING_RATE": "0.5",
 		"SCHEDULER_MIN_SHARE":  "0",
 		"REAPER_GRACE":         "2m",
+		"RETRY_BASE_DELAY":     "1s",
+		"RETRY_MAX_DELAY":      "30s",
+		"MAX_ATTEMPTS":         "8",
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -86,26 +94,34 @@ func TestLoadEngineOverrides(t *testing.T) {
 		w.AgingRate != 0.5 || w.MinShareEvery != 0 || cfg.Dispatcher.ReaperGrace != 2*time.Minute {
 		t.Errorf("worker = %+v, dispatcher = %+v", w, cfg.Dispatcher)
 	}
+	if cfg.Retry != (Retry{BaseDelay: time.Second, MaxDelay: 30 * time.Second, MaxAttempts: 8}) {
+		t.Errorf("retry = %+v", cfg.Retry)
+	}
 }
 
 func TestLoadRejectsInvalidEngineSettings(t *testing.T) {
 	_, err := load(env(map[string]string{
-		"WORKER_CHANNELS":      "sms,fax",
-		"PROVIDER_URL":         "webhook.site/abc",
-		"SCHEDULER_AGING_RATE": "fast",
-		"RATE_LIMIT_SMS":       "0",
+		"WORKER_CHANNELS":       "sms,fax",
+		"PROVIDER_URL":          "webhook.site/abc",
+		"SCHEDULER_AGING_RATE":  "fast",
+		"RATE_LIMIT_SMS":        "0",
+		"BREAKER_FAILURE_RATIO": "1.5",
 	}))
 	if err == nil {
 		t.Fatal("expected an error")
 	}
-	for _, key := range []string{"WORKER_CHANNELS", "PROVIDER_URL", "SCHEDULER_AGING_RATE", "RATE_LIMIT_SMS"} {
+	for _, key := range []string{"WORKER_CHANNELS", "PROVIDER_URL", "SCHEDULER_AGING_RATE", "RATE_LIMIT_SMS", "BREAKER_FAILURE_RATIO"} {
 		if !strings.Contains(err.Error(), key) {
 			t.Errorf("error does not mention %s: %v", key, err)
 		}
 	}
-	if _, err := load(env(map[string]string{"PROVIDER_TIMEOUT": "30s", "LEASE_DURATION": "30s"})); err == nil ||
+	if _, err := load(env(map[string]string{"PROVIDER_TIMEOUT": "10s", "LEASE_DURATION": "24s"})); err == nil ||
 		!strings.Contains(err.Error(), "LEASE_DURATION") {
-		t.Errorf("a lease shorter than the provider timeout + 5s must be rejected: %v", err)
+		t.Errorf("a lease shorter than the provider timeout + 15s must be rejected: %v", err)
+	}
+	if _, err := load(env(map[string]string{"RETRY_BASE_DELAY": "1m", "RETRY_MAX_DELAY": "10s"})); err == nil ||
+		!strings.Contains(err.Error(), "RETRY_MAX_DELAY") {
+		t.Errorf("a max delay below the base delay must be rejected: %v", err)
 	}
 }
 
@@ -148,6 +164,7 @@ func TestLoadOverrides(t *testing.T) {
 		MaxScheduleAhead:     72 * time.Hour,
 		RequestTimeout:       10 * time.Second,
 
+		Retry:      defaults.Retry,
 		Dispatcher: defaults.Dispatcher,
 		Worker:     defaults.Worker,
 	}
