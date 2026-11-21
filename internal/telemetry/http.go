@@ -4,7 +4,6 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5/middleware"
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
@@ -21,8 +20,8 @@ import (
 // Requests to skipPaths (probes, scrapes) are not traced. It must run inside a chi router, after
 // httpx.CorrelationID.
 //
-// otelhttp's handler is not used here: it names the span after http.Request.Pattern, which chi
-// sets to the mount point ("/v1/*") for routes in a sub-router.
+// otelhttp is not used: its handler names the span after http.Request.Pattern, which chi sets to
+// the mount point ("/v1/*") for routes in a sub-router.
 func HTTPMiddleware(skipPaths ...string) func(http.Handler) http.Handler {
 	skip := make(map[string]bool, len(skipPaths))
 	for _, p := range skipPaths {
@@ -35,9 +34,10 @@ func HTTPMiddleware(skipPaths ...string) func(http.Handler) http.Handler {
 				return
 			}
 			ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
-			ctx, span := Tracer().Start(ctx, r.Method, trace.WithSpanKind(trace.SpanKindServer),
+			method := httpx.MethodLabel(r.Method)
+			ctx, span := Tracer().Start(ctx, method, trace.WithSpanKind(trace.SpanKindServer),
 				trace.WithAttributes(
-					semconv.HTTPRequestMethodKey.String(r.Method),
+					semconv.HTTPRequestMethodKey.String(method),
 					semconv.URLPath(r.URL.Path),
 				))
 			defer span.End()
@@ -50,7 +50,7 @@ func HTTPMiddleware(skipPaths ...string) func(http.Handler) http.Handler {
 				status = http.StatusOK
 			}
 			route := httpx.RoutePattern(r) // the route context is shared, so it is complete here
-			span.SetName(r.Method + " " + route)
+			span.SetName(method + " " + route)
 			span.SetAttributes(semconv.HTTPRoute(route), semconv.HTTPResponseStatusCode(status))
 			if id := logging.CorrelationID(r.Context()); id != "" {
 				span.SetAttributes(AttrCorrelationID.String(id))
@@ -60,9 +60,4 @@ func HTTPMiddleware(skipPaths ...string) func(http.Handler) http.Handler {
 			}
 		})
 	}
-}
-
-// HTTPTransport wraps base so each outgoing request gets a client span and a traceparent header.
-func HTTPTransport(base http.RoundTripper) http.RoundTripper {
-	return otelhttp.NewTransport(base)
 }
