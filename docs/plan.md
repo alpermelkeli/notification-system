@@ -12,7 +12,7 @@ Living document. Update phase status as work lands. Time budget ≈ 12h of focus
 | 5 | Processing engine: dispatcher, Kafka topics, workers, capped-aging scheduler, rate limiter, provider client | done |
 | 6 | Delivery & retry: backoff, classification, DLQ, circuit breaker | done |
 | 7 | Observability: metrics endpoint, correlation IDs, tracing | done |
-| 8 | Bonus: scheduling, templates, WebSocket | next |
+| 8 | Bonus: scheduling, templates, WebSocket | in progress |
 | 9 | Hardening: integration/e2e tests, load test vs capacity-planning numbers, `--scale` demo, README polish, final review | |
 
 ## Resolved decisions (Phase 1)
@@ -38,6 +38,8 @@ Living document. Update phase status as work lands. Time budget ≈ 12h of focus
 | Breaker while open | Checked before the pick; records stay buffered and fetching pauses through backpressure, no attempts burned; sends claimed after the trip are released | [0005 amendment](adr/0005-delivery-retry-and-failure-handling.md) |
 | Claim during a PostgreSQL outage | Retried with backoff on transient errors so the watermark holds; abandoned below it on shutdown or revoke | [0005 amendment](adr/0005-delivery-retry-and-failure-handling.md) |
 | Observability | Per-role Prometheus registries; queue depth and consumer lag sampled by the dispatcher; the request's `traceparent` stored with the row and carried in Kafka headers, so one trace covers every attempt; trace ids in logs | [0009](adr/0009-observability.md) |
+| Templates (B-3) | Stored templates (`/v1/templates`), `{{name}}` substitution only, rendered and validated at creation; rows record `template_id` and `template_version` | [0010](adr/0010-templates.md) |
+| Status events and WebSocket (B-4) | Rows published best-effort to `notification.events` after each commit; every API instance reads all events without a group and fans them out to `/v1/ws` subscribers of notification and batch ids, with a snapshot on subscribe; `coder/websocket` | [0011](adr/0011-status-events-and-websocket.md) |
 | Readiness of multi-channel workers | `/readyz` checks every channel's Kafka client (`kafka-sms`, `kafka-email`, `kafka-push`) | [0009](adr/0009-observability.md) |
 
 ## Phase 8 starting point

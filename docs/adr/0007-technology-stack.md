@@ -63,6 +63,13 @@ in `internal/telemetry` instead of the `franz-go/plugin/kotel` module, and the d
 covered by a stored `traceparent` instead of `otelpgx`. Neither of those needs a dependency (see
 [ADR-0009](0009-observability.md)). Jaeger `2.12.0` and Prometheus `v3.7.3` run in compose.
 
+**Amendment (2026-11-21, Phase 8):** `github.com/coder/websocket` v1.8.15 serves the WebSocket
+status stream (B-4). It is the maintained successor of `nhooyr.io/websocket`, has no
+dependencies and takes a `context.Context` throughout; `gorilla/websocket` was the alternative
+(see [ADR-0011](0011-status-events-and-websocket.md)). Templates (B-3) use no template engine:
+`{{name}}` substitution is a small parser in `internal/domain` (see
+[ADR-0010](0010-templates.md)).
+
 ## Consequences
 - ✅ A small, mainstream dependency set that reviewers will recognise.
 - ⚠️ Testcontainers makes integration tests require Docker. They are skipped under `-short`

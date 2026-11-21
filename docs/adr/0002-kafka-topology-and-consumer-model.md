@@ -79,8 +79,9 @@ event stream for status consumers (B-4). Kafka has no per-message priority.
 - The global 100 msg/s per channel is enforced by the shared Redis limiter (ADR-0006), not by
   the partition count. Adding replicas adds resilience and send concurrency, but never exceeds
   the limit.
-- **Event consumers** (e.g. the WebSocket hub in each API instance) use a unique group per
-  instance starting at `latest`, so every instance sees every event.
+- **Event consumers** (e.g. the WebSocket hub in each API instance) read every partition of
+  `notification.events` from `latest` without a consumer group, so every instance sees every
+  event (amended in Phase 8, see below).
 
 **Amendment (2026-11-21, Phase 5): fetch settings for pause/resume.** Polls are bounded to the
 high-water mark (`PollRecords`), and the long-poll wait is 200 ms instead of franz-go's 5 s default
@@ -88,6 +89,12 @@ high-water mark (`PollRecords`), and the long-poll wait is 200 ms instead of fra
 the default wait, backpressure that pauses and resumes topics continuously stalled delivery for
 5 s per resume: a compose burst ran at ~50 sends every 5 s instead of 100/s. With 200 ms, 1100 SMS
 took 11.2–11.4 s with two or three workers (the floor is 11.0 s).
+
+**Amendment (2026-11-21, Phase 8): event consumers use no group.** The WebSocket hub of each
+API instance consumes `notification.events` directly, on all partitions and from the end, instead
+of in a unique group per instance. It never commits, because a reconnecting client gets a
+snapshot instead of a replay, so a group would only leave an orphaned group on the broker behind
+every instance that ever ran. See [ADR-0011](0011-status-events-and-websocket.md).
 
 ## Consequences
 - ✅ A channel can be paused (circuit open) without touching other channels.
