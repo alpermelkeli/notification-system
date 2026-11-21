@@ -25,6 +25,7 @@ type fakeStore struct {
 	lastBatch       storage.NewBatch
 	lastFilter      storage.ListFilter
 	lastCorrelation string
+	lastOrigin      storage.Origin
 	listPage        storage.ListPage
 }
 
@@ -53,7 +54,9 @@ func (f *fakeStore) newNotification(in storage.NewNotification, correlationID st
 	return n
 }
 
-func (f *fakeStore) CreateNotification(ctx context.Context, in storage.NewNotification, correlationID string) (domain.Notification, bool, error) {
+func (f *fakeStore) CreateNotification(ctx context.Context, in storage.NewNotification, origin storage.Origin) (domain.Notification, bool, error) {
+	correlationID := origin.CorrelationID
+	f.lastOrigin = origin
 	if f.block {
 		<-ctx.Done()
 		return domain.Notification{}, false, ctx.Err()
@@ -79,7 +82,9 @@ func (f *fakeStore) CreateNotification(ctx context.Context, in storage.NewNotifi
 	return n, true, nil
 }
 
-func (f *fakeStore) CreateBatch(_ context.Context, in storage.NewBatch, correlationID string) (storage.BatchResult, error) {
+func (f *fakeStore) CreateBatch(_ context.Context, in storage.NewBatch, origin storage.Origin) (storage.BatchResult, error) {
+	correlationID := origin.CorrelationID
+	f.lastOrigin = origin
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.err != nil {

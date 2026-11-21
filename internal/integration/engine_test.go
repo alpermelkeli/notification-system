@@ -281,7 +281,7 @@ func TestEngineDeliversEveryNotificationOnce(t *testing.T) {
 	// Cancelled before any dispatcher runs: it must never reach the provider.
 	cancelled, _, err := store.CreateNotification(ctx, storage.NewNotification{
 		Channel: domain.ChannelSMS, Priority: domain.PriorityNormal, Recipient: "+905559999999", Content: "x",
-	}, "")
+	}, storage.Origin{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,7 +301,7 @@ func TestEngineDeliversEveryNotificationOnce(t *testing.T) {
 		}
 		n, _, err := store.CreateNotification(ctx, storage.NewNotification{
 			Channel: domain.ChannelSMS, Priority: domain.Priorities[i%3], Recipient: recipient, Content: "hello",
-		}, "corr-e2e")
+		}, storage.Origin{CorrelationID: "corr-e2e"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -362,7 +362,7 @@ func TestReaperRecoversARecordConsumedWithoutClaim(t *testing.T) {
 	// Deliver one notification so the group commits an offset on its partition.
 	first, _, err := store.CreateNotification(ctx, storage.NewNotification{
 		Channel: domain.ChannelSMS, Priority: domain.PriorityHigh, Recipient: "+905551110000", Content: "a",
-	}, "")
+	}, storage.Origin{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -383,7 +383,7 @@ func TestReaperRecoversARecordConsumedWithoutClaim(t *testing.T) {
 	lost, _, err := store.CreateNotification(ctx, storage.NewNotification{
 		Channel: domain.ChannelSMS, Priority: domain.PriorityHigh, Recipient: "+905551110001", Content: "b",
 		ScheduledAt: ptr(time.Now().Add(time.Hour)), // not due, so the relay leaves it alone
-	}, "")
+	}, storage.Origin{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -428,7 +428,7 @@ func TestEngineFailsPermanentAndExhaustedDeliveries(t *testing.T) {
 	create := func(recipient string) domain.Notification {
 		n, _, err := store.CreateNotification(ctx, storage.NewNotification{
 			Channel: domain.ChannelSMS, Priority: domain.PriorityNormal, Recipient: recipient, Content: "x",
-		}, "corr-fail")
+		}, storage.Origin{CorrelationID: "corr-fail"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -491,7 +491,7 @@ func TestEngineBreakerHoldsDeliveriesDuringAnOutage(t *testing.T) {
 	for i := range 20 {
 		n, _, err := store.CreateNotification(ctx, storage.NewNotification{
 			Channel: domain.ChannelSMS, Priority: domain.PriorityHigh, Recipient: fmt.Sprintf("+90555333%04d", i), Content: "x",
-		}, "")
+		}, storage.Origin{})
 		if err != nil {
 			t.Fatal(err)
 		}

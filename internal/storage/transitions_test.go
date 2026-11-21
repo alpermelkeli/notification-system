@@ -41,7 +41,7 @@ func dispatchAll(t *testing.T, s *Store) []domain.Notification {
 
 func create(t *testing.T, s *Store) domain.Notification {
 	t.Helper()
-	n, _, err := s.CreateNotification(context.Background(), sms("hi"), "")
+	n, _, err := s.CreateNotification(context.Background(), sms("hi"), Origin{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestDispatchSkipsRowsThatAreNotDue(t *testing.T) {
 	later := time.Now().Add(time.Hour)
 	in := sms("later")
 	in.ScheduledAt = &later
-	if _, _, err := s.CreateNotification(context.Background(), in, ""); err != nil {
+	if _, _, err := s.CreateNotification(context.Background(), in, Origin{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := dispatchAll(t, s); len(got) != 0 {
@@ -188,7 +188,7 @@ func TestConcurrentDispatchersNeverPublishTheSameRow(t *testing.T) {
 	for i := range items {
 		items[i] = sms("bulk")
 	}
-	if _, err := s.CreateBatch(context.Background(), NewBatch{Items: items}, ""); err != nil {
+	if _, err := s.CreateBatch(context.Background(), NewBatch{Items: items}, Origin{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -476,7 +476,7 @@ func TestRequeueConsumed(t *testing.T) {
 	in := func(p domain.Priority) domain.Notification {
 		req := sms("x")
 		req.Priority = p
-		n, _, err := s.CreateNotification(ctx, req, "")
+		n, _, err := s.CreateNotification(ctx, req, Origin{})
 		if err != nil {
 			t.Fatal(err)
 		}

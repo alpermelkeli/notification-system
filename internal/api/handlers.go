@@ -13,7 +13,6 @@ import (
 
 	"github.com/alpermelkeli/notification-system/internal/domain"
 	"github.com/alpermelkeli/notification-system/internal/httpx"
-	"github.com/alpermelkeli/notification-system/internal/logging"
 	"github.com/alpermelkeli/notification-system/internal/storage"
 )
 
@@ -38,10 +37,13 @@ func (h *Handler) createNotification(w http.ResponseWriter, r *http.Request) {
 		in.IdempotencyKey = &storage.IdempotencyKey{Key: *key, RequestHash: requestHash(canonicalOf(in))}
 	}
 
-	n, created, err := h.store.CreateNotification(r.Context(), in, logging.CorrelationID(r.Context()))
+	n, created, err := h.store.CreateNotification(r.Context(), in, origin(r.Context()))
 	if err != nil {
 		h.writeError(w, r, err)
 		return
+	}
+	if created {
+		h.opts.Metrics.Created(n.Channel, n.Priority, 1)
 	}
 	w.Header().Set("Location", "/v1/notifications/"+n.ID.String())
 	if !created {
@@ -108,10 +110,17 @@ func (h *Handler) createBatch(w http.ResponseWriter, r *http.Request) {
 		in.IdempotencyKey = &storage.IdempotencyKey{Key: *key, RequestHash: requestHash(canon)}
 	}
 
-	res, err := h.store.CreateBatch(r.Context(), in, logging.CorrelationID(r.Context()))
+	res, err := h.store.CreateBatch(r.Context(), in, origin(r.Context()))
 	if err != nil {
 		h.writeError(w, r, err)
 		return
+	}
+	if res.Created {
+		for _, it := range res.Items {
+			if !it.Duplicate {
+				h.opts.Metrics.Created(it.Notification.Channel, it.Notification.Priority, 1)
+			}
+		}
 	}
 	w.Header().Set("Location", "/v1/batches/"+res.Batch.ID.String())
 	if !res.Created {
