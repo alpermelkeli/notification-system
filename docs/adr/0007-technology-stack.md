@@ -52,6 +52,16 @@ send slots under contention, and a 30-line reserving GCRA script on plain go-red
 only supports Confluent images, so `internal/testinfra` starts the compose images
 (`apache/kafka`, `redis`) as generic containers.
 
+**Amendment (2026-11-21, Phase 7):** the OpenTelemetry row is implemented with
+`go.opentelemetry.io/otel`, `otel/trace` and `otel/sdk` v1.47.0, the OTLP/HTTP trace exporter
+(`otel/exporters/otlp/otlptrace/otlptracehttp` v1.47.0), and `contrib/.../otelhttp` v0.72.0 for
+the provider client only. HTTP was chosen over the gRPC exporter to keep a gRPC client out of the
+binary. The exporter's config package still imports `google.golang.org/grpc` for shared types, so
+it appears as an indirect module. Kafka headers carry the trace context through a 30-line carrier
+in `internal/telemetry` instead of the `franz-go/plugin/kotel` module, and the database hop is
+covered by a stored `traceparent` instead of `otelpgx`. Neither of those needs a dependency (see
+[ADR-0009](0009-observability.md)). Jaeger `2.12.0` and Prometheus `v3.7.3` run in compose.
+
 ## Consequences
 - ✅ A small, mainstream dependency set that reviewers will recognise.
 - ⚠️ Testcontainers makes integration tests require Docker. They are skipped under `-short`
