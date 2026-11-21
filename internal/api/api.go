@@ -1,4 +1,4 @@
-// Package api implements the public HTTP API (FR-1.x) described by api/openapi.yaml. Handlers
+// Package api implements the public HTTP API (FR-1.x, B-3 templates) described by api/openapi.yaml. Handlers
 // decode and validate requests, call the store and map domain errors to HTTP responses; they
 // never talk to Kafka (ADR-0003).
 package api
@@ -32,6 +32,13 @@ type Store interface {
 	Replay(ctx context.Context, id uuid.UUID) (domain.Notification, error)
 	ListNotifications(ctx context.Context, f storage.ListFilter) (storage.ListPage, error)
 	GetBatch(ctx context.Context, id uuid.UUID) (domain.Batch, error)
+
+	CreateTemplate(ctx context.Context, in storage.TemplateInput) (domain.Template, error)
+	GetTemplate(ctx context.Context, id uuid.UUID) (domain.Template, error)
+	GetTemplates(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]domain.Template, error)
+	ListTemplates(ctx context.Context, f storage.TemplateFilter) (storage.TemplatePage, error)
+	UpdateTemplate(ctx context.Context, id uuid.UUID, in storage.TemplateInput) (domain.Template, error)
+	DeleteTemplate(ctx context.Context, id uuid.UUID) error
 }
 
 // Options configures the API.
@@ -94,6 +101,11 @@ func (h *Handler) Routes(r chi.Router) {
 		r.Post("/notifications/{id}/cancel", h.cancelNotification)
 		r.Post("/notifications/{id}/retry", h.retryNotification)
 		r.Get("/batches/{id}", h.getBatch)
+		r.Post("/templates", h.createTemplate)
+		r.Get("/templates", h.listTemplates)
+		r.Get("/templates/{id}", h.getTemplate)
+		r.Put("/templates/{id}", h.updateTemplate)
+		r.Delete("/templates/{id}", h.deleteTemplate)
 	})
 	r.Get("/openapi.yaml", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/yaml")

@@ -28,13 +28,18 @@ func (h *Handler) createNotification(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, rerr)
 		return
 	}
-	in, vs := h.validateCreate("", req, h.opts.Now())
+	templates, err := h.loadTemplates(r.Context(), req)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	in, canon, vs := h.validateCreate("", req, h.opts.Now(), templates)
 	if len(vs) > 0 {
 		h.writeError(w, r, validationFailed(vs))
 		return
 	}
 	if key != nil {
-		in.IdempotencyKey = &storage.IdempotencyKey{Key: *key, RequestHash: requestHash(canonicalOf(in))}
+		in.IdempotencyKey = &storage.IdempotencyKey{Key: *key, RequestHash: requestHash(canon)}
 	}
 
 	n, created, err := h.store.CreateNotification(r.Context(), in, origin(r.Context()))
@@ -71,6 +76,16 @@ func (h *Handler) createBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	reqs := make([]createRequest, len(req.Notifications))
+	for i, item := range req.Notifications {
+		reqs[i] = item.createRequest
+	}
+	templates, err := h.loadTemplates(r.Context(), reqs...)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+
 	now := h.opts.Now()
 	in := storage.NewBatch{Items: make([]storage.NewNotification, len(req.Notifications))}
 	canon := make([]canonical, len(req.Notifications))
@@ -78,7 +93,7 @@ func (h *Handler) createBatch(w http.ResponseWriter, r *http.Request) {
 	var vs []violation
 	for i, item := range req.Notifications {
 		prefix := fmt.Sprintf("notifications[%d].", i)
-		n, itemVs := h.validateCreate(prefix, item.createRequest, now)
+		n, c, itemVs := h.validateCreate(prefix, item.createRequest, now, templates)
 		vs = append(vs, itemVs...)
 		if item.IdempotencyKey != nil {
 			k := *item.IdempotencyKey
@@ -93,11 +108,11 @@ func (h *Handler) createBatch(w http.ResponseWriter, r *http.Request) {
 				vs = append(vs, violation{Field: prefix + "idempotencyKey", Message: "must differ from the Idempotency-Key header"})
 			default:
 				seenKeys[k] = i
-				n.IdempotencyKey = &storage.IdempotencyKey{Key: k, RequestHash: requestHash(canonicalOf(n))}
+				n.IdempotencyKey = &storage.IdempotencyKey{Key: k, RequestHash: requestHash(c)}
 			}
 		}
 		in.Items[i] = n
-		canon[i] = canonicalOf(n)
+		canon[i] = c
 		if item.IdempotencyKey != nil {
 			canon[i].Key = *item.IdempotencyKey
 		}
@@ -294,6 +309,8 @@ func (h *Handler) writeError(w http.ResponseWriter, r *http.Request, err error) 
 			violation{Field: fmt.Sprintf("notifications[%d].idempotencyKey", ie.Index), Message: "already used with different content"})
 	case errors.Is(err, domain.ErrIdempotencyKeyReused):
 		httpx.WriteError(w, http.StatusConflict, "idempotency_key_reused", err.Error())
+	case errors.Is(err, domain.ErrAlreadyExists):
+		httpx.WriteError(w, http.StatusConflict, "already_exists", err.Error())
 	case errors.Is(err, context.DeadlineExceeded):
 		h.logger.WarnContext(r.Context(), "request timed out", "method", r.Method, "path", r.URL.Path, "err", err)
 		httpx.WriteError(w, http.StatusServiceUnavailable, "timeout", "the request timed out; it is safe to retry with the same Idempotency-Key")

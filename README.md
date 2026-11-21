@@ -241,6 +241,11 @@ linted in CI). With the stack running, browse it at **http://localhost:8080/docs
 | `POST /v1/notifications/{id}/retry` | Replay a `failed` notification | `202` |
 | `GET /v1/notifications` | Filter by `status`, `channel`, `batchId`, `createdFrom`/`createdTo`; cursor pagination | `200` |
 | `GET /v1/batches/{id}` | Batch with per-status counts | `200` |
+| `POST /v1/templates` | Create a template with `{{variable}}` placeholders | `201` |
+| `GET /v1/templates` | List templates, filter by `channel`; cursor pagination | `200` |
+| `GET /v1/templates/{id}` | Template with its variables and version | `200` |
+| `PUT /v1/templates/{id}` | Replace name and body (`version` + 1; channel fixed) | `200` |
+| `DELETE /v1/templates/{id}` | Delete; notifications created from it are unaffected | `204` |
 
 ```bash
 # Create a high-priority OTP; repeating it with the same key returns the same notification
@@ -296,8 +301,33 @@ How it works:
 - A time in the past means "as soon as possible", so idempotent retries keep working after the
   scheduled time has passed.
 
+**Templates (B-3):** store the text once and send it with per-recipient variables
+([ADR-0010](docs/adr/0010-templates.md)).
+
+```bash
+curl -XPOST localhost:8080/v1/templates -H 'Content-Type: application/json' \
+  -d '{"name":"order_shipped","channel":"sms","body":"Hi {{name}}, order {{order_id}} has shipped."}'
+# 201 {"id":"<templateId>","variables":["name","order_id"],"version":1,...}
+
+curl -XPOST localhost:8080/v1/notifications -H 'Content-Type: application/json' \
+  -d '{"recipient":"+905551234567","templateId":"<templateId>","variables":{"name":"Ayşe","order_id":"A-42"}}'
+# 202 {"channel":"sms","content":"Hi Ayşe, order A-42 has shipped.","templateId":"<templateId>","templateVersion":1,...}
+```
+
+How templates behave:
+- Placeholders are `{{ name }}` only: no logic, no functions.
+- The text is rendered when the notification is created and must meet the channel's limits like
+  any other content. A missing or unused variable is a `variables.<name>` violation.
+- `channel` may be omitted and is taken from the template.
+- Editing a template bumps its `version` and never changes notifications that were already
+  accepted.
+- Batch items can mix templates and plain content.
+- The `Idempotency-Key` hash covers `templateId` and `variables`, so a retry after a template
+  edit still replays the original notification.
+
 Unknown JSON fields are rejected. Status codes: `400` malformed request, `404` unknown id, `409`
-`invalid_state` or `idempotency_key_reused` (for batch items, `details` names the item), `413`
+`invalid_state`, `idempotency_key_reused` (for batch items, `details` names the item) or
+`already_exists` (template name), `413`
 body over 256 KiB (10 MiB for batches), `415` non-JSON body, `422` validation, `503` timeout.
 SMS segment counting follows carrier packing (an escape sequence or surrogate pair is never split
 across segments).

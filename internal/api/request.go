@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/alpermelkeli/notification-system/internal/domain"
 	"github.com/alpermelkeli/notification-system/internal/storage"
@@ -72,24 +75,80 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, limit int64, dst any) *r
 	return nil
 }
 
-// validateCreate validates one create request and converts it to the store input. prefix is
-// prepended to field names (e.g. "notifications[3].") so batch violations point at the item.
-func (h *Handler) validateCreate(prefix string, req createRequest, now time.Time) (storage.NewNotification, []violation) {
+// validateCreate validates one create request and converts it to the store input and the
+// canonical form its idempotency hash covers. prefix is prepended to field names (e.g.
+// "notifications[3].") so batch violations point at the item. templates holds the templates the
+// request may name, loaded beforehand (see loadTemplates).
+func (h *Handler) validateCreate(prefix string, req createRequest, now time.Time, templates map[uuid.UUID]domain.Template) (storage.NewNotification, canonical, []violation) {
 	var vs []violation
 	add := func(field, msg string) { vs = append(vs, violation{Field: prefix + field, Message: msg}) }
 
+	// A template supplies the content and, if the request omits it, the channel (ADR-0010).
+	var tpl *domain.Template
+	if req.TemplateID != nil {
+		if req.Content != "" {
+			add("content", "must be omitted when templateId is set")
+		}
+		switch id, err := uuid.Parse(*req.TemplateID); {
+		case err != nil:
+			add("templateId", "must be a UUID")
+		default:
+			if t, ok := templates[id]; ok {
+				tpl = &t
+			} else {
+				add("templateId", "no template with this id")
+			}
+		}
+	} else if req.Variables != nil {
+		add("variables", "requires templateId")
+	}
+
 	ch, chErr := domain.ParseChannel(req.Channel)
+	chOK := false
 	switch {
+	case req.Channel == "" && tpl != nil:
+		ch, chOK = tpl.Channel, true
+	case req.Channel == "" && req.TemplateID != nil:
+		// The templateId violation already explains it; the channel would come from the template.
 	case req.Channel == "":
 		add("channel", "is required")
 	case chErr != nil:
 		add("channel", "must be one of sms, email, push")
+	case tpl != nil && ch != tpl.Channel:
+		add("channel", fmt.Sprintf("must match the template's channel (%s) or be omitted", tpl.Channel))
 	default:
+		chOK = true
+	}
+
+	content := req.Content
+	if chOK {
 		if err := domain.ValidateRecipient(ch, req.Recipient); err != nil {
 			add("recipient", message(err))
 		}
-		if err := domain.ValidateContent(ch, req.Content); err != nil {
-			add("content", message(err))
+		switch {
+		case tpl != nil:
+			rendered, err := tpl.Render(req.Variables)
+			var re *domain.RenderError
+			switch {
+			case errors.As(err, &re):
+				for _, v := range re.Missing {
+					add("variables."+v, "is required by the template")
+				}
+				for _, v := range re.Unused {
+					add("variables."+v, "is not used by the template")
+				}
+			case err != nil:
+				add("templateId", message(err))
+			default:
+				content = rendered
+				if err := domain.ValidateContent(ch, content); err != nil {
+					add("content", "rendered from the template: "+message(err))
+				}
+			}
+		case req.TemplateID == nil:
+			if err := domain.ValidateContent(ch, content); err != nil {
+				add("content", message(err))
+			}
 		}
 	}
 	prio, err := domain.ParsePriority(req.Priority)
@@ -109,9 +168,40 @@ func (h *Handler) validateCreate(prefix string, req createRequest, now time.Time
 			scheduledAt = &at
 		}
 	}
-	return storage.NewNotification{
-		Channel: ch, Priority: prio, Recipient: req.Recipient, Content: req.Content, ScheduledAt: scheduledAt,
-	}, vs
+
+	in := storage.NewNotification{
+		Channel: ch, Priority: prio, Recipient: req.Recipient, Content: content, ScheduledAt: scheduledAt,
+	}
+	canon := canonical{
+		Channel: string(ch), Priority: string(prio), Recipient: req.Recipient, Content: req.Content, ScheduledAt: scheduledAt,
+	}
+	if tpl != nil {
+		in.Template = &storage.TemplateRef{ID: tpl.ID, Version: tpl.Version}
+		// The hash covers what the client sent, not the rendered text, so a retry after the
+		// template was edited still replays the original notification (ADR-0010).
+		canon.TemplateID, canon.Variables = tpl.ID.String(), req.Variables
+	}
+	return in, canon, vs
+}
+
+// loadTemplates loads every template the requests name, in one query. Ids that are not UUIDs are
+// skipped here and reported by validateCreate.
+func (h *Handler) loadTemplates(ctx context.Context, reqs ...createRequest) (map[uuid.UUID]domain.Template, error) {
+	var ids []uuid.UUID
+	seen := map[uuid.UUID]bool{}
+	for _, r := range reqs {
+		if r.TemplateID == nil {
+			continue
+		}
+		if id, err := uuid.Parse(*r.TemplateID); err == nil && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	return h.store.GetTemplates(ctx, ids)
 }
 
 // idempotencyKey reads and checks the Idempotency-Key header. It returns nil if absent.
@@ -139,21 +229,18 @@ func validKey(k string) bool {
 }
 
 // canonical is the normalised form of one notification request that idempotency hashes cover.
-// Defaults are applied first, so omitting priority and sending "normal" hash the same.
+// Defaults are applied first, so omitting priority and sending "normal" hash the same. The
+// template fields are omitted when empty, so plain-content requests hash as they did before
+// templates existed.
 type canonical struct {
-	Channel     string     `json:"channel"`
-	Priority    string     `json:"priority"`
-	Recipient   string     `json:"recipient"`
-	Content     string     `json:"content"`
-	ScheduledAt *time.Time `json:"scheduledAt"`
-	Key         string     `json:"key,omitempty"`
-}
-
-func canonicalOf(n storage.NewNotification) canonical {
-	return canonical{
-		Channel: string(n.Channel), Priority: string(n.Priority), Recipient: n.Recipient,
-		Content: n.Content, ScheduledAt: n.ScheduledAt,
-	}
+	Channel     string            `json:"channel"`
+	Priority    string            `json:"priority"`
+	Recipient   string            `json:"recipient"`
+	Content     string            `json:"content"`
+	ScheduledAt *time.Time        `json:"scheduledAt"`
+	Key         string            `json:"key,omitempty"`
+	TemplateID  string            `json:"templateId,omitempty"`
+	Variables   map[string]string `json:"variables,omitempty"`
 }
 
 // hashVersion prefixes every hashed request. Bump it when canonical changes shape, so retries in
