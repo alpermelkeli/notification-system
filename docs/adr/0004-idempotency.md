@@ -42,6 +42,25 @@ was reaped cannot overwrite a newer outcome.
 **4. Provider:** every request carries `Idempotency-Key: <notification id>` and
 `X-Correlation-ID`, so providers that support deduplication can deduplicate.
 
+**Amendment (2026-11-21, Phase 3), details settled during implementation:**
+- An expired key that the cleanup has not deleted yet is taken over by the next request
+  (`ON CONFLICT ... DO UPDATE ... WHERE expires_at <= now()`).
+- Batch item keys: an item whose key is live with the same request hash is not created again; the
+  response returns the existing notification for that position, marked as a duplicate. Such
+  items do not belong to the new batch and are not counted in its total. A different hash fails
+  the whole batch with `409`. Duplicate keys inside one request are rejected as invalid.
+- Replaying a batch with its batch-level key returns the original batch and the notifications it
+  created, in request order.
+- The key, the batch row and all notification rows are written in one transaction. Keys are
+  claimed in sorted order so that concurrent batches with overlapping keys cannot deadlock.
+- **Fencing token (replaces the status-only guard of point 3):** a status guard alone is not
+  enough. If worker A stalls past its lease, the row is reaped, re-dispatched and claimed by
+  worker B, so it is `processing` again and A's late outcome would match. Each claim therefore
+  sets a fresh `lease_token`, and every outcome transition (`sent`, `retrying`, `failed`,
+  release) must present it; a stale token is rejected as "lease lost".
+- `IDEMPOTENCY_TTL` must not exceed `RETENTION_DAYS`, so a live key never points at a dropped
+  notification.
+
 ## Consequences
 - ✅ Duplicate creates are impossible, and duplicate publishes or deliveries are filtered before
   the provider call.

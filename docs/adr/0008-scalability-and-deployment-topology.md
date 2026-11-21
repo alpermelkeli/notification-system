@@ -41,7 +41,7 @@ locally.
 - **Connection pooling:** API and workers go through **PgBouncer** (transaction mode). The
   dispatcher connects directly, because `LISTEN/NOTIFY` needs a session connection.
 - **Data lifecycle:** daily partitions by `created_at` with partition-drop retention
-  (default 30 days), `fillfactor=80` for HOT updates, and a partial index for due work. The
+  (default 30 days), `fillfactor=80` so updated row versions stay on the same page, and a partial index for due work. The
   primary key is `(id, created_at)` with UUIDv7 ids, and idempotency keys are in a separate
   table (ADR-0004).
 
@@ -65,6 +65,19 @@ locally.
   at ≤ 100 msg/s per channel.
 - Production manifests (Kubernetes HPA/KEDA) are **documented, not shipped.** They are out of
   scope for a 12 h assessment. The deployment diagram shows the target topology.
+
+**Amendment (2026-11-21, Phase 3):**
+- `fillfactor=80` originally said "for HOT updates". Status transitions change an indexed column
+  (`status` is in the partial-index predicates), so they cannot be HOT; the setting is kept
+  because same-page updates still reduce bloat (see capacity planning §4).
+- `created_at` is the millisecond timestamp embedded in the UUIDv7 id. A lookup by id alone (for
+  example `GET /v1/notifications/{id}`) therefore derives `created_at` and reads one partition,
+  without the client having to send it. All items of a batch share the batch's timestamp, so a
+  batch also lives in one partition, and their ids carry a 12-bit sequence so that id order is
+  request order.
+- Partition maintenance (pre-create ahead, `DETACH ... CONCURRENTLY` + `DROP` after retention,
+  expired idempotency keys) runs in the dispatcher under a PostgreSQL advisory lock. There is no
+  default partition.
 
 ## Consequences
 - ✅ Scaling claims are backed by numbers (capacity planning) and demonstrated locally (nginx +

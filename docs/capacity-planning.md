@@ -87,8 +87,12 @@ sends). A retry storm reduces *goodput*, not safety.
 - Partition `notifications` and `notification_status_history` by `created_at`, one partition per
   day. Retention is enforced by **dropping old partitions**, which is instant and causes no
   vacuum storm, instead of `DELETE`.
-- `fillfactor = 80` on `notifications`, so the frequent status updates can be HOT updates
-  (no index churn).
+- `fillfactor = 80` on `notifications`. Every transition changes `status`, which appears in the
+  partial-index predicates and in the `(status, id)` index, so these updates are **not** HOT and
+  do add index entries. The 20% free space still lets the new row version land on the same heap
+  page, which keeps a notification's versions together and lets page pruning reclaim dead
+  versions before vacuum runs. (Corrected in Phase 3; the first version of this document claimed
+  HOT updates.)
 - Partitioning constraint: on a partitioned table, unique indexes must include the partition
   key. Therefore:
   - The primary key is `(id, created_at)`. Ids are **UUIDv7** (time-ordered), and the
