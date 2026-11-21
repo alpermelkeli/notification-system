@@ -5,6 +5,11 @@
 
 -- +goose Up
 
+-- Even a catalog-only ALTER takes an exclusive lock on notifications and every partition. Fail
+-- fast instead of queueing every read and write behind a long-running statement; the migrate job
+-- is then rerun.
+SET LOCAL lock_timeout = '5s';
+
 CREATE TABLE templates (
     id         uuid        PRIMARY KEY, -- UUIDv7
     name       text        NOT NULL UNIQUE,
