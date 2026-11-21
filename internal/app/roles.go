@@ -15,6 +15,7 @@ import (
 	"github.com/alpermelkeli/notification-system/internal/config"
 	"github.com/alpermelkeli/notification-system/internal/dispatcher"
 	"github.com/alpermelkeli/notification-system/internal/domain"
+	"github.com/alpermelkeli/notification-system/internal/events"
 	"github.com/alpermelkeli/notification-system/internal/health"
 	"github.com/alpermelkeli/notification-system/internal/metrics"
 	"github.com/alpermelkeli/notification-system/internal/platform"
@@ -66,10 +67,21 @@ func RunAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	}
 	defer pool.Close()
 
-	router, httpMetrics := baseRouter(logger, cfg.InstanceID, []health.Check{platform.PostgresCheck(pool)}, metrics.NewRegistry())
+	// Status events only (ADR-0011). Kafka is not part of readiness: without it creates and
+	// cancels still work and only live updates pause.
+	producer, err := platform.NewKafkaClient(cfg.KafkaBrokers,
+		append(dispatcher.ProducerOptions(), kgo.ClientID("api-"+cfg.InstanceID))...)
+	if err != nil {
+		return err
+	}
+	defer closeProducer(ctx, producer, logger)
+
+	reg := metrics.NewRegistry()
+	router, httpMetrics := baseRouter(logger, cfg.InstanceID, []health.Check{platform.PostgresCheck(pool)}, reg)
 	store := storage.New(pool, storage.Options{IdempotencyTTL: cfg.IdempotencyTTL})
 	api.New(store, logger, api.Options{
 		MaxScheduleAhead: cfg.MaxScheduleAhead, RequestTimeout: cfg.RequestTimeout, Metrics: httpMetrics,
+		Events: events.NewPublisher(producer, metrics.NewEvents(reg), logger),
 	}).Routes(router)
 
 	return serveHTTP(ctx, logger, cfg.HTTPAddr, router, cfg.ShutdownTimeout)
@@ -90,19 +102,20 @@ func RunDispatcher(ctx context.Context, cfg config.Config, logger *slog.Logger) 
 	if err != nil {
 		return err
 	}
-	defer kafka.Close()
+	defer closeProducer(ctx, kafka, logger)
 
 	reg := metrics.NewRegistry()
 	m := metrics.NewDispatch(reg)
+	evts := events.NewPublisher(kafka, metrics.NewEvents(reg), logger)
 	store := storage.New(pool, storage.Options{IdempotencyTTL: cfg.IdempotencyTTL})
 	relay := dispatcher.NewRelay(store, dispatcher.NewPublisher(kafka, m).Publish, logger, dispatcher.RelayOptions{
-		BatchSize: cfg.Dispatcher.BatchSize, PollInterval: cfg.Dispatcher.PollInterval, Metrics: m,
+		BatchSize: cfg.Dispatcher.BatchSize, PollInterval: cfg.Dispatcher.PollInterval, Metrics: m, Events: evts,
 	})
 	dead := queue.NewDeadLetters(kafka, dispatcher.PublishTimeout)
 	offsets := dispatcher.NewKafkaOffsets(kadm.NewClient(kafka))
 	reaper := dispatcher.NewReaper(store, offsets, dead, logger, dispatcher.ReaperOptions{
 		Interval: cfg.Dispatcher.ReaperInterval, Grace: cfg.Dispatcher.ReaperGrace,
-		StuckAfter: cfg.Dispatcher.ReaperStuckAfter, MaxAttempts: cfg.Retry.MaxAttempts, Metrics: m,
+		StuckAfter: cfg.Dispatcher.ReaperStuckAfter, MaxAttempts: cfg.Retry.MaxAttempts, Metrics: m, Events: evts,
 	})
 	depth := dispatcher.NewDepthMonitor(store, offsets, m, logger, cfg.Dispatcher.DepthInterval)
 
@@ -150,14 +163,14 @@ func RunWorker(ctx context.Context, cfg config.Config, logger *slog.Logger) erro
 	if err != nil {
 		return err
 	}
-	// Dead letters go through their own producer: the consumers' clients are per channel and leave
-	// their group on shutdown.
+	// Dead letters and status events go through their own producer: the consumers' clients are
+	// per channel and leave their group on shutdown.
 	producer, err := platform.NewKafkaClient(cfg.KafkaBrokers,
-		append(dispatcher.ProducerOptions(), kgo.ClientID("worker-dlq-"+cfg.InstanceID))...)
+		append(dispatcher.ProducerOptions(), kgo.ClientID("worker-producer-"+cfg.InstanceID))...)
 	if err != nil {
 		return err
 	}
-	defer producer.Close()
+	defer closeProducer(ctx, producer, logger)
 
 	reg := metrics.NewRegistry()
 	store := storage.New(pool, storage.Options{IdempotencyTTL: cfg.IdempotencyTTL})
@@ -171,6 +184,7 @@ func RunWorker(ctx context.Context, cfg config.Config, logger *slog.Logger) erro
 		},
 		Breaker: worker.BreakerOptions(cfg.Worker.Breaker),
 		Metrics: metrics.NewDelivery(reg),
+		Events:  events.NewPublisher(producer, metrics.NewEvents(reg), logger),
 	}
 
 	var wg sync.WaitGroup
@@ -228,6 +242,22 @@ func runMaintenance(ctx context.Context, store *storage.Store, cfg config.Config
 		case <-ticker.C:
 		}
 	}
+}
+
+// producerFlushTimeout bounds how long shutdown waits for buffered records, mostly status
+// events, before closing a producing client.
+const producerFlushTimeout = 5 * time.Second
+
+// closeProducer sends the records still buffered in cl, within producerFlushTimeout, and closes
+// it, so the last transitions before a shutdown still reach WebSocket clients. ctx is the role's
+// context, which is usually cancelled by then; the flush gets its own deadline.
+func closeProducer(ctx context.Context, cl *kgo.Client, logger *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), producerFlushTimeout)
+	defer cancel()
+	if err := cl.Flush(ctx); err != nil {
+		logger.Warn("buffered kafka records not flushed before shutdown", "err", err)
+	}
+	cl.Close()
 }
 
 func serveAdmin(ctx context.Context, cfg config.Config, logger *slog.Logger, checks []health.Check, reg *prometheus.Registry) error {

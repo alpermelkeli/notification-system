@@ -291,3 +291,13 @@ func (f *fakeStore) DeleteTemplate(_ context.Context, id uuid.UUID) error {
 	delete(f.templates, id)
 	return nil
 }
+
+// newNotificationForTest stores a notification in status st and returns its id.
+func (f *fakeStore) newNotificationForTest(st domain.Status) uuid.UUID {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := f.newNotification(storage.NewNotification{Channel: domain.ChannelSMS, Priority: domain.PriorityNormal}, "", nil)
+	n.Status = st
+	f.byID[n.ID] = n
+	return n.ID
+}

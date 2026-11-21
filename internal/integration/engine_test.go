@@ -29,6 +29,7 @@ import (
 
 	"github.com/alpermelkeli/notification-system/internal/dispatcher"
 	"github.com/alpermelkeli/notification-system/internal/domain"
+	"github.com/alpermelkeli/notification-system/internal/events"
 	"github.com/alpermelkeli/notification-system/internal/provider"
 	"github.com/alpermelkeli/notification-system/internal/queue"
 	"github.com/alpermelkeli/notification-system/internal/ratelimit"
@@ -96,7 +97,8 @@ func run(m *testing.M) int {
 	return m.Run()
 }
 
-// createTopics creates the work and dead-letter topics with the partition counts of ADR-0002.
+// createTopics creates the work, dead-letter and event topics with the partition counts of
+// ADR-0002.
 func createTopics(ctx context.Context) error {
 	cl, err := kgo.NewClient(kgo.SeedBrokers(kafkaAddr))
 	if err != nil {
@@ -104,12 +106,14 @@ func createTopics(ctx context.Context) error {
 	}
 	defer cl.Close()
 	adm := kadm.NewClient(cl)
-	resp, err := adm.CreateTopic(ctx, 3, 1, nil, queue.DeadLetterTopic)
-	if err == nil {
-		err = resp.Err
-	}
-	if err != nil {
-		return fmt.Errorf("create topic %s: %w", queue.DeadLetterTopic, err)
+	for topic, partitions := range map[string]int32{queue.DeadLetterTopic: 3, queue.EventsTopic: 6} {
+		resp, err := adm.CreateTopic(ctx, partitions, 1, nil, topic)
+		if err == nil {
+			err = resp.Err
+		}
+		if err != nil {
+			return fmt.Errorf("create topic %s: %w", topic, err)
+		}
 	}
 	for _, c := range domain.Channels {
 		for _, p := range domain.Priorities {
@@ -215,11 +219,12 @@ func startEngine(t *testing.T, store *storage.Store, providerURL string, workers
 		t.Fatal(err)
 	}
 	t.Cleanup(producer.Close)
+	evts := events.NewPublisher(producer, nil, quiet)
 	relay := dispatcher.NewRelay(store, dispatcher.NewPublisher(producer, nil).Publish, quiet,
-		dispatcher.RelayOptions{PollInterval: 50 * time.Millisecond})
+		dispatcher.RelayOptions{PollInterval: 50 * time.Millisecond, Events: evts})
 	dead := queue.NewDeadLetters(producer, dispatcher.PublishTimeout)
 	reaper := dispatcher.NewReaper(store, dispatcher.NewKafkaOffsets(kadm.NewClient(producer)), dead, quiet,
-		dispatcher.ReaperOptions{Interval: 200 * time.Millisecond, Grace: 100 * time.Millisecond, MaxAttempts: 3})
+		dispatcher.ReaperOptions{Interval: 200 * time.Millisecond, Grace: 100 * time.Millisecond, MaxAttempts: 3, Events: evts})
 	wg.Go(func() { relay.Run(ctx) })
 	wg.Go(func() { reaper.Run(ctx) })
 
@@ -238,7 +243,7 @@ func startEngine(t *testing.T, store *storage.Store, providerURL string, workers
 	for range workers {
 		o := worker.Options{
 			Retry: retry.Policy{BaseDelay: 200 * time.Millisecond, MaxAttempts: 3}, Lease: 10 * time.Second,
-			CommitInterval: 100 * time.Millisecond, DeadLetters: dead,
+			CommitInterval: 100 * time.Millisecond, DeadLetters: dead, Events: evts,
 		}
 		for _, f := range opts {
 			f(&o)

@@ -25,7 +25,19 @@ type RelayOptions struct {
 	PollInterval time.Duration
 	// Metrics counts failed batches. Optional.
 	Metrics *metrics.Dispatch
+	// Events receives every row the relay moved to queued (ADR-0011). Optional.
+	Events EventPublisher
 }
+
+// EventPublisher publishes the status events of changed rows (ADR-0011). It must not block.
+// *events.Publisher implements it.
+type EventPublisher interface {
+	Publish(ctx context.Context, ns ...domain.Notification)
+}
+
+type noEvents struct{}
+
+func (noEvents) Publish(context.Context, ...domain.Notification) {}
 
 // Relay publishes due notifications in next_attempt_at order (ADR-0003). It wakes on
 // NOTIFY notifications_due, which the API sends for rows due now, and polls as a fallback.
@@ -45,6 +57,9 @@ func NewRelay(store RelayStore, publish storage.PublishFunc, logger *slog.Logger
 	if opts.PollInterval <= 0 {
 		opts.PollInterval = 500 * time.Millisecond
 	}
+	if opts.Events == nil {
+		opts.Events = noEvents{}
+	}
 	return &Relay{store: store, publish: publish, logger: logger, opts: opts, wake: make(chan struct{}, 1)}
 }
 
@@ -58,6 +73,7 @@ func (r *Relay) Run(ctx context.Context) {
 	for {
 		queued, err := r.store.DispatchDue(ctx, r.opts.BatchSize, r.publish)
 		n := len(queued)
+		r.opts.Events.Publish(ctx, queued...)
 		if ctx.Err() != nil {
 			return
 		}

@@ -60,7 +60,8 @@ curl localhost:8081/stats        # accepted/rejected per channel + rate in the l
 **PostgreSQL decides *when*, Kafka moves *what*, workers deliver at ≤ 100 msg/s per channel.**
 
 1. **API** validates the request, enforces `Idempotency-Key`, inserts the notification
-   (`status=pending`) and returns `202 Accepted`. It never talks to Kafka directly.
+   (`status=pending`) and returns `202 Accepted`. It never publishes work to Kafka; the
+   dispatcher does.
 2. **Dispatcher** claims due rows (`FOR UPDATE SKIP LOCKED`, FIFO by `next_attempt_at`), publishes
    them to Kafka and marks them `queued`. The same mechanism handles new, scheduled and retrying
    notifications.
@@ -71,7 +72,9 @@ curl localhost:8081/stats        # accepted/rejected per channel + rate in the l
    and get a guaranteed minimum share. Each send takes a token from the shared **Redis** rate
    limiter, passes a per-channel circuit breaker (Phase 6), and the outcome is written back with a
    guarded status transition.
-5. **Status events** stream to `notification.events` for WebSocket clients (Phase 8).
+5. **Status events:** every component publishes the rows it changed to `notification.events`
+   after the commit (best effort, [ADR-0011](docs/adr/0011-status-events-and-websocket.md)), and
+   every API instance fans them out to WebSocket subscribers.
 
 ### Processing engine (Phase 5)
 - **Dispatcher** ([`internal/dispatcher`](internal/dispatcher)): the relay locks up to 500 due rows,
@@ -120,7 +123,7 @@ See [ADR-0009](docs/adr/0009-observability.md) for the design.
   | How big is the backlog? | `notifier_notifications{status}`, `notifier_notifications_due`, `notifier_oldest_due_age_seconds` (PostgreSQL), `notifier_kafka_consumer_lag{group,topic}` (Kafka), `notifier_worker_buffered_records` |
   | Are deliveries succeeding? | `notifier_delivery_outcomes_total{channel,outcome}` (sent, retrying, failed, released, skipped, ...), `notifier_provider_requests_total{channel,class}`, `notifier_dead_letters_total` |
   | How fast? | `notifier_delivery_latency_seconds` (first due → sent, across retries), `notifier_queue_wait_seconds` (due → picked), `notifier_provider_request_duration_seconds`, `notifier_http_request_duration_seconds{route}` |
-  | Is something degraded? | `notifier_circuit_breaker_state{channel}` (0 closed, 1 half-open, 2 open), `notifier_reaper_recovered_total{reason}`, `notifier_worker_db_retries_total`, `notifier_dispatch_errors_total` |
+  | Is something degraded? | `notifier_circuit_breaker_state{channel}` (0 closed, 1 half-open, 2 open), `notifier_reaper_recovered_total{reason}`, `notifier_worker_db_retries_total`, `notifier_dispatch_errors_total`, `notifier_status_events_total{result}` (failed, dropped) |
 
   ```promql
   sum by (channel) (rate(notifier_provider_requests_total{class="delivered"}[1m]))          # sends/s
@@ -155,6 +158,8 @@ See [ADR-0009](docs/adr/0009-observability.md) for the design.
 | [0007](docs/adr/0007-technology-stack.md) | Go 1.26, chi, pgx, goose, franz-go, go-redis, OpenTelemetry, testcontainers |
 | [0008](docs/adr/0008-scalability-and-deployment-topology.md) | Scaling model per component, single PG primary + HA/replica/partitioning, nginx scaling demo |
 | [0009](docs/adr/0009-observability.md) | Prometheus metrics per role, queue depth sampling, `traceparent` stored with the row and carried in Kafka headers, trace ids in logs |
+| [0010](docs/adr/0010-templates.md) | Stored templates, `{{name}}` substitution only, rendered and validated at creation |
+| [0011](docs/adr/0011-status-events-and-websocket.md) | Best-effort status events after each commit; every API instance reads all events and serves WebSocket subscriptions by notification or batch id |
 
 ## Data model
 Schema: [`migrations/`](migrations) (goose, forward-only, embedded in the binary and applied by
@@ -404,7 +409,8 @@ and are skipped by `make test-short`:
   delivered exactly once, a 503 is retried, a cancelled row is never sent, the rate holds, and a
   lost record is recovered by the reaper. A 400 fails at once, a provider stuck on 503 exhausts
   the attempts with growing backoff, both reach `notifications.dlq`, and during a provider outage
-  the breaker stops the calls without burning attempts. One notification retried once is followed
+  the breaker stops the calls without burning attempts. A consumer of `notification.events`
+  sees every transition of a delivered and of a retried notification, in order of `at`. One notification retried once is followed
   through a single trace: two dispatches under the stored request span, each delivery under its
   dispatch, and the `traceparent` reaching the provider on both calls.
   A scheduled notification reaches the provider at its `scheduledAt` (not before, and within the

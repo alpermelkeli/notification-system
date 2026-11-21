@@ -41,6 +41,16 @@ type Store interface {
 	DeleteTemplate(ctx context.Context, id uuid.UUID) error
 }
 
+// EventPublisher publishes the status events of changed rows (ADR-0011). It must not block.
+// *events.Publisher implements it.
+type EventPublisher interface {
+	Publish(ctx context.Context, ns ...domain.Notification)
+}
+
+type noEvents struct{}
+
+func (noEvents) Publish(context.Context, ...domain.Notification) {}
+
 // Options configures the API.
 type Options struct {
 	// MaxScheduleAhead bounds scheduledAt (B-2). It must stay below the data retention, or a
@@ -50,6 +60,9 @@ type Options struct {
 	RequestTimeout time.Duration
 	// Metrics counts created notifications. Optional.
 	Metrics *metrics.HTTP
+	// Events receives every notification the API creates, cancels or replays (ADR-0011).
+	// Optional.
+	Events EventPublisher
 	// Now returns the current time. Default time.Now.
 	Now func() time.Time
 }
@@ -85,6 +98,9 @@ func New(store Store, logger *slog.Logger, opts Options) *Handler {
 	}
 	if opts.MaxScheduleAhead <= 0 {
 		opts.MaxScheduleAhead = 7 * 24 * time.Hour
+	}
+	if opts.Events == nil {
+		opts.Events = noEvents{}
 	}
 	return &Handler{store: store, logger: logger, opts: opts}
 }

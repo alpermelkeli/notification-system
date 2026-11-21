@@ -83,6 +83,8 @@ type ReaperOptions struct {
 	Channels []domain.Channel
 	// Metrics counts recoveries and dead letters. Optional.
 	Metrics *metrics.Dispatch
+	// Events receives every row the reaper changed (ADR-0011). Optional.
+	Events EventPublisher
 }
 
 // Reaper recovers notifications that would otherwise never be delivered (ADR-0003):
@@ -123,6 +125,9 @@ func NewReaper(store ReaperStore, offsets OffsetSource, dead DeadLetterPublisher
 	if len(opts.Channels) == 0 {
 		opts.Channels = domain.Channels
 	}
+	if opts.Events == nil {
+		opts.Events = noEvents{}
+	}
 	return &Reaper{store: store, offsets: offsets, dead: dead, logger: logger, opts: opts}
 }
 
@@ -151,6 +156,8 @@ func (r *Reaper) RunOnce(ctx context.Context) (ReapReport, error) {
 		res, err := r.store.ReapExpiredLeases(ctx, r.opts.MaxAttempts, r.opts.Limit)
 		rep.ExpiredLeases += len(res.Retried)
 		rep.ExhaustedLeases += len(res.Failed)
+		r.opts.Events.Publish(ctx, res.Retried...)
+		r.opts.Events.Publish(ctx, res.Failed...)
 		r.deadLetter(ctx, res.Failed)
 		return len(res.Retried) + len(res.Failed), err
 	})
@@ -161,6 +168,7 @@ func (r *Reaper) RunOnce(ctx context.Context) (ReapReport, error) {
 	if len(committed) > 0 {
 		n, err := r.drain(ctx, func() (int, error) {
 			ns, err := r.store.RequeueConsumed(ctx, committed, r.opts.Grace, r.opts.Limit)
+			r.opts.Events.Publish(ctx, ns...)
 			return len(ns), err
 		})
 		rep.Consumed = n
@@ -169,6 +177,7 @@ func (r *Reaper) RunOnce(ctx context.Context) (ReapReport, error) {
 
 	n, err := r.drain(ctx, func() (int, error) {
 		ns, err := r.store.RequeueStuck(ctx, r.opts.StuckAfter, r.opts.Limit)
+		r.opts.Events.Publish(ctx, ns...)
 		return len(ns), err
 	})
 	rep.Stuck = n

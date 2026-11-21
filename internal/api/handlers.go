@@ -49,6 +49,7 @@ func (h *Handler) createNotification(w http.ResponseWriter, r *http.Request) {
 	}
 	if created {
 		h.opts.Metrics.Created(n.Channel, n.Priority, 1)
+		h.opts.Events.Publish(r.Context(), n)
 	}
 	w.Header().Set("Location", "/v1/notifications/"+n.ID.String())
 	if !created {
@@ -134,6 +135,7 @@ func (h *Handler) createBatch(w http.ResponseWriter, r *http.Request) {
 		for _, it := range res.Items {
 			if !it.Duplicate {
 				h.opts.Metrics.Created(it.Notification.Channel, it.Notification.Priority, 1)
+				h.opts.Events.Publish(r.Context(), it.Notification)
 			}
 		}
 	}
@@ -164,6 +166,9 @@ func (h *Handler) getHistory(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) cancelNotification(w http.ResponseWriter, r *http.Request) {
 	h.withID(w, r, func(ctx context.Context, id uuid.UUID) (any, error) {
 		n, err := h.store.Cancel(ctx, id)
+		if err == nil {
+			h.opts.Events.Publish(ctx, n)
+		}
 		return toNotificationJSON(n), err
 	}, http.StatusOK)
 }
@@ -172,6 +177,9 @@ func (h *Handler) cancelNotification(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) retryNotification(w http.ResponseWriter, r *http.Request) {
 	h.withID(w, r, func(ctx context.Context, id uuid.UUID) (any, error) {
 		n, err := h.store.Replay(ctx, id)
+		if err == nil {
+			h.opts.Events.Publish(ctx, n)
+		}
 		return toNotificationJSON(n), err
 	}, http.StatusAccepted)
 }
