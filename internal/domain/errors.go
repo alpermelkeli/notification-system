@@ -12,6 +12,8 @@ var (
 	ErrNotFound = errors.New("not found")
 	// ErrInvalidArgument means the caller supplied an invalid value.
 	ErrInvalidArgument = errors.New("invalid argument")
+	// ErrAlreadyExists means a resource with the same unique name exists, e.g. a template.
+	ErrAlreadyExists = errors.New("already exists")
 	// ErrInvalidTransition means a guarded status change did not apply because the notification
 	// is not in an allowed source status (see TransitionError).
 	ErrInvalidTransition = errors.New("invalid status transition")
