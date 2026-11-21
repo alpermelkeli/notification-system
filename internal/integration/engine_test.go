@@ -206,7 +206,7 @@ func startEngine(t *testing.T, store *storage.Store, providerURL string, workers
 		t.Fatal(err)
 	}
 	t.Cleanup(producer.Close)
-	relay := dispatcher.NewRelay(store, dispatcher.NewPublisher(producer).Publish, quiet,
+	relay := dispatcher.NewRelay(store, dispatcher.NewPublisher(producer, nil).Publish, quiet,
 		dispatcher.RelayOptions{PollInterval: 50 * time.Millisecond})
 	dead := queue.NewDeadLetters(producer, dispatcher.PublishTimeout)
 	reaper := dispatcher.NewReaper(store, dispatcher.NewKafkaOffsets(kadm.NewClient(producer)), dead, quiet,

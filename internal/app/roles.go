@@ -91,7 +91,7 @@ func RunDispatcher(ctx context.Context, cfg config.Config, logger *slog.Logger) 
 	defer kafka.Close()
 
 	store := storage.New(pool, storage.Options{IdempotencyTTL: cfg.IdempotencyTTL})
-	relay := dispatcher.NewRelay(store, dispatcher.NewPublisher(kafka).Publish, logger, dispatcher.RelayOptions{
+	relay := dispatcher.NewRelay(store, dispatcher.NewPublisher(kafka, nil).Publish, logger, dispatcher.RelayOptions{
 		BatchSize: cfg.Dispatcher.BatchSize, PollInterval: cfg.Dispatcher.PollInterval,
 	})
 	dead := queue.NewDeadLetters(kafka, dispatcher.PublishTimeout)
