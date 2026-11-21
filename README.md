@@ -4,13 +4,13 @@ An event-driven, multi-channel notification service written in Go. It accepts no
 requests over HTTP, processes them asynchronously through prioritized queue workers, and delivers
 them via SMS, Email and Push providers with rate limiting, retries and real-time status tracking.
 
-> **Status:** 🚧 Phase 6 done: notifications flow end to end (API → PostgreSQL → dispatcher → Kafka → priority-scheduled workers → Redis rate limiter → provider), failures are classified and retried with exponential backoff and jitter, terminal failures are dead-lettered, and a per-channel circuit breaker holds the backlog during provider outages. Metrics and tracing follow in Phase 7. See [`docs/plan.md`](docs/plan.md).
+> **Status:** 🚧 Phase 7 done: notifications flow end to end (API → PostgreSQL → dispatcher → Kafka → priority-scheduled workers → Redis rate limiter → provider). Failures are classified and retried with exponential backoff and jitter, terminal failures are dead-lettered, and a per-channel circuit breaker holds the backlog during provider outages. Every role exports Prometheus metrics (queue depth, outcome rates, latency), and one OpenTelemetry trace follows each notification from the API request to the provider call, retries included. Bonus features follow in Phase 8. See [`docs/plan.md`](docs/plan.md).
 
 ## Features (target)
 - **Notification API:** single and batch create (up to 1000), status by ID / batch ID, cancel, filtered + paginated listing
 - **Processing engine:** async workers, high / normal / low priority queues, 100 msg/s per channel rate limit, content validation, idempotency
 - **Delivery & retry:** exponential backoff with jitter, failure classification, dead-letter handling
-- **Observability:** metrics endpoint (queue depth, success/failure rates, latency), structured logs with correlation IDs, health checks
+- **Observability:** Prometheus metrics (queue depth, success/failure rates, latency), structured logs with correlation and trace IDs, health checks, OpenTelemetry traces in Jaeger
 - **Bonus:** scheduled notifications, templates, WebSocket status updates, distributed tracing, CI/CD
 
 ## Quick start
@@ -30,6 +30,8 @@ curl localhost:8080/readyz       # API readiness: {"status":"ok","checks":{"post
 | `worker` | channel consumers + delivery (`notifier worker`) | (admin :9090 in-network) |
 | `mockprovider` | local fake of webhook.site with fault injection | 8081 (127.0.0.1 only) |
 | `postgres`, `kafka`, `redis` | infrastructure | 5432, 9092, 6379 (127.0.0.1 only) |
+| `jaeger` | trace storage and UI ([ADR-0009](docs/adr/0009-observability.md)) | 16686 UI, 4318 OTLP (127.0.0.1 only) |
+| `prometheus` | scrapes `/metrics` of every replica | 9091 UI (127.0.0.1 only) |
 | `kafka-init` | one-shot job creating the [ADR-0002](docs/adr/0002-kafka-topology-and-consumer-model.md) topics | |
 | `migrate` | one-shot job: schema migrations + daily partitions (`notifier migrate`); the roles start after it | |
 
@@ -37,7 +39,7 @@ Every role exposes `GET /healthz` (liveness, never checks dependencies), `GET /r
 (readiness, checks the role's dependencies; failures are reported as `unavailable` and the error
 is logged, not returned) and `GET /metrics` (Prometheus; blocked at the public load balancer). Every response
 carries `X-Correlation-ID` (taken from the request if valid, otherwise generated) and
-`X-Instance-ID`.
+`X-Instance-ID`. A W3C `traceparent` request header is continued by the API's trace.
 
 Mock provider:
 ```bash
@@ -107,6 +109,40 @@ curl localhost:8081/stats        # accepted/rejected per channel + rate in the l
   stay in its buffers and in Kafka, fetching pauses, and no attempts are burned. After 30 s one
   probe is let through; its success closes the breaker. `4xx` and `429` answers do not count.
 
+### Observability (Phase 7)
+See [ADR-0009](docs/adr/0009-observability.md) for the design.
+
+- **Metrics** ([`internal/metrics`](internal/metrics)): every role serves its own registry on
+  `/metrics`, and the compose Prometheus (http://localhost:9091) scrapes all replicas. Main series:
+
+  | Question | Metric |
+  |----------|--------|
+  | How big is the backlog? | `notifier_notifications{status}`, `notifier_notifications_due`, `notifier_oldest_due_age_seconds` (PostgreSQL), `notifier_kafka_consumer_lag{group,topic}` (Kafka), `notifier_worker_buffered_records` |
+  | Are deliveries succeeding? | `notifier_delivery_outcomes_total{channel,outcome}` (sent, retrying, failed, released, skipped, ...), `notifier_provider_requests_total{channel,class}`, `notifier_dead_letters_total` |
+  | How fast? | `notifier_delivery_latency_seconds` (first due → sent, across retries), `notifier_queue_wait_seconds` (due → picked), `notifier_provider_request_duration_seconds`, `notifier_http_request_duration_seconds{route}` |
+  | Is something degraded? | `notifier_circuit_breaker_state{channel}` (0 closed, 1 half-open, 2 open), `notifier_reaper_recovered_total{reason}`, `notifier_worker_db_retries_total`, `notifier_dispatch_errors_total` |
+
+  ```promql
+  sum by (channel) (rate(notifier_provider_requests_total{class="delivered"}[1m]))          # sends/s
+  sum by (channel) (rate(notifier_delivery_outcomes_total{outcome="failed"}[5m]))
+    / sum by (channel) (rate(notifier_delivery_outcomes_total{outcome=~"sent|failed"}[5m])) # failure ratio
+  histogram_quantile(0.95, sum by (le, channel) (rate(notifier_delivery_latency_seconds_bucket[5m])))
+  max by (topic) (notifier_kafka_consumer_lag)                                               # worker backlog
+  ```
+  The queue depth gauges are sampled by every dispatcher every `QUEUE_METRICS_INTERVAL`, so take
+  `max()` over instances.
+- **Traces** ([`internal/telemetry`](internal/telemetry)): with `OTEL_EXPORTER_OTLP_ENDPOINT` set
+  (compose: Jaeger, UI at http://localhost:16686), each notification gets one trace:
+  `POST /v1/notifications` → `send notifications.sms.high` (dispatcher) → `process
+  notifications.sms.high` (worker) → `claim`, `HTTP POST` (provider), `write outcome`. The API stores
+  the request's `traceparent` with the row and the dispatcher puts its span in the Kafka headers,
+  so retries hours later still join the same trace. Find a trace by the `correlation_id` tag.
+- **Logs**: JSON lines carry `correlation_id` and, inside a recorded span, `trace_id` and
+  `span_id`.
+- Measured on the compose stack (3000 SMS in three batches of 1000): `notifier_provider_requests_total`
+  ran at 99.8/s, `high` drained first (median queue wait 5.6 s against 18.5 s for `normal`), and
+  `notifier_kafka_consumer_lag` showed the remaining `normal` and `low` backlog per topic.
+
 ### Design decisions
 | ADR | Decision |
 |-----|----------|
@@ -118,6 +154,7 @@ curl localhost:8081/stats        # accepted/rejected per channel + rate in the l
 | [0006](docs/adr/0006-rate-limiting-and-priority-scheduling.md) | Redis GCRA per channel/provider, 429 fleet cool-down, capped-aging priority scheduler |
 | [0007](docs/adr/0007-technology-stack.md) | Go 1.26, chi, pgx, goose, franz-go, go-redis, OpenTelemetry, testcontainers |
 | [0008](docs/adr/0008-scalability-and-deployment-topology.md) | Scaling model per component, single PG primary + HA/replica/partitioning, nginx scaling demo |
+| [0009](docs/adr/0009-observability.md) | Prometheus metrics per role, queue depth sampling, `traceparent` stored with the row and carried in Kafka headers, trace ids in logs |
 
 ## Data model
 Schema: [`migrations/`](migrations) (goose, forward-only, embedded in the binary and applied by
@@ -125,7 +162,7 @@ Schema: [`migrations/`](migrations) (goose, forward-only, embedded in the binary
 
 | Table | Purpose |
 |-------|---------|
-| `notifications` | One row per message: content, status, attempts, `next_attempt_at` (drives dispatch, scheduling and retries), lease, provider result. Also the dispatch outbox ([ADR-0003](docs/adr/0003-dispatch-without-separate-outbox.md)) |
+| `notifications` | One row per message: content, status, attempts, `next_attempt_at` (drives dispatch, scheduling and retries), lease, provider result, and the creating request's `correlation_id` and `trace_parent` ([ADR-0009](docs/adr/0009-observability.md)). Also the dispatch outbox ([ADR-0003](docs/adr/0003-dispatch-without-separate-outbox.md)) |
 | `notification_status_history` | Append-only audit trail: one row per transition (from, to, attempt, reason) |
 | `batches` | One row per batch request; status counts are aggregated from its notifications |
 | `idempotency_keys` | `Idempotency-Key` → request hash + created resource, with a TTL ([ADR-0004](docs/adr/0004-idempotency.md)) |
@@ -289,6 +326,9 @@ stop the process with a message listing every problem. Copy [`.env.example`](.en
 | `BREAKER_OPEN_TIMEOUT` | `30s` | worker | How long the breaker stays open before one probe; notifications released while open are retried after it |
 | `SCHEDULER_AGING_RATE` | `2` | worker | Priority points gained per second waited (capped per priority, [ADR-0006](docs/adr/0006-rate-limiting-and-priority-scheduling.md)) |
 | `SCHEDULER_MIN_SHARE` | `10` | worker | Every Nth send goes to `normal`/`low` under a `high` flood (0 disables) |
+| `QUEUE_METRICS_INTERVAL` | `15s` | dispatcher | How often queue depth (PostgreSQL) and consumer lag (Kafka) are sampled for `/metrics` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | _(empty: tracing off)_ | all | Base URL of an OTLP/HTTP collector; spans go to `<url>/v1/traces`. Compose sets `http://jaeger:4318` unless `.env` sets it to empty |
+| `TRACE_SAMPLE_RATIO` | `1` | all | Share of new traces recorded (0–1); spans with a parent follow the parent's decision |
 | `MOCK_ADDR` | `:8081` | mockprovider | Listen address |
 | `MOCK_LATENCY` / `MOCK_LATENCY_JITTER` | `50ms` / `100ms` | mockprovider | Simulated latency: base + uniform `[0, jitter)` |
 | `MOCK_FAILURE_RATE` | `0` | mockprovider | Probability of HTTP 500 |
@@ -315,10 +355,13 @@ and are skipped by `make test-short`:
   delivered exactly once, a 503 is retried, a cancelled row is never sent, the rate holds, and a
   lost record is recovered by the reaper. A 400 fails at once, a provider stuck on 503 exhausts
   the attempts with growing backoff, both reach `notifications.dlq`, and during a provider outage
-  the breaker stops the calls without burning attempts.
+  the breaker stops the calls without burning attempts. One notification retried once is followed
+  through a single trace: two dispatches under the stored request span, each delivery under its
+  dispatch, and the `traceparent` reaching the provider on both calls.
 
 The worker engine (scheduler, watermarks, backpressure, rebalance, shutdown, outcome policy,
-circuit breaker, claim retry during a database outage) is unit-tested with fakes, without Kafka.
+circuit breaker, claim retry during a database outage) is unit-tested with fakes, without Kafka,
+including the metrics it records and the span tree of a delivery.
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs lint, race-enabled tests with
 coverage and a Docker image build on every push to `main` and every pull request. No test calls
 the real webhook.site; the provider is faked with `httptest` or the mock provider.
