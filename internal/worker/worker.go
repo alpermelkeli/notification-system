@@ -321,12 +321,11 @@ func (w *Worker) schedule(ctx context.Context) {
 		go func(r record) {
 			defer w.inFlight.Done()
 			defer func() { <-slots }()
-			// A send is not abandoned on shutdown: it finishes and persists its outcome within the
-			// lease, so the record is not delivered twice.
-			sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.opts.Lease)
-			defer cancel()
-			w.process(sctx, r, done)
-			w.tracker.done(r.part, r.kr.Offset, true)
+			if w.process(ctx, r, done) {
+				w.tracker.done(r.part, r.kr.Offset, true)
+			} else {
+				w.tracker.abandon(r.part)
+			}
 		}(it.rec)
 	}
 }
@@ -391,6 +390,7 @@ func (w *Worker) revoke(ctx context.Context, revoked map[string][]int32) {
 	if len(revoked) == 0 {
 		return
 	}
+	w.tracker.revoking(revoked)
 	dropped := w.drop(revoked)
 	deadline := time.Now().Add(w.opts.RevokeTimeout)
 	for w.tracker.inFlight(revoked) > 0 && time.Now().Before(deadline) && ctx.Err() == nil {

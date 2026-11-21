@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"slices"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/alpermelkeli/notification-system/internal/domain"
@@ -444,14 +446,76 @@ func TestStaleAndUndecodableRecordsAreSkipped(t *testing.T) {
 	}
 }
 
-func TestClaimErrorLeavesRowForTheReaper(t *testing.T) {
+// dbDown is a transient error: the connection to PostgreSQL was refused.
+var dbDown = &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+
+func (f *fakeStore) setClaimErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.claimErr = err
+}
+
+// TestClaimRetriedWhileDatabaseUnavailable: during an outage the record is neither skipped nor
+// committed past; it is delivered once the database is back.
+func TestClaimRetriedWhileDatabaseUnavailable(t *testing.T) {
 	h := newHarness(t, nil, Options{})
-	h.store.claimErr = errors.New("connection refused")
+	h.store.setClaimErr(dbDown)
+	n := h.store.add(domain.PriorityNormal, domain.StatusQueued, 0)
+	h.feed(t, n, 0)
+	time.Sleep(300 * time.Millisecond)
+	if got := h.committedAt(normalTopic, 0); got != -1 {
+		t.Fatalf("committed %d during the outage, want nothing", got)
+	}
+	h.store.setClaimErr(nil)
+	eventually(t, "delivered after recovery", func() bool { return h.committedAt(normalTopic, 0) == 1 })
+	if got := h.store.outcome(n.ID); got != "sent m" {
+		t.Errorf("outcome %q", got)
+	}
+}
+
+// TestNonTransientClaimErrorIsSkipped: a failing statement cannot be fixed by retrying; the record
+// is committed past and the row left for the reaper.
+func TestNonTransientClaimErrorIsSkipped(t *testing.T) {
+	h := newHarness(t, nil, Options{})
+	h.store.setClaimErr(&pgconn.PgError{Code: "42601", Message: "syntax error"})
 	h.feed(t, h.store.add(domain.PriorityNormal, domain.StatusQueued, 0), 0)
-	// The record is committed past; the row stays queued and the offset reaper re-publishes it.
 	eventually(t, "commit", func() bool { return h.committedAt(normalTopic, 0) == 1 })
 	if len(h.sender.sent()) != 0 {
 		t.Error("sent without a claim")
+	}
+}
+
+// TestShutdownDuringOutageKeepsTheRecord: shutting down while the claim waits for the database is
+// prompt and does not commit past the record.
+func TestShutdownDuringOutageKeepsTheRecord(t *testing.T) {
+	h := newHarness(t, nil, Options{})
+	h.store.setClaimErr(dbDown)
+	h.feed(t, h.store.add(domain.PriorityNormal, domain.StatusQueued, 0), 0)
+	time.Sleep(150 * time.Millisecond)
+	start := time.Now()
+	h.stop()
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("shutdown took %v during the outage", took)
+	}
+	if got := h.committedAt(normalTopic, 0); got != -1 {
+		t.Errorf("committed %d, want nothing: the next owner must read the record again", got)
+	}
+}
+
+// TestRevokeDuringOutageDoesNotWait: a revoke gives up claims stuck on the database at once
+// instead of waiting RevokeTimeout, and commits nothing past them.
+func TestRevokeDuringOutageDoesNotWait(t *testing.T) {
+	h := newHarness(t, nil, Options{RevokeTimeout: 5 * time.Second})
+	h.store.setClaimErr(dbDown)
+	h.feed(t, h.store.add(domain.PriorityNormal, domain.StatusQueued, 0), 0)
+	eventually(t, "claim in flight", func() bool { return h.w.tracker.inFlight(map[string][]int32{normalTopic: {0}}) == 1 })
+	start := time.Now()
+	h.w.revoke(context.Background(), map[string][]int32{normalTopic: {0}})
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("revoke took %v", took)
+	}
+	if got := h.committedAt(normalTopic, 0); got != -1 {
+		t.Errorf("committed %d on revoke, want nothing", got)
 	}
 }
 
