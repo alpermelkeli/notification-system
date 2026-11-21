@@ -101,7 +101,7 @@ func newFixture(t *testing.T) *fixture {
 	f := &fixture{hub: NewHub(metrics.NewWebSocket(reg), discard), store: &fakeStore{
 		notifications: map[uuid.UUID]domain.Notification{}, batches: map[uuid.UUID]domain.Batch{},
 	}, reg: reg}
-	f.srv = httptest.NewServer(NewHandler(f.hub, f.store, discard))
+	f.srv = httptest.NewServer(NewHandler(f.hub, f.store, discard, HandlerOptions{AllowedOrigins: []string{"*.allowed.example"}}))
 	t.Cleanup(func() {
 		f.hub.Shutdown()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -404,6 +404,19 @@ func TestCrossOriginBrowsersAreRejected(t *testing.T) {
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
 	}
+}
+
+func TestAllowedOriginsMayConnect(t *testing.T) {
+	f := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(f.srv.URL, "http"), &websocket.DialOptions{
+		HTTPHeader: http.Header{"Origin": []string{"https://app.allowed.example"}},
+	})
+	if err != nil {
+		t.Fatalf("an allowed origin was refused: %v", err)
+	}
+	_ = conn.CloseNow()
 }
 
 func TestClientCloseIsCounted(t *testing.T) {

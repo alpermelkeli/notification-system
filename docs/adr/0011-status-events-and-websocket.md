@@ -107,8 +107,13 @@ response body that follows may echo the recipient; the REST API shows the full e
   - 10 000 connections per instance, beyond which connections are closed with 1013;
   - a ping every 30 s, from its own goroutine, detects dead peers. The reader only reads, so
     pongs are processed even while a request is handled.
-- **Origin:** browsers must connect from the API's own origin, which is the library's default.
-  The demo page at `/ws-demo` is served from it. Non-browser clients send no `Origin` header.
+- **Origin:** browsers connect from the API's own origin, the library's default, which serves the
+  demo page at `/ws-demo`. `WS_ALLOWED_ORIGINS` adds origins as host patterns
+  (`*.example.com`) or with a scheme (`https://app.example.com`), matched against the origin's
+  host and non-default port; `*.example.com` excludes the apex. Patterns that could never match
+  (a path, another scheme) or that allow every site (`*`) stop the process. It is needed when a proxy in
+  front of the API rewrites `Host`, or a web app on another domain connects. Non-browser clients
+  send no `Origin` header and are accepted.
 - **Shutdown:** on shutdown, open sockets are closed with 1001 (going away). Clients reconnect
   through the load balancer to another instance and subscribe again; the snapshot fills the gap.
 - **Hub:** each API instance runs one hub, which routes an event to the subscribers of its
