@@ -26,6 +26,8 @@ x-app: &app
     DATABASE_URL: postgres://notifier:notifier@postgres:5432/notifier?sslmode=disable
     KAFKA_BROKERS: kafka:29092
     REDIS_ADDR: redis:6379
+    # Workers deliver to the local mock provider unless .env points PROVIDER_URL at webhook.site.
+    PROVIDER_URL: ${PROVIDER_URL:-http://mockprovider:8081/}
 
 services:
   # ---------------------------------------------------------------- infrastructure
@@ -141,6 +143,9 @@ services:
   worker:
     <<: *app
     command: ["worker"]
+    # A worker finishes its in-flight sends before exiting; each is bounded by LEASE_DURATION
+    # (30s). A SIGKILL between the provider's accept and the outcome write would send it again.
+    stop_grace_period: 40s
     depends_on:
       migrate: { condition: service_completed_successfully }
       redis: { condition: service_healthy }

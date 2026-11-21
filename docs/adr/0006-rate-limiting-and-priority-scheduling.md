@@ -16,8 +16,9 @@ a send slot becomes available**. Kafka has no native priority (ADR-0002).
   1. In-process limiter (`x/time/rate`) set to 100 / N instances. This breaks whenever N changes
      and requires coordination.
   2. Partition-based quota. Complex and coupled to rebalances.
-  3. **Distributed GCRA in Redis (chosen)** via `go-redis/redis_rate`: one atomic Lua script per
-     check and a single key per channel. It is exact across instances.
+  3. **Distributed GCRA in Redis (chosen)**: one atomic Lua script per check and a single key per
+     channel. It is exact across instances. (Planned with `go-redis/redis_rate`; Phase 5 replaced
+     it with a reserving script, see the amendment.)
 - **Priority**
   1. Strict priority everywhere. Simple, but low priority can starve under sustained load.
   2. Strict high, weighted round-robin normal/low (e.g. 4:1). Prevents starvation, but
@@ -28,10 +29,11 @@ a send slot becomes available**. Kafka has no native priority (ADR-0002).
 
 ## Decision
 **Rate limiting**
-- The key is `ratelimit:{channel}:{provider}`, with a limit of 100/s and a small burst (default 10). This
-  keeps the per-second count at or below the limit in practice. Configurable via env.
+- The key is `ratelimit:{channel}:{provider}`, with a limit of 100/s and a small burst (default 10,
+  changed to 1 in Phase 5, see the amendment). Configurable via env.
 - A worker acquires a token **before** each provider call. When denied, it waits for the
-  `RetryAfter` returned by GCRA. Messages are never dropped or re-queued because of the limiter.
+  `RetryAfter` returned by GCRA (Phase 5: it reserves the next slot and sleeps until it, see the
+  amendment). Messages are never dropped or re-queued because of the limiter.
 - If Redis is unavailable, the worker **fails closed**: it pauses sending and reports not-ready.
   Exceeding the provider limit is worse than a short delay.
 
@@ -104,6 +106,45 @@ Kafka batch fetch → route by topic → priority heaps → aging scheduler → 
   provider latency: 100 msg/s × ~200 ms ≈ 20 in flight. When a send completes, its offset is
   marked in the partition watermark tracker (ADR-0002).
 - All weights, caps, the aging rate and the minimum share are configurable via env.
+
+**Amendment (2026-11-21, Phase 5): a reserving GCRA replaces `redis_rate`, and the burst default is 1.**
+
+*Measurements.* A compose burst (1000 `low` SMS, then 100 `high`) against the mock provider
+showed:
+- With `redis_rate` and burst 10, one second at the provider held 106 sends. GCRA grants the burst
+  at once after an idle period, so a wall-clock second can hold `rate + burst - 1` sends. That
+  breaks "max 100 msg/s".
+- With `redis_rate` and burst 1, the peak was 91/s with one worker, and 1000 SMS took 14.8 s with
+  three workers (about 68/s). `redis_rate` answers "allowed, or retry after X". A rejected request
+  leaves its slot to whoever asks first, and the retry latency (timer plus Redis round trip) is
+  lost. The more replicas contend, the more slots go unused.
+
+*Decision.* `internal/ratelimit` runs its own small Lua script: a **reserving** GCRA. Each call
+atomically takes the next free slot of the channel (slots are `1/rate` apart, plus
+`(burst-1)/rate` of tolerance) and returns how long to sleep until it. A reservation is never
+lost to contention, so the schedule advances by exactly `1/rate` per send, whatever the number of
+workers. The same script checks the cool-down key first, so each token costs one round trip. Slots
+are reserved at most 1 s ahead. Beyond that the caller waits without reserving and asks again, so
+a waiter that is cancelled holds no distant slot. The burst default is **1**
+(`RATE_LIMIT_BURST`).
+
+*Result* (same test; rate measured on arrival at the provider): 1100 SMS in 11.1 s with one
+worker and 11.4 s with three (the floor at 100/s is 11.0 s). The peak was 100/s in both runs, and
+the 100 `high` were done within 1.4 s of submission despite the `low` backlog.
+
+*Other implementation notes.*
+- Keys are `{ratelimit:{channel}:{provider}}` and `...:cooldown`. The braces are a Redis Cluster
+  hash tag, so one script can use both keys. `{provider}` is the host of `PROVIDER_URL`.
+- The cool-down is set with `SET NX PX` plus `PEXPIRE ... GT`, so a shorter `Retry-After` never
+  shortens a cool-down already in place.
+- The token is granted before the claim. If the claim took longer than 50 ms (e.g. it waited for
+  the dispatcher's commit), the worker takes a fresh token before sending. Otherwise sends whose
+  claims finished together would reach the provider in a burst of up to `WORKER_CONCURRENCY` per
+  replica above the rate. If no fresh token can be had (Redis down), the claim is released
+  without consuming the attempt.
+- A token can go unused: when a pick finds nothing after the wait (the partition was revoked
+  meanwhile), and when a record is skipped as stale. Both are rare and cost only throughput,
+  never the limit.
 
 ## Consequences
 - ✅ 100 msg/s per channel holds regardless of the number of worker replicas.

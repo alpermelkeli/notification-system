@@ -91,6 +91,24 @@ reaper interval plus the grace period, not after an arbitrary age. The cost is t
 admin request per channel per reaper run (a handful of partitions), and the reaper needs access
 to the Kafka admin API.
 
+**Amendment (2026-11-21, Phase 5): implementation notes.**
+- Committed offsets are read with franz-go's admin client (`kadm.FetchOffsets` on
+  `workers.{channel}`), from the same client the dispatcher produces with.
+- Every dispatcher replica runs the reaper, **without an advisory lock**. Each step is one
+  statement that locks its rows with `FOR UPDATE SKIP LOCKED`, so two reapers never change the
+  same row, and the offset reads are idempotent. A lock would only save a few small requests per
+  30 s, at the cost of a dedicated connection. Partition maintenance, by contrast, needs its lock
+  for correctness (ADR-0008).
+- The dispatch race described above is closed in the database instead of with claim retries:
+  every guarded transition first locks the row by its key and checks the status on the locked
+  version. The dispatcher holds the row lock from before publishing until it commits `queued`, so
+  a worker that receives the record early waits for that commit and then claims normally. (With
+  the status in the locking query's `WHERE`, PostgreSQL rejected the still-`pending` row from the
+  statement snapshot without waiting; a compose burst test lost 1 of 100 records this way, and the
+  reaper recovered it.)
+- Each reaper step changes at most 1000 rows per statement and 10 statements per run; the next run
+  continues after a mass failure.
+
 ## Consequences
 - ✅ No dual write: the row *is* the publish intent, so it cannot be lost.
 - ✅ One mechanism handles new, scheduled and retrying notifications.

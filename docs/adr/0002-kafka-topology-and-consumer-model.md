@@ -82,6 +82,13 @@ event stream for status consumers (B-4). Kafka has no per-message priority.
 - **Event consumers** (e.g. the WebSocket hub in each API instance) use a unique group per
   instance starting at `latest`, so every instance sees every event.
 
+**Amendment (2026-11-21, Phase 5): fetch settings for pause/resume.** Polls are bounded to the
+high-water mark (`PollRecords`), and the long-poll wait is 200 ms instead of franz-go's 5 s default
+(`FetchMaxWait`). franz-go fetches a resumed topic only after the fetch in flight returns. With
+the default wait, backpressure that pauses and resumes topics continuously stalled delivery for
+5 s per resume: a compose burst ran at ~50 sends every 5 s instead of 100/s. With 200 ms, 1100 SMS
+took 11.2–11.4 s with two or three workers (the floor is 11.0 s).
+
 ## Consequences
 - ✅ A channel can be paused (circuit open) without touching other channels.
 - ✅ Throughput per channel/priority can be tuned with the partition count.

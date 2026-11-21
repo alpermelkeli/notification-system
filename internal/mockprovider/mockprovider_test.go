@@ -104,6 +104,7 @@ func TestStats(t *testing.T) {
 	post(t, h, validBody, "")
 	s.cfg.FailureRate = 1
 	post(t, h, validBody, "")
+	now = now.Add(time.Second)
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
@@ -114,8 +115,9 @@ func TestStats(t *testing.T) {
 	if st.Accepted["sms"] != 4 || st.Rejected["sms"] != 1 {
 		t.Errorf("totals = %+v", st)
 	}
-	if st.RateLastSecond["sms"] != 3 {
-		t.Errorf("rate_last_second = %d, want 3", st.RateLastSecond["sms"])
+	// Both requests of the previous second count, the rejected one included.
+	if st.RateLastSecond["sms"] != 2 {
+		t.Errorf("rate_last_second = %d, want 2", st.RateLastSecond["sms"])
 	}
 }
 

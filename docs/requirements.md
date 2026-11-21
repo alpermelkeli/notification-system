@@ -24,11 +24,11 @@ teams and API consumers.
 ### FR-2 Processing Engine
 | ID | Requirement | Status | Where |
 |----|-------------|--------|-------|
-| FR-2.1 | Async processing via queue workers | [ ] | |
-| FR-2.2 | Rate limit: max **100 msg/s per channel** | [ ] | |
-| FR-2.3 | Priority queues: high / normal / low | [ ] | |
+| FR-2.1 | Async processing via queue workers | [x] | `internal/dispatcher` (relay, reaper), `internal/worker`, `internal/integration` |
+| FR-2.2 | Rate limit: max **100 msg/s per channel** | [x] | `internal/ratelimit` (reserving GCRA in Redis, shared by all workers), measured in compose |
+| FR-2.3 | Priority queues: high / normal / low | [x] | 9 channel × priority topics, `internal/worker/scheduler.go` (capped aging + minimum share) |
 | FR-2.4 | Content validation (char limits, required fields) | [x] | `internal/domain/validate.go` (per-channel rules), `internal/api/request.go` |
-| FR-2.5 | Idempotency — no duplicate sends | [~] | `Idempotency-Key` in `internal/api`, `internal/storage/idempotency.go`, fenced `Claim` (provider header in Phase 5) |
+| FR-2.5 | Idempotency — no duplicate sends | [x] | `Idempotency-Key` in `internal/api`, `internal/storage/idempotency.go`, guarded + fenced `Claim`, provider `Idempotency-Key` header (`internal/provider`) |
 
 ### FR-3 Delivery & Retry Logic
 Left open by the brief ("thinking and design by candidate"). Our design must be documented in an ADR.
@@ -43,7 +43,7 @@ Left open by the brief ("thinking and design by candidate"). Our design must be 
 | ID | Requirement | Status | Where |
 |----|-------------|--------|-------|
 | FR-4.1 | Real-time metrics endpoint: queue depth, success/failure rates, latency | [ ] | |
-| FR-4.2 | Structured logging with correlation IDs | [~] | `internal/logging`, `internal/httpx/middleware.go` (HTTP; Kafka propagation in Phase 5) |
+| FR-4.2 | Structured logging with correlation IDs | [~] | `internal/logging`, `internal/httpx/middleware.go`, Kafka `correlation_id` header → worker logs and provider `X-Correlation-ID` (metrics/tracing in Phase 7) |
 | FR-4.3 | Health check endpoint | [x] | `internal/health`, `/healthz` + `/readyz` on every role |
 
 ## External provider (webhook.site)

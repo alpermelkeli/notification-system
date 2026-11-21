@@ -7,10 +7,14 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/alpermelkeli/notification-system/internal/domain"
 )
 
 // Config is the configuration shared by every role of the notifier binary.
@@ -51,6 +55,51 @@ type Config struct {
 	MaxScheduleAhead time.Duration
 	// RequestTimeout bounds each public API request.
 	RequestTimeout time.Duration
+
+	// Dispatcher configures the relay and reaper (role: dispatcher).
+	Dispatcher Dispatcher
+	// Worker configures delivery (role: worker).
+	Worker Worker
+}
+
+// Dispatcher configures the dispatcher role (ADR-0003).
+type Dispatcher struct {
+	// BatchSize is the number of due rows published per transaction.
+	BatchSize int
+	// PollInterval is the fallback poll period for scheduled and retrying rows.
+	PollInterval time.Duration
+	// ReaperInterval is how often expired leases and lost queued rows are recovered.
+	ReaperInterval time.Duration
+	// ReaperGrace is how long a queued row behind the committed offset is left alone.
+	ReaperGrace time.Duration
+	// ReaperStuckAfter is the age fallback for queued rows.
+	ReaperStuckAfter time.Duration
+}
+
+// Worker configures the worker role (ADR-0002, ADR-0005, ADR-0006).
+type Worker struct {
+	// Channels are the channels this process delivers; each gets its own consumer group member.
+	Channels []domain.Channel
+	// Concurrency is the number of sends in flight per channel.
+	Concurrency int
+	// ProviderURL is the delivery provider endpoint (webhook.site or the mock provider).
+	ProviderURL string
+	// ProviderTimeout bounds each provider request.
+	ProviderTimeout time.Duration
+	// Lease is how long a claim lasts; it must cover the provider timeout.
+	Lease time.Duration
+	// RateLimits is the per-channel send rate per second, shared by all workers.
+	RateLimits map[domain.Channel]int
+	// RateLimitBurst is the burst allowance of each channel's bucket.
+	RateLimitBurst int
+	// RetryDelay is the delay before a failed attempt is retried.
+	RetryDelay time.Duration
+	// MaxAttempts is the attempt budget of a notification.
+	MaxAttempts int
+	// AgingRate is the scheduler's aging rate in points per second waited.
+	AgingRate float64
+	// MinShareEvery reserves one pick in this many for non-high traffic (0 disables).
+	MinShareEvery int
 }
 
 // Load reads the configuration from the process environment.
@@ -89,6 +138,38 @@ func load(lookup lookupFunc) (Config, error) {
 		MaintenanceInterval:  p.duration("MAINTENANCE_INTERVAL", time.Hour),
 		MaxScheduleAhead:     p.duration("MAX_SCHEDULE_AHEAD", 7*24*time.Hour),
 		RequestTimeout:       p.duration("REQUEST_TIMEOUT", 10*time.Second),
+
+		Dispatcher: Dispatcher{
+			BatchSize:        p.integer("DISPATCH_BATCH_SIZE", 500, 1, 10_000),
+			PollInterval:     p.duration("DISPATCH_POLL_INTERVAL", 500*time.Millisecond),
+			ReaperInterval:   p.duration("REAPER_INTERVAL", 30*time.Second),
+			ReaperGrace:      p.duration("REAPER_GRACE", time.Minute),
+			ReaperStuckAfter: p.duration("REAPER_STUCK_AFTER", 24*time.Hour),
+		},
+		Worker: Worker{
+			Channels:        p.channels("WORKER_CHANNELS"),
+			Concurrency:     p.integer("WORKER_CONCURRENCY", 20, 1, 1000),
+			ProviderURL:     p.url("PROVIDER_URL", "http://localhost:8081/"),
+			ProviderTimeout: p.duration("PROVIDER_TIMEOUT", 10*time.Second),
+			Lease:           p.duration("LEASE_DURATION", 30*time.Second),
+			RateLimits: map[domain.Channel]int{
+				domain.ChannelSMS:   p.integer("RATE_LIMIT_SMS", 100, 1, 100_000),
+				domain.ChannelEmail: p.integer("RATE_LIMIT_EMAIL", 100, 1, 100_000),
+				domain.ChannelPush:  p.integer("RATE_LIMIT_PUSH", 100, 1, 100_000),
+			},
+			RateLimitBurst: p.integer("RATE_LIMIT_BURST", 1, 1, 10_000),
+			RetryDelay:     p.duration("RETRY_DELAY", 5*time.Second),
+			MaxAttempts:    p.integer("MAX_ATTEMPTS", 5, 1, 100),
+			AgingRate:      p.float("SCHEDULER_AGING_RATE", 2, 0, 1000),
+			MinShareEvery:  p.integer("SCHEDULER_MIN_SHARE", 10, 0, 1000),
+		},
+	}
+
+	// A claim must outlive the provider call and the outcome write, or a slow but successful
+	// send is reaped and delivered twice.
+	if cfg.Worker.Lease < cfg.Worker.ProviderTimeout+5*time.Second {
+		p.errs = append(p.errs, fmt.Errorf("LEASE_DURATION (%v) must be at least PROVIDER_TIMEOUT (%v) + 5s",
+			cfg.Worker.Lease, cfg.Worker.ProviderTimeout))
 	}
 
 	// A live idempotency key must never point at a notification whose partition was dropped.
@@ -167,6 +248,49 @@ func (p *parser) integer(key string, def, minV, maxV int) int {
 		return def
 	}
 	return n
+}
+
+func (p *parser) float(key string, def, minV, maxV float64) float64 {
+	v, ok := p.raw(key)
+	if !ok {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f < minV || f > maxV {
+		p.errs = append(p.errs, fmt.Errorf("%s: %q is not a number in [%g, %g]", key, v, minV, maxV))
+		return def
+	}
+	return f
+}
+
+func (p *parser) url(key, def string) string {
+	v := p.str(key, def)
+	u, err := url.Parse(v)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		p.errs = append(p.errs, fmt.Errorf("%s: %q is not an absolute http(s) URL", key, v))
+		return def
+	}
+	return v
+}
+
+// channels parses a channel list; the default is every channel.
+func (p *parser) channels(key string) []domain.Channel {
+	names := p.list(key, nil)
+	if names == nil {
+		return slices.Clone(domain.Channels)
+	}
+	var out []domain.Channel
+	for _, n := range names {
+		c, err := domain.ParseChannel(strings.ToLower(n))
+		if err != nil {
+			p.errs = append(p.errs, fmt.Errorf("%s: %w", key, err))
+			continue
+		}
+		if !slices.Contains(out, c) {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 func (p *parser) list(key string, def []string) []string {

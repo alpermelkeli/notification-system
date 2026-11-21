@@ -51,7 +51,10 @@ type Stats struct {
 	Accepted map[string]int64 `json:"accepted"`
 	// Rejected counts simulated 429/500 responses per channel since start.
 	Rejected map[string]int64 `json:"rejected"`
-	// RateLastSecond is the number of accepted requests per channel in the last full second.
+	// RateLastSecond is the number of requests received per channel in the last full second,
+	// counted on arrival (before the simulated latency) and whatever the outcome, which is what a
+	// provider's own rate limit counts. Counting at response time would shift each request by its
+	// random latency and show bunching that the sender never produced.
 	// In the scaling demo it stays at or below the 100 msg/s limit whatever the worker count.
 	RateLastSecond map[string]int64 `json:"rate_last_second"`
 }
@@ -118,6 +121,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.arrive(req.Channel)
 	if !s.sleep(r) {
 		return // client gave up
 	}
@@ -182,6 +186,18 @@ func (s *Server) acceptedID(key string) string {
 	return id
 }
 
+// arrive counts a request in its channel's per-second window.
+func (s *Server) arrive(channel string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c, ok := s.window[channel]
+	if !ok {
+		c = &secondCounter{}
+		s.window[channel] = c
+	}
+	c.add(s.now().Unix())
+}
+
 func (s *Server) record(channel, result string, accepted bool) {
 	s.requests.WithLabelValues(channel, result).Inc()
 	s.mu.Lock()
@@ -191,12 +207,6 @@ func (s *Server) record(channel, result string, accepted bool) {
 		return
 	}
 	s.accepted[channel]++
-	c, ok := s.window[channel]
-	if !ok {
-		c = &secondCounter{}
-		s.window[channel] = c
-	}
-	c.add(s.now().Unix())
 }
 
 func (s *Server) handleStats(w http.ResponseWriter, _ *http.Request) {

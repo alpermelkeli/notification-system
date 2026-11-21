@@ -11,9 +11,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/testcontainers/testcontainers-go"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
+	"github.com/alpermelkeli/notification-system/internal/testinfra"
 	"github.com/alpermelkeli/notification-system/migrations"
 )
 
@@ -31,33 +30,12 @@ func TestMain(m *testing.M) {
 
 func runWithPostgres(m *testing.M) int {
 	ctx := context.Background()
-	ctr, err := tcpostgres.Run(ctx, "postgres:17-alpine",
-		tcpostgres.WithDatabase("notifier"),
-		tcpostgres.WithUsername("notifier"),
-		tcpostgres.WithPassword("notifier"),
-		tcpostgres.BasicWaitStrategies(),
-	)
-	defer func() {
-		if err := testcontainers.TerminateContainer(ctr); err != nil {
-			fmt.Fprintln(os.Stderr, "terminate postgres container:", err)
-		}
-	}()
+	pool, stop, err := testinfra.Postgres(ctx)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "start postgres container (integration tests need Docker; use -short to skip):", err)
+		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	dsn, err := ctr.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "connection string:", err)
-		return 1
-	}
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "connect:", err)
-		return 1
-	}
-	defer pool.Close()
-
+	defer stop()
 	if err := Migrate(ctx, pool, migrations.FS, slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
 		fmt.Fprintln(os.Stderr, "migrate:", err)
 		return 1

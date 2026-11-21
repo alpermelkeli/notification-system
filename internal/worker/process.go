@@ -1,0 +1,132 @@
+package worker
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"time"
+
+	"github.com/alpermelkeli/notification-system/internal/domain"
+	"github.com/alpermelkeli/notification-system/internal/provider"
+	"github.com/alpermelkeli/notification-system/internal/ratelimit"
+)
+
+// staleToken is how old a token may be when the claim finishes; older tokens are replaced.
+const staleToken = 50 * time.Millisecond
+
+// persistRetries bounds retries of an outcome write that failed because PostgreSQL was
+// unavailable. If all fail, the lease expires and the reaper retries the notification.
+var persistRetries = []time.Duration{200 * time.Millisecond, time.Second, 2 * time.Second}
+
+// process delivers one record: guarded claim, provider call, outcome.
+func (w *Worker) process(ctx context.Context, r record) {
+	ctx = withCorrelation(ctx, r)
+	log := w.logger.With("notification_id", r.msg.ID.String(), "priority", string(r.msg.Priority))
+
+	n, err := w.claim(ctx, r)
+	if errors.Is(err, errStale) {
+		log.DebugContext(ctx, "skipping stale work record", "err", err)
+		return
+	}
+	if err != nil {
+		// The row stays queued; if this record is committed past, the reaper re-publishes it.
+		log.ErrorContext(ctx, "claim failed", "err", err)
+		return
+	}
+	lease, _ := n.Lease()
+	log = log.With("attempt", n.Attempts)
+
+	// The token was granted before the claim. If the claim was slow (e.g. it waited for the
+	// dispatcher's commit), sends whose claims finished together would reach the provider in a
+	// burst above the rate, so take a fresh token (ADR-0006).
+	if time.Since(r.tokenAt) > staleToken {
+		if err := w.limiter.Wait(ctx, w.channel); err != nil {
+			// No token, no send. Hand the attempt back; it is retried without consuming it.
+			log.WarnContext(ctx, "no rate-limit token after claim; releasing", "err", err)
+			if err := w.persist(ctx, func() error {
+				_, err := w.store.Release(ctx, lease, w.opts.RetryDelay, "rate limiter unavailable")
+				return err
+			}); err != nil {
+				log.ErrorContext(ctx, "release not persisted; the lease will expire and be retried", "err", err)
+			}
+			return
+		}
+	}
+
+	res, sendErr := w.sender.Send(ctx, provider.Message{
+		IdempotencyKey: n.ID.String(),
+		CorrelationID:  n.CorrelationID,
+		To:             n.Recipient,
+		Channel:        n.Channel,
+		Content:        n.Content,
+	})
+
+	var outcome func() error
+	switch {
+	case sendErr == nil:
+		outcome = func() error { _, err := w.store.MarkSent(ctx, lease, res.MessageID); return err }
+		log.DebugContext(ctx, "delivered", "provider_message_id", res.MessageID)
+	case n.Attempts >= w.opts.MaxAttempts:
+		outcome = func() error { _, err := w.store.MarkFailed(ctx, lease, sendErr.Error()); return err }
+		log.ErrorContext(ctx, "delivery failed; attempts exhausted", "err", sendErr)
+	default:
+		delay := w.retryDelay(ctx, sendErr)
+		outcome = func() error { _, err := w.store.MarkRetrying(ctx, lease, delay, sendErr.Error()); return err }
+		log.WarnContext(ctx, "delivery failed; will retry", "err", sendErr, "retry_in", delay)
+	}
+	if err := w.persist(ctx, outcome); err != nil {
+		if errors.Is(err, domain.ErrLeaseLost) {
+			// The lease expired and the row was reaped; the newer claim owns the outcome.
+			log.WarnContext(ctx, "outcome discarded: lease lost", "err", err)
+			return
+		}
+		log.ErrorContext(ctx, "outcome not persisted; the lease will expire and be retried", "err", err)
+	}
+}
+
+// retryDelay returns the delay before the next attempt. A 429 also pauses the whole fleet for the
+// provider's Retry-After (ADR-0006). Phase 6 replaces the fixed delay with exponential backoff and
+// classifies permanent failures (ADR-0005).
+func (w *Worker) retryDelay(ctx context.Context, sendErr error) time.Duration {
+	delay := w.opts.RetryDelay
+	var pe *provider.Error
+	if errors.As(sendErr, &pe) && pe.StatusCode == http.StatusTooManyRequests {
+		cool := min(pe.RetryAfter, ratelimit.MaxCooldown) // a bogus Retry-After must not park the row for days
+		if cool <= 0 {
+			cool = time.Second
+		}
+		if err := w.limiter.Cooldown(ctx, w.channel, cool); err != nil {
+			w.logger.WarnContext(ctx, "could not set the rate-limit cool-down", "err", err)
+		}
+		delay = max(delay, cool)
+	}
+	return delay
+}
+
+// claim claims the record's notification. If the dispatcher has not committed the row as queued
+// yet, the claim waits on its row lock (storage.apply), so an early record is not skipped. It
+// returns errStale when the record must be skipped.
+func (w *Worker) claim(ctx context.Context, r record) (domain.Notification, error) {
+	n, err := w.store.Claim(ctx, r.msg.ID, r.msg.CreatedAt, w.opts.Lease)
+	var te *domain.TransitionError
+	if errors.As(err, &te) || errors.Is(err, domain.ErrNotFound) {
+		// Cancelled, already claimed or finished, or a duplicate publish (ADR-0004).
+		return domain.Notification{}, errors.Join(errStale, err)
+	}
+	return n, err
+}
+
+// persist runs an outcome write, retrying while PostgreSQL is unavailable. Guard failures
+// (lease lost, invalid transition) are final.
+func (w *Worker) persist(ctx context.Context, write func() error) error {
+	err := write()
+	for _, d := range persistRetries {
+		if err == nil || errors.Is(err, domain.ErrLeaseLost) || errors.Is(err, domain.ErrInvalidTransition) ||
+			ctx.Err() != nil {
+			return err
+		}
+		sleep(ctx, d)
+		err = write()
+	}
+	return err
+}
