@@ -46,7 +46,9 @@ COMMIT;            -- on publish failure: ROLLBACK, back off, retry
   - `processing` rows whose `lease_until` has expired go to `retrying`. This covers workers
     that crashed mid-send.
   - `queued` rows older than the stuck threshold (default 10 min) go back to `pending` to be
-    re-published. This covers records skipped by an offset commit after a consumer crash.
+    re-published. This is a last-resort safety net for records that never reach a worker (e.g.
+    topic data loss or an operational mistake). Normal crash recovery is handled by watermark
+    offset commits (ADR-0002).
 - **Status events** (`notification.events`) are published **best-effort after commit** by the
   component that changed the state. PostgreSQL remains the truth. Losing an event only delays a
   WebSocket update, and clients can always query the API.

@@ -59,8 +59,8 @@ around our own capacity:
 
 **Separation of concerns**
 ```
-Kafka consumers → priority buffers → aging scheduler → Redis limiter → provider → DB outcome → commit offset
-   (distribute)                        (prioritise)      (rate limit)
+Kafka batch fetch → route by topic → priority heaps → aging scheduler → Redis limiter → provider → DB outcome → watermark commit
+   (distribute)                     (bounded, pause)   (prioritise)     (rate limit)
 ```
 - Kafka distributes work. Partition counts (6/6/3) size **throughput and parallelism only**;
   they are not a priority mechanism.
@@ -68,9 +68,12 @@ Kafka consumers → priority buffers → aging scheduler → Redis limiter → p
   enforced. The dispatcher publishes due rows in FIFO order (ADR-0003).
 
 **Priority scheduling: capped aging (per channel, inside each worker)**
-- One fetch loop per priority topic feeds a bounded FIFO buffer (default 50 records). When a
-  buffer is full, fetching from that topic pauses, which applies backpressure into Kafka.
-  Because each buffer is FIFO, its head is always its oldest record.
+- Fetched batches are routed by topic into one buffer per priority (high-water mark 50
+  records, low-water mark 25). When a buffer is full, fetching from that topic pauses, which
+  applies backpressure into Kafka (ADR-0002).
+- **Each buffer is a min-heap ordered by `due_at`**, not a plain FIFO queue. Records from
+  several partitions arrive interleaved, so arrival order is not age order. The heap makes the
+  head the truly oldest record. At ~50 elements, push and pop are negligible (O(log n)).
 - The scheduler **first waits for a rate-limit token, then picks**. A pick made before waiting
   for a token could hold a low-priority record while a high-priority one arrives.
 - The pick compares the **effective priority** of the three buffer heads:
@@ -98,7 +101,8 @@ Kafka consumers → priority buffers → aging scheduler → Redis limiter → p
   handled by the retry mechanism itself (out-of-band backoff with jitter, circuit breaker, fleet
   cool-down on `429`; ADR-0005), not by the scheduler.
 - Picked records go to a bounded sender pool (default 20 goroutines per channel), sized for
-  provider latency: 100 msg/s × ~200 ms ≈ 20 in flight.
+  provider latency: 100 msg/s × ~200 ms ≈ 20 in flight. When a send completes, its offset is
+  marked in the partition watermark tracker (ADR-0002).
 - All weights, caps, the aging rate and the minimum share are configurable via env.
 
 ## Consequences
