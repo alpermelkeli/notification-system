@@ -18,8 +18,8 @@ import (
 // ReaperStore is the persistence the reaper needs. *storage.Store implements it.
 type ReaperStore interface {
 	ReapExpiredLeases(ctx context.Context, maxAttempts, limit int) (storage.ReapResult, error)
-	RequeueConsumed(ctx context.Context, committed []storage.CommittedOffset, grace time.Duration, limit int) (int, error)
-	RequeueStuck(ctx context.Context, olderThan time.Duration, limit int) (int, error)
+	RequeueConsumed(ctx context.Context, committed []storage.CommittedOffset, grace time.Duration, limit int) ([]domain.Notification, error)
+	RequeueStuck(ctx context.Context, olderThan time.Duration, limit int) ([]domain.Notification, error)
 }
 
 // DeadLetterPublisher publishes the dead letters of notifications that moved to failed.
@@ -149,10 +149,10 @@ func (r *Reaper) RunOnce(ctx context.Context) (ReapReport, error) {
 	)
 	_, err := r.drain(ctx, func() (int, error) {
 		res, err := r.store.ReapExpiredLeases(ctx, r.opts.MaxAttempts, r.opts.Limit)
-		rep.ExpiredLeases += res.Retried
+		rep.ExpiredLeases += len(res.Retried)
 		rep.ExhaustedLeases += len(res.Failed)
 		r.deadLetter(ctx, res.Failed)
-		return res.Retried + len(res.Failed), err
+		return len(res.Retried) + len(res.Failed), err
 	})
 	errs = append(errs, err)
 
@@ -160,13 +160,17 @@ func (r *Reaper) RunOnce(ctx context.Context) (ReapReport, error) {
 	errs = append(errs, err)
 	if len(committed) > 0 {
 		n, err := r.drain(ctx, func() (int, error) {
-			return r.store.RequeueConsumed(ctx, committed, r.opts.Grace, r.opts.Limit)
+			ns, err := r.store.RequeueConsumed(ctx, committed, r.opts.Grace, r.opts.Limit)
+			return len(ns), err
 		})
 		rep.Consumed = n
 		errs = append(errs, err)
 	}
 
-	n, err := r.drain(ctx, func() (int, error) { return r.store.RequeueStuck(ctx, r.opts.StuckAfter, r.opts.Limit) })
+	n, err := r.drain(ctx, func() (int, error) {
+		ns, err := r.store.RequeueStuck(ctx, r.opts.StuckAfter, r.opts.Limit)
+		return len(ns), err
+	})
 	rep.Stuck = n
 	errs = append(errs, err)
 

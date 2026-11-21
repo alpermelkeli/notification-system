@@ -5,13 +5,14 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/alpermelkeli/notification-system/internal/domain"
 	"github.com/alpermelkeli/notification-system/internal/metrics"
 	"github.com/alpermelkeli/notification-system/internal/storage"
 )
 
 // RelayStore is the persistence the relay needs. *storage.Store implements it.
 type RelayStore interface {
-	DispatchDue(ctx context.Context, limit int, publish storage.PublishFunc) (int, error)
+	DispatchDue(ctx context.Context, limit int, publish storage.PublishFunc) ([]domain.Notification, error)
 	ListenDue(ctx context.Context, notify func()) error
 }
 
@@ -55,7 +56,8 @@ func (r *Relay) Run(ctx context.Context) {
 
 	backoff := newBackoff(100*time.Millisecond, 5*time.Second)
 	for {
-		n, err := r.store.DispatchDue(ctx, r.opts.BatchSize, r.publish)
+		queued, err := r.store.DispatchDue(ctx, r.opts.BatchSize, r.publish)
+		n := len(queued)
 		if ctx.Err() != nil {
 			return
 		}

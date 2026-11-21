@@ -164,14 +164,19 @@ func TestDispatchOrderAndLimit(t *testing.T) {
 		time.Sleep(2 * time.Millisecond) // distinct next_attempt_at
 	}
 	var got []string
-	n, err := s.DispatchDue(ctx, 3, func(_ context.Context, ns []domain.Notification) ([]KafkaPosition, error) {
+	queued, err := s.DispatchDue(ctx, 3, func(_ context.Context, ns []domain.Notification) ([]KafkaPosition, error) {
 		for _, x := range ns {
 			got = append(got, x.ID.String())
 		}
 		return positions(ns), nil
 	})
-	if err != nil || n != 3 {
-		t.Fatalf("n=%d err=%v", n, err)
+	if err != nil || len(queued) != 3 {
+		t.Fatalf("queued %d, err=%v", len(queued), err)
+	}
+	for _, q := range queued {
+		if q.Status != domain.StatusQueued || q.QueuedAt == nil || !q.UpdatedAt.Equal(*q.QueuedAt) {
+			t.Errorf("returned row is not queued: %+v", q)
+		}
 	}
 	for i := range got {
 		if got[i] != ids[i] {
@@ -201,7 +206,7 @@ func TestConcurrentDispatchersNeverPublishTheSameRow(t *testing.T) {
 	for range 4 {
 		wg.Go(func() {
 			for {
-				n, err := s.DispatchDue(context.Background(), 50, func(_ context.Context, ns []domain.Notification) ([]KafkaPosition, error) {
+				queued, err := s.DispatchDue(context.Background(), 50, func(_ context.Context, ns []domain.Notification) ([]KafkaPosition, error) {
 					mu.Lock()
 					defer mu.Unlock()
 					for _, x := range ns {
@@ -214,10 +219,10 @@ func TestConcurrentDispatchersNeverPublishTheSameRow(t *testing.T) {
 					t.Errorf("dispatch: %v", err)
 					return
 				}
-				if n == 0 {
+				if len(queued) == 0 {
 					return
 				}
-				total.Add(int64(n))
+				total.Add(int64(len(queued)))
 			}
 		})
 	}
@@ -338,8 +343,11 @@ func TestReapExpiredLeases(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 
 	res, err := s.ReapExpiredLeases(ctx, 5, 100)
-	if err != nil || res.Retried != 1 || len(res.Failed) != 0 {
+	if err != nil || len(res.Retried) != 1 || len(res.Failed) != 0 {
 		t.Fatalf("reaped %+v, err %v; want 1 retried", res, err)
+	}
+	if r := res.Retried[0]; r.ID != expired.ID || r.Status != domain.StatusRetrying {
+		t.Errorf("retried row = %+v", r)
 	}
 	got, _ := s.GetNotification(ctx, expired.ID)
 	if got.Status != domain.StatusRetrying || got.Attempts != 1 || got.LeaseUntil != nil {
@@ -369,7 +377,7 @@ func TestReapExpiredLeaseOnTheLastAttemptFails(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 
 	res, err := s.ReapExpiredLeases(ctx, 3, 100)
-	if err != nil || res.Retried != 0 || len(res.Failed) != 1 {
+	if err != nil || len(res.Retried) != 0 || len(res.Failed) != 1 {
 		t.Fatalf("reaped %+v, err %v; want 1 failed", res, err)
 	}
 	failed := res.Failed[0]
@@ -401,7 +409,7 @@ func TestStaleLeaseCannotOverwriteANewerClaim(t *testing.T) {
 	dispatchAll(t, s)
 	leaseA := claim(t, s, n, time.Millisecond)
 	time.Sleep(20 * time.Millisecond)
-	if res, err := s.ReapExpiredLeases(ctx, 5, 10); err != nil || res.Retried != 1 {
+	if res, err := s.ReapExpiredLeases(ctx, 5, 10); err != nil || len(res.Retried) != 1 {
 		t.Fatalf("reap: %+v, %v", res, err)
 	}
 	dispatchAll(t, s)
@@ -509,9 +517,9 @@ func TestRequeueConsumed(t *testing.T) {
 		{Channel: domain.ChannelSMS, Priority: domain.PriorityHigh, Partition: 1, Offset: 0},
 		{Channel: domain.ChannelEmail, Priority: domain.PriorityNormal, Partition: 2, Offset: 99},
 	}
-	n, err := s.RequeueConsumed(ctx, committed, time.Minute, 100)
-	if err != nil || n != 1 {
-		t.Fatalf("requeued %d, err %v; want 1", n, err)
+	requeued, err := s.RequeueConsumed(ctx, committed, time.Minute, 100)
+	if err != nil || len(requeued) != 1 || requeued[0].ID != lost.ID || requeued[0].Status != domain.StatusPending {
+		t.Fatalf("requeued %+v, err %v; want the lost row", requeued, err)
 	}
 	got, _ := s.GetNotification(ctx, lost.ID)
 	if got.Status != domain.StatusPending || got.QueuedAt != nil {
@@ -536,8 +544,8 @@ func TestRequeueConsumed(t *testing.T) {
 	if again := dispatchAll(t, s); len(again) != 1 || again[0].ID != lost.ID {
 		t.Fatalf("re-dispatched %d rows", len(again))
 	}
-	if n, err := s.RequeueConsumed(ctx, nil, 0, 100); err != nil || n != 0 {
-		t.Errorf("no committed offsets: %d, %v", n, err)
+	if ns, err := s.RequeueConsumed(ctx, nil, 0, 100); err != nil || len(ns) != 0 {
+		t.Errorf("no committed offsets: %d, %v", len(ns), err)
 	}
 }
 
@@ -549,9 +557,9 @@ func TestRequeueStuck(t *testing.T) {
 	if _, err := testPool.Exec(ctx, `UPDATE notifications SET queued_at = now() - interval '1 hour' WHERE id = $1`, stuck.ID); err != nil {
 		t.Fatal(err)
 	}
-	n, err := s.RequeueStuck(ctx, 10*time.Minute, 100)
-	if err != nil || n != 1 {
-		t.Fatalf("requeued %d, err %v; want 1", n, err)
+	requeued, err := s.RequeueStuck(ctx, 10*time.Minute, 100)
+	if err != nil || len(requeued) != 1 || requeued[0].ID != stuck.ID || requeued[0].Status != domain.StatusPending {
+		t.Fatalf("requeued %+v, err %v; want the stuck row", requeued, err)
 	}
 	if got, _ := s.GetNotification(ctx, stuck.ID); got.Status != domain.StatusPending || got.QueuedAt != nil {
 		t.Errorf("stuck row: %+v", got)

@@ -37,7 +37,7 @@ func pop(xs *[]int) int {
 
 func (f *fakeReaperStore) ReapExpiredLeases(_ context.Context, maxAttempts, _ int) (storage.ReapResult, error) {
 	f.maxAttempts = maxAttempts
-	res := storage.ReapResult{Retried: pop(&f.leases)}
+	res := storage.ReapResult{Retried: make([]domain.Notification, pop(&f.leases))}
 	if len(f.exhausted) > 0 {
 		res.Failed, f.exhausted = f.exhausted[0], f.exhausted[1:]
 	}
@@ -54,15 +54,15 @@ func (f *fakeDeadLetters) Publish(_ context.Context, ns ...domain.Notification) 
 	return f.err
 }
 
-func (f *fakeReaperStore) RequeueConsumed(_ context.Context, c []storage.CommittedOffset, grace time.Duration, _ int) (int, error) {
+func (f *fakeReaperStore) RequeueConsumed(_ context.Context, c []storage.CommittedOffset, grace time.Duration, _ int) ([]domain.Notification, error) {
 	f.committed, f.grace = c, grace
 	f.consumedCalls++
-	return pop(&f.consumed), nil
+	return make([]domain.Notification, pop(&f.consumed)), nil
 }
 
-func (f *fakeReaperStore) RequeueStuck(_ context.Context, olderThan time.Duration, _ int) (int, error) {
+func (f *fakeReaperStore) RequeueStuck(_ context.Context, olderThan time.Duration, _ int) ([]domain.Notification, error) {
 	f.stuckAfter = olderThan
-	return pop(&f.stuck), nil
+	return make([]domain.Notification, pop(&f.stuck)), nil
 }
 
 type fakeOffsets map[string]map[string]map[int32]int64 // group -> topic -> partition -> offset
