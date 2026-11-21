@@ -9,16 +9,30 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/alpermelkeli/notification-system/internal/domain"
 )
+
+// fakeOffsets hands out Kafka positions on partition 0 in publish order, like a single-partition
+// topic would.
+var fakeOffsets atomic.Int64
+
+func positions(ns []domain.Notification) []KafkaPosition {
+	out := make([]KafkaPosition, len(ns))
+	for i := range ns {
+		out[i] = KafkaPosition{Partition: 0, Offset: fakeOffsets.Add(1) - 1}
+	}
+	return out
+}
 
 // dispatchAll publishes every due row and returns them.
 func dispatchAll(t *testing.T, s *Store) []domain.Notification {
 	t.Helper()
 	var published []domain.Notification
-	if _, err := s.DispatchDue(context.Background(), 1000, func(_ context.Context, ns []domain.Notification) error {
+	if _, err := s.DispatchDue(context.Background(), 1000, func(_ context.Context, ns []domain.Notification) ([]KafkaPosition, error) {
 		published = append(published, ns...)
-		return nil
+		return positions(ns), nil
 	}); err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
@@ -130,7 +144,7 @@ func TestDispatchPublishFailureKeepsRowsDue(t *testing.T) {
 	n := create(t, s)
 
 	boom := errors.New("kafka unavailable")
-	if _, err := s.DispatchDue(ctx, 10, func(context.Context, []domain.Notification) error { return boom }); !errors.Is(err, boom) {
+	if _, err := s.DispatchDue(ctx, 10, func(context.Context, []domain.Notification) ([]KafkaPosition, error) { return nil, boom }); !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want the publish error", err)
 	}
 	if got, _ := s.GetNotification(ctx, n.ID); got.Status != domain.StatusPending {
@@ -150,11 +164,11 @@ func TestDispatchOrderAndLimit(t *testing.T) {
 		time.Sleep(2 * time.Millisecond) // distinct next_attempt_at
 	}
 	var got []string
-	n, err := s.DispatchDue(ctx, 3, func(_ context.Context, ns []domain.Notification) error {
+	n, err := s.DispatchDue(ctx, 3, func(_ context.Context, ns []domain.Notification) ([]KafkaPosition, error) {
 		for _, x := range ns {
 			got = append(got, x.ID.String())
 		}
-		return nil
+		return positions(ns), nil
 	})
 	if err != nil || n != 3 {
 		t.Fatalf("n=%d err=%v", n, err)
@@ -187,14 +201,14 @@ func TestConcurrentDispatchersNeverPublishTheSameRow(t *testing.T) {
 	for range 4 {
 		wg.Go(func() {
 			for {
-				n, err := s.DispatchDue(context.Background(), 50, func(_ context.Context, ns []domain.Notification) error {
+				n, err := s.DispatchDue(context.Background(), 50, func(_ context.Context, ns []domain.Notification) ([]KafkaPosition, error) {
 					mu.Lock()
 					defer mu.Unlock()
 					for _, x := range ns {
 						seen[x.ID.String()]++
 					}
 					time.Sleep(5 * time.Millisecond) // hold the locks while "publishing"
-					return nil
+					return positions(ns), nil
 				})
 				if err != nil {
 					t.Errorf("dispatch: %v", err)
@@ -372,6 +386,124 @@ func TestStaleLeaseCannotOverwriteANewerClaim(t *testing.T) {
 	}
 }
 
+// position reads the stored Kafka position of a notification.
+func position(t *testing.T, n domain.Notification) (*int32, *int64) {
+	t.Helper()
+	var (
+		p *int32
+		o *int64
+	)
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT kafka_partition, kafka_offset FROM notifications WHERE id = $1 AND created_at = $2`,
+		n.ID, n.CreatedAt).Scan(&p, &o); err != nil {
+		t.Fatal(err)
+	}
+	return p, o
+}
+
+func TestDispatchStoresKafkaPositions(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	a, b := create(t, s), create(t, s)
+	if _, err := s.DispatchDue(ctx, 10, func(_ context.Context, ns []domain.Notification) ([]KafkaPosition, error) {
+		out := make([]KafkaPosition, len(ns))
+		for i, x := range ns {
+			out[i] = KafkaPosition{Partition: 2, Offset: 40}
+			if x.ID == b.ID {
+				out[i] = KafkaPosition{Partition: 5, Offset: 41}
+			}
+		}
+		return out, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if p, o := position(t, a); p == nil || *p != 2 || *o != 40 {
+		t.Errorf("a: partition=%v offset=%v, want 2/40", p, o)
+	}
+	if p, o := position(t, b); p == nil || *p != 5 || *o != 41 {
+		t.Errorf("b: partition=%v offset=%v, want 5/41", p, o)
+	}
+
+	// A publisher that loses track of records must not mark anything queued.
+	create(t, s)
+	if _, err := s.DispatchDue(ctx, 10, func(context.Context, []domain.Notification) ([]KafkaPosition, error) {
+		return nil, nil
+	}); err == nil {
+		t.Fatal("dispatch accepted a publish result without positions")
+	}
+}
+
+func TestRequeueConsumed(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	in := func(p domain.Priority) domain.Notification {
+		req := sms("x")
+		req.Priority = p
+		n, _, err := s.CreateNotification(ctx, req, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	lost, waiting, otherPartition, fresh, otherPriority := in(domain.PriorityNormal), in(domain.PriorityNormal),
+		in(domain.PriorityNormal), in(domain.PriorityNormal), in(domain.PriorityHigh)
+	at := map[uuid.UUID]KafkaPosition{
+		lost.ID:           {Partition: 1, Offset: 10}, // behind the committed offset 11: consumed
+		waiting.ID:        {Partition: 1, Offset: 11}, // the next record the group reads: backlog
+		otherPartition.ID: {Partition: 2, Offset: 10}, // partition 2 has no committed offset
+		fresh.ID:          {Partition: 1, Offset: 5},  // consumed, but queued within the grace period
+		otherPriority.ID:  {Partition: 1, Offset: 3},  // high topic: its committed offset is 0
+	}
+	if _, err := s.DispatchDue(ctx, 10, func(_ context.Context, ns []domain.Notification) ([]KafkaPosition, error) {
+		out := make([]KafkaPosition, len(ns))
+		for i, x := range ns {
+			out[i] = at[x.ID]
+		}
+		return out, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE notifications SET queued_at = now() - interval '5 minutes' WHERE id <> $1`, fresh.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	committed := []CommittedOffset{
+		{Channel: domain.ChannelSMS, Priority: domain.PriorityNormal, Partition: 1, Offset: 11},
+		{Channel: domain.ChannelSMS, Priority: domain.PriorityHigh, Partition: 1, Offset: 0},
+		{Channel: domain.ChannelEmail, Priority: domain.PriorityNormal, Partition: 2, Offset: 99},
+	}
+	n, err := s.RequeueConsumed(ctx, committed, time.Minute, 100)
+	if err != nil || n != 1 {
+		t.Fatalf("requeued %d, err %v; want 1", n, err)
+	}
+	got, _ := s.GetNotification(ctx, lost.ID)
+	if got.Status != domain.StatusPending || got.QueuedAt != nil {
+		t.Errorf("lost row: %+v", got)
+	}
+	if p, o := position(t, lost); p != nil || o != nil {
+		t.Errorf("requeued row keeps its old position %v/%v", p, o)
+	}
+	for name, x := range map[string]domain.Notification{
+		"waiting": waiting, "other partition": otherPartition, "fresh": fresh, "other priority": otherPriority,
+	} {
+		if got, _ := s.GetNotification(ctx, x.ID); got.Status != domain.StatusQueued {
+			t.Errorf("%s row was requeued: %s", name, got.Status)
+		}
+	}
+	hist, err := s.History(ctx, lost.ID)
+	if err != nil || hist[len(hist)-1].Reason != "kafka record consumed without claim" {
+		t.Errorf("history = %+v, %v", hist, err)
+	}
+
+	// The requeued row is published again with a new position.
+	if again := dispatchAll(t, s); len(again) != 1 || again[0].ID != lost.ID {
+		t.Fatalf("re-dispatched %d rows", len(again))
+	}
+	if n, err := s.RequeueConsumed(ctx, nil, 0, 100); err != nil || n != 0 {
+		t.Errorf("no committed offsets: %d, %v", n, err)
+	}
+}
+
 func TestRequeueStuck(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -401,13 +533,13 @@ func TestCancelDuringDispatchWaitsAndWins(t *testing.T) {
 	n := create(t, s)
 
 	cancelled := make(chan error, 1)
-	if _, err := s.DispatchDue(ctx, 10, func(context.Context, []domain.Notification) error {
+	if _, err := s.DispatchDue(ctx, 10, func(_ context.Context, ns []domain.Notification) ([]KafkaPosition, error) {
 		go func() { _, err := s.Cancel(ctx, n.ID); cancelled <- err }()
 		select {
 		case err := <-cancelled:
-			return fmt.Errorf("cancel did not wait for the dispatcher's lock: %w", err)
+			return nil, fmt.Errorf("cancel did not wait for the dispatcher's lock: %w", err)
 		case <-time.After(100 * time.Millisecond):
-			return nil
+			return positions(ns), nil
 		}
 	}); err != nil {
 		t.Fatal(err)
