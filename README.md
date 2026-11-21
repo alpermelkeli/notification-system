@@ -4,7 +4,7 @@ An event-driven, multi-channel notification service written in Go. It accepts no
 requests over HTTP, processes them asynchronously through prioritized queue workers, and delivers
 them via SMS, Email and Push providers with rate limiting, retries and real-time status tracking.
 
-> **Status:** 🚧 Phase 5 done: notifications flow end to end (API → PostgreSQL → dispatcher → Kafka → priority-scheduled workers → Redis rate limiter → provider), with a reaper for lost records. Exponential backoff, failure classification, DLQ and the circuit breaker follow in Phase 6. See [`docs/plan.md`](docs/plan.md).
+> **Status:** 🚧 Phase 6 done: notifications flow end to end (API → PostgreSQL → dispatcher → Kafka → priority-scheduled workers → Redis rate limiter → provider), failures are classified and retried with exponential backoff and jitter, terminal failures are dead-lettered, and a per-channel circuit breaker holds the backlog during provider outages. Metrics and tracing follow in Phase 7. See [`docs/plan.md`](docs/plan.md).
 
 ## Features (target)
 - **Notification API:** single and batch create (up to 1000), status by ID / batch ID, cancel, filtered + paginated listing
@@ -77,7 +77,8 @@ curl localhost:8081/stats        # accepted/rejected per channel + rate in the l
   Kafka partition and offset of each record. It wakes on `NOTIFY notifications_due` and polls every
   500 ms as a fallback (scheduled and retrying rows). Replicas share the work through
   `FOR UPDATE SKIP LOCKED`.
-- **Reaper** (every 30 s, in every dispatcher): expired worker leases go to `retrying`. A `queued`
+- **Reaper** (every 30 s, in every dispatcher): expired worker leases go to `retrying`, or to
+  `failed` with a dead letter if it was the last attempt. A `queued`
   row whose offset is behind the committed offset of `workers.{channel}` was consumed without a
   claim, so it goes back to `pending` (after a 1-minute grace period). A burst backlog is never
   re-published, however long it waits. Rows queued for more than 24 h fall back to `pending`.
@@ -311,10 +312,12 @@ and are skipped by `make test-short`:
   shared rate across several limiters on Redis.
 - `internal/integration`: the engine end to end. Two workers share the group, every notification is
   delivered exactly once, a 503 is retried, a cancelled row is never sent, the rate holds, and a
-  lost record is recovered by the reaper.
+  lost record is recovered by the reaper. A 400 fails at once, a provider stuck on 503 exhausts
+  the attempts with growing backoff, both reach `notifications.dlq`, and during a provider outage
+  the breaker stops the calls without burning attempts.
 
-The worker engine (scheduler, watermarks, backpressure, rebalance, shutdown) is unit-tested with
-fakes, without Kafka.
+The worker engine (scheduler, watermarks, backpressure, rebalance, shutdown, outcome policy,
+circuit breaker, claim retry during a database outage) is unit-tested with fakes, without Kafka.
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs lint, race-enabled tests with
 coverage and a Docker image build on every push to `main` and every pull request. No test calls
 the real webhook.site; the provider is faked with `httptest` or the mock provider.

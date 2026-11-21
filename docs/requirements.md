@@ -34,9 +34,9 @@ teams and API consumers.
 Left open by the brief ("thinking and design by candidate"). Our design must be documented in an ADR.
 | ID | Requirement | Status | Where |
 |----|-------------|--------|-------|
-| FR-3.1 | Retry policy (backoff + jitter, max attempts) | [ ] | |
-| FR-3.2 | Retryable vs. permanent failure classification | [ ] | |
-| FR-3.3 | Dead-letter handling / terminal failed state | [ ] | |
+| FR-3.1 | Retry policy (backoff + jitter, max attempts) | [x] | `internal/retry` (exponential, equal jitter), `internal/worker/process.go` (`settle`), reaper fails expired leases at the limit |
+| FR-3.2 | Retryable vs. permanent failure classification | [x] | `internal/provider/classify.go` |
+| FR-3.3 | Dead-letter handling / terminal failed state | [x] | `failed` + `last_error`, `notifications.dlq` claim-checks (`internal/queue/deadletter.go`), replay via `POST /v1/notifications/{id}/retry` |
 | FR-3.4 | Status lifecycle & state machine | [x] | `internal/domain/status.go`, guarded transitions + history in `internal/storage/transitions.go` |
 
 ### FR-4 Observability
@@ -54,7 +54,7 @@ Left open by the brief ("thinking and design by candidate"). Our design must be 
 ## Bonus (optional, viewed favorably)
 | ID | Feature | Status |
 |----|---------|--------|
-| B-1 | Failure handling (circuit breaker, DLQ, replay) | [ ] |
+| B-1 | Failure handling (circuit breaker, DLQ, replay) | [x] |
 | B-2 | Scheduled notifications (future delivery) | [ ] |
 | B-3 | Template system with variable substitution | [ ] |
 | B-4 | WebSocket real-time status updates | [ ] |

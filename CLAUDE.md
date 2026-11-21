@@ -68,11 +68,12 @@ internal/httpx/        error envelope, JSON helpers, middleware (correlation id,
 internal/health/       /healthz (liveness) and /readyz (concurrent dependency checks)
 internal/platform/     lazy PostgreSQL / Kafka / Redis clients + readiness checks
 internal/mockprovider/ mock provider handler
-internal/queue/        Kafka contract: topic/group names, claim-check work message
+internal/queue/        Kafka contract: topic/group names, claim-check work message, dead letters
 internal/dispatcher/   relay (PG -> Kafka, NOTIFY + poll), publisher, reaper (leases, offset rule, age fallback)
-internal/worker/       per-channel consumer: priority heaps, capped-aging scheduler, watermarks, claim/send/outcome
+internal/worker/       per-channel consumer: priority heaps, capped-aging scheduler, watermarks, circuit breaker, claim/send/outcome
+internal/retry/        backoff with equal jitter and the attempt budget (ADR-0005)
 internal/ratelimit/    reserving GCRA in Redis + fleet cool-down
-internal/provider/     HTTP client of the delivery provider
+internal/provider/     HTTP client of the delivery provider, outcome classification
 internal/testinfra/    containers for integration tests (PostgreSQL, Kafka, Redis)
 internal/integration/  end-to-end engine tests (containers + httptest provider)
 deploy/                nginx LB config, Kafka topic creation script

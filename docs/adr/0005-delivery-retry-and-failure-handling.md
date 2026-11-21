@@ -67,6 +67,41 @@ terminal failures visible and replayable (B-1).
 - Request body: `{to, channel, content}`, plus `Idempotency-Key` and `X-Correlation-ID`
   headers.
 
+**Amendment (2026-11-21, Phase 6): implementation notes.**
+- *Classification* lives in `provider.Classify`. `last_error` starts with the class
+  (`retryable:`, `rate_limited:`, `permanent:`), or `attempts exhausted (n), last <class>:` when
+  the budget is spent, so `GET /v1/notifications?status=failed` shows why each row failed.
+- *Backoff* is `internal/retry` with the formula above. A `429` waits
+  `max(backoff, min(Retry-After, 1m))`; the cap stops a bogus header from parking a row for days.
+  `RETRY_DELAY` became `RETRY_BASE_DELAY` and `RETRY_MAX_DELAY`. `MAX_ATTEMPTS` is shared by the
+  worker and the dispatcher's reaper.
+- *Expired lease on the last attempt.* The reaper keeps an expired lease's attempt counted (the
+  send may have happened). A row that expires on attempt `MAX_ATTEMPTS` now goes to `failed` with
+  a dead letter in the same statement, instead of being dispatched beyond its budget.
+- *Dead letters* are claim-checks: ids, channel, priority, attempts, `last_error`, correlation id
+  and time, but no recipient or content, so the topic holds no personal data. They are published
+  after the `failed` row commits, by the worker or by the reaper. A crash in between loses only
+  the audit record, never the notification.
+- *Circuit breaker.* `sony/gobreaker/v2` in two-step mode. Retryable failures count as failures,
+  `2xx` and permanent `4xx` as successes (the provider answered), and `429`s are excluded. The
+  ratio rule uses a rolling one-minute window with six buckets. Two changes from the text above:
+  - The breaker is checked **before** the pick, not after the claim. While it is open nothing is
+    picked, so records stay in the worker's priority buffers and fetching pauses through the
+    buffers' high-water mark, the same backpressure that pauses a busy topic. There is no separate
+    `PauseFetchTopics` call. The watermark does not move, so the backlog waits in Kafka and no
+    attempt is burned or released.
+  - A send admitted while the breaker was closed, but claimed after it opened, is released to
+    `retrying` without consuming its attempt, due after the open period. Sends already at the
+    provider when it trips finish normally.
+  - In half-open, exactly one probe is admitted. An admitted send that does not happen (stale
+    record, no token) is reported as excluded, so the next probe is not blocked.
+- *PostgreSQL outage (from the Phase 5 review).* A claim that fails with a transient database
+  error (`storage.IsTransient`: no connection, timeouts, shutdown, resource exhaustion,
+  serialization failures) is retried with backoff from 100 ms up to 5 s instead of being given up.
+  It holds its sender slot, so a worker whose database is down stops taking work, and its
+  watermark holds. On shutdown or revoke the claim is abandoned below the watermark for the next
+  owner. A non-transient error still skips the record, leaving it to the reaper.
+
 ## Consequences
 - ✅ Transient provider issues heal automatically. Permanent errors fail fast. Outages pause
   delivery instead of draining the retry budget.
