@@ -42,24 +42,31 @@ func (t transition) validate() error {
 	return nil
 }
 
-// apply runs t against one notification and returns the updated row. The row lock taken in prev
-// makes concurrent transitions serialise; READ COMMITTED re-checks the status guard after the
-// lock is granted, so exactly one of two racing transitions wins.
+// apply runs t against one notification and returns the updated row.
+//
+// prev locks the row by key alone and the status and lease guards are checked on the locked
+// version. A guard in prev's WHERE would be evaluated on the statement's snapshot first, so a
+// row whose transition is still uncommitted in another transaction would be rejected at once
+// instead of waited for. Locking first makes every transition wait for a concurrent one and then
+// judge the committed result. This matters for the claim: the dispatcher holds the row lock from
+// before publishing until it commits queued, so a worker that receives the record early waits for
+// that commit instead of skipping the record (ADR-0003). Of two racing transitions, exactly one
+// wins.
 func apply(ctx context.Context, q querier, id uuid.UUID, createdAt time.Time, t transition) (domain.Notification, error) {
 	if err := t.validate(); err != nil {
 		return domain.Notification{}, err
 	}
 	sql := `
 WITH prev AS (
-    SELECT id, created_at, status FROM notifications
-     WHERE id = $1 AND created_at = $2 AND status = ANY($3)
-       AND ($6::uuid IS NULL OR lease_token = $6)
+    SELECT id, created_at, status, lease_token FROM notifications
+     WHERE id = $1 AND created_at = $2
        FOR UPDATE
 ), upd AS (
     UPDATE notifications n
        SET status = $4, updated_at = now()` + t.set + `
       FROM prev
      WHERE n.id = prev.id AND n.created_at = prev.created_at
+       AND prev.status = ANY($3) AND ($6::uuid IS NULL OR prev.lease_token = $6)
  RETURNING ` + columns("n") + `, prev.status AS prev_status
 ), hist AS (
     INSERT INTO notification_status_history

@@ -606,3 +606,37 @@ func TestListenDue(t *testing.T) {
 		t.Errorf("%d idle connections still show a LISTEN", listening)
 	}
 }
+
+// TestClaimDuringDispatchWaitsForTheCommit is the race of the ADR-0003 amendment: a worker can
+// receive a record while the dispatcher has not yet committed the row as queued. The claim must
+// wait for that commit and succeed, not see a pending row and give up.
+func TestClaimDuringDispatchWaitsForTheCommit(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	n := create(t, s)
+
+	claimed := make(chan error, 1)
+	if _, err := s.DispatchDue(ctx, 10, func(_ context.Context, ns []domain.Notification) ([]KafkaPosition, error) {
+		// The record is in Kafka now; a fast worker claims it before the dispatcher commits.
+		go func() { _, err := s.Claim(ctx, n.ID, n.CreatedAt, time.Minute); claimed <- err }()
+		select {
+		case err := <-claimed:
+			return nil, fmt.Errorf("claim did not wait for the dispatcher's commit: %w", err)
+		case <-time.After(300 * time.Millisecond):
+			return positions(ns), nil
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-claimed; err != nil {
+		t.Fatalf("claim after the dispatch commit: %v", err)
+	}
+	got, _ := s.GetNotification(ctx, n.ID)
+	if got.Status != domain.StatusProcessing || got.Attempts != 1 {
+		t.Errorf("after claim: %+v", got)
+	}
+	hist, _ := s.History(ctx, n.ID)
+	if len(hist) != 3 || *hist[2].From != domain.StatusQueued || hist[2].To != domain.StatusProcessing {
+		t.Errorf("history = %+v", hist)
+	}
+}
