@@ -23,6 +23,7 @@ import (
 	"github.com/alpermelkeli/notification-system/internal/app"
 	"github.com/alpermelkeli/notification-system/internal/config"
 	"github.com/alpermelkeli/notification-system/internal/logging"
+	"github.com/alpermelkeli/notification-system/internal/telemetry"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".
@@ -90,7 +91,24 @@ func run(args []string, stdout, stderr io.Writer) int {
 		stop()
 	}()
 
-	logger.Info("starting", "version", version)
+	shutdownTracing, err := telemetry.Setup(ctx, telemetry.Options{
+		Endpoint: cfg.Tracing.Endpoint, SampleRatio: cfg.Tracing.SampleRatio,
+		Service: args[0], Instance: cfg.InstanceID, Version: version,
+	})
+	if err != nil {
+		logger.Error("tracing setup failed", "err", err)
+		return 1
+	}
+	defer func() {
+		// Flush the spans of the last requests and deliveries; ctx is already cancelled.
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(sctx); err != nil {
+			logger.Warn("tracing shutdown", "err", err)
+		}
+	}()
+
+	logger.Info("starting", "version", version, "tracing", cfg.Tracing.Endpoint != "")
 	if err := role(ctx, cfg, logger); err != nil {
 		logger.Error("stopped with error", "err", err)
 		return 1

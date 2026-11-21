@@ -20,7 +20,7 @@ func TestListNotifications(t *testing.T) {
 		if i%3 == 0 {
 			in.Channel, in.Recipient = domain.ChannelEmail, "a@example.com"
 		}
-		n, _, err := s.CreateNotification(ctx, in, "")
+		n, _, err := s.CreateNotification(ctx, in, Origin{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -30,7 +30,7 @@ func TestListNotifications(t *testing.T) {
 	if _, err := s.Cancel(ctx, all[4].ID); err != nil {
 		t.Fatal(err)
 	}
-	batch, err := s.CreateBatch(ctx, NewBatch{Items: []NewNotification{sms("b1"), sms("b2")}}, "")
+	batch, err := s.CreateBatch(ctx, NewBatch{Items: []NewNotification{sms("b1"), sms("b2")}}, Origin{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +68,7 @@ func TestListPaginationVisitsEveryRowOnce(t *testing.T) {
 	for i := range items {
 		items[i] = sms("p")
 	}
-	if _, err := s.CreateBatch(ctx, NewBatch{Items: items}, ""); err != nil {
+	if _, err := s.CreateBatch(ctx, NewBatch{Items: items}, Origin{}); err != nil {
 		t.Fatal(err)
 	}
 

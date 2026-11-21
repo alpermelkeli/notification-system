@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/alpermelkeli/notification-system/internal/dispatcher"
 	"github.com/alpermelkeli/notification-system/internal/domain"
 	"github.com/alpermelkeli/notification-system/internal/health"
+	"github.com/alpermelkeli/notification-system/internal/metrics"
 	"github.com/alpermelkeli/notification-system/internal/platform"
 	"github.com/alpermelkeli/notification-system/internal/provider"
 	"github.com/alpermelkeli/notification-system/internal/queue"
@@ -64,10 +66,10 @@ func RunAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	}
 	defer pool.Close()
 
-	router := baseRouter(logger, cfg.InstanceID, []health.Check{platform.PostgresCheck(pool)})
+	router, httpMetrics := baseRouter(logger, cfg.InstanceID, []health.Check{platform.PostgresCheck(pool)}, metrics.NewRegistry())
 	store := storage.New(pool, storage.Options{IdempotencyTTL: cfg.IdempotencyTTL})
 	api.New(store, logger, api.Options{
-		MaxScheduleAhead: cfg.MaxScheduleAhead, RequestTimeout: cfg.RequestTimeout,
+		MaxScheduleAhead: cfg.MaxScheduleAhead, RequestTimeout: cfg.RequestTimeout, Metrics: httpMetrics,
 	}).Routes(router)
 
 	return serveHTTP(ctx, logger, cfg.HTTPAddr, router, cfg.ShutdownTimeout)
@@ -90,15 +92,19 @@ func RunDispatcher(ctx context.Context, cfg config.Config, logger *slog.Logger) 
 	}
 	defer kafka.Close()
 
+	reg := metrics.NewRegistry()
+	m := metrics.NewDispatch(reg)
 	store := storage.New(pool, storage.Options{IdempotencyTTL: cfg.IdempotencyTTL})
-	relay := dispatcher.NewRelay(store, dispatcher.NewPublisher(kafka).Publish, logger, dispatcher.RelayOptions{
-		BatchSize: cfg.Dispatcher.BatchSize, PollInterval: cfg.Dispatcher.PollInterval,
+	relay := dispatcher.NewRelay(store, dispatcher.NewPublisher(kafka, m).Publish, logger, dispatcher.RelayOptions{
+		BatchSize: cfg.Dispatcher.BatchSize, PollInterval: cfg.Dispatcher.PollInterval, Metrics: m,
 	})
 	dead := queue.NewDeadLetters(kafka, dispatcher.PublishTimeout)
-	reaper := dispatcher.NewReaper(store, dispatcher.NewKafkaOffsets(kadm.NewClient(kafka)), dead, logger, dispatcher.ReaperOptions{
+	offsets := dispatcher.NewKafkaOffsets(kadm.NewClient(kafka))
+	reaper := dispatcher.NewReaper(store, offsets, dead, logger, dispatcher.ReaperOptions{
 		Interval: cfg.Dispatcher.ReaperInterval, Grace: cfg.Dispatcher.ReaperGrace,
-		StuckAfter: cfg.Dispatcher.ReaperStuckAfter, MaxAttempts: cfg.Retry.MaxAttempts,
+		StuckAfter: cfg.Dispatcher.ReaperStuckAfter, MaxAttempts: cfg.Retry.MaxAttempts, Metrics: m,
 	})
+	depth := dispatcher.NewDepthMonitor(store, offsets, m, logger, cfg.Dispatcher.DepthInterval)
 
 	var wg sync.WaitGroup
 	defer wg.Wait() // background loops use the pool and the client, which earlier defers close
@@ -108,10 +114,11 @@ func RunDispatcher(ctx context.Context, cfg config.Config, logger *slog.Logger) 
 	defer cancel()
 	wg.Go(func() { relay.Run(ctx) })
 	wg.Go(func() { reaper.Run(ctx) })
+	wg.Go(func() { depth.Run(ctx) })
 	wg.Go(func() { runMaintenance(ctx, store, cfg, logger) })
 
-	checks := []health.Check{platform.PostgresCheck(pool), platform.KafkaCheck(kafka)}
-	return serveAdmin(ctx, cfg, logger, checks)
+	checks := []health.Check{platform.PostgresCheck(pool), platform.KafkaCheck("kafka", kafka)}
+	return serveAdmin(ctx, cfg, logger, checks, reg)
 }
 
 // RunWorker delivers notifications of cfg.Worker.Channels (ADR-0002, ADR-0006): one consumer
@@ -152,6 +159,7 @@ func RunWorker(ctx context.Context, cfg config.Config, logger *slog.Logger) erro
 	}
 	defer producer.Close()
 
+	reg := metrics.NewRegistry()
 	store := storage.New(pool, storage.Options{IdempotencyTTL: cfg.IdempotencyTTL})
 	policy := worker.DefaultPolicy()
 	policy.AgingRate, policy.MinShareEvery = cfg.Worker.AgingRate, cfg.Worker.MinShareEvery
@@ -162,6 +170,7 @@ func RunWorker(ctx context.Context, cfg config.Config, logger *slog.Logger) erro
 			BaseDelay: cfg.Retry.BaseDelay, MaxDelay: cfg.Retry.MaxDelay, MaxAttempts: cfg.Retry.MaxAttempts,
 		},
 		Breaker: worker.BreakerOptions(cfg.Worker.Breaker),
+		Metrics: metrics.NewDelivery(reg),
 	}
 
 	var wg sync.WaitGroup
@@ -177,16 +186,15 @@ func RunWorker(ctx context.Context, cfg config.Config, logger *slog.Logger) erro
 		if err != nil {
 			return err
 		}
-		if len(checks) == 2 {
-			checks = append(checks, platform.KafkaCheck(cl))
-		}
+		// Every channel's consumer has its own client, so readiness checks each of them.
+		checks = append(checks, platform.KafkaCheck("kafka-"+string(c), cl))
 		wg.Go(func() {
 			w.Run(ctx, cl)
 			cl.CloseAllowingRebalance() // leaves the group after in-flight sends are persisted and committed
 		})
 	}
 	logger.Info("worker started", "channels", cfg.Worker.Channels, "provider", sender.Name())
-	return serveAdmin(ctx, cfg, logger, checks)
+	return serveAdmin(ctx, cfg, logger, checks, reg)
 }
 
 // runMaintenance runs the data lifecycle (partitions, retention, expired idempotency keys) at
@@ -222,8 +230,9 @@ func runMaintenance(ctx context.Context, store *storage.Store, cfg config.Config
 	}
 }
 
-func serveAdmin(ctx context.Context, cfg config.Config, logger *slog.Logger, checks []health.Check) error {
-	if err := serveHTTP(ctx, logger, cfg.AdminAddr, baseRouter(logger, cfg.InstanceID, checks), cfg.ShutdownTimeout); err != nil {
+func serveAdmin(ctx context.Context, cfg config.Config, logger *slog.Logger, checks []health.Check, reg *prometheus.Registry) error {
+	router, _ := baseRouter(logger, cfg.InstanceID, checks, reg)
+	if err := serveHTTP(ctx, logger, cfg.AdminAddr, router, cfg.ShutdownTimeout); err != nil {
 		return fmt.Errorf("admin server: %w", err)
 	}
 	return nil

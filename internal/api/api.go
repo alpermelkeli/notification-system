@@ -16,13 +16,16 @@ import (
 
 	apispec "github.com/alpermelkeli/notification-system/api"
 	"github.com/alpermelkeli/notification-system/internal/domain"
+	"github.com/alpermelkeli/notification-system/internal/logging"
+	"github.com/alpermelkeli/notification-system/internal/metrics"
 	"github.com/alpermelkeli/notification-system/internal/storage"
+	"github.com/alpermelkeli/notification-system/internal/telemetry"
 )
 
 // Store is the persistence the API needs. *storage.Store implements it.
 type Store interface {
-	CreateNotification(ctx context.Context, in storage.NewNotification, correlationID string) (domain.Notification, bool, error)
-	CreateBatch(ctx context.Context, in storage.NewBatch, correlationID string) (storage.BatchResult, error)
+	CreateNotification(ctx context.Context, in storage.NewNotification, origin storage.Origin) (domain.Notification, bool, error)
+	CreateBatch(ctx context.Context, in storage.NewBatch, origin storage.Origin) (storage.BatchResult, error)
 	GetNotification(ctx context.Context, id uuid.UUID) (domain.Notification, error)
 	History(ctx context.Context, id uuid.UUID) ([]domain.StatusChange, error)
 	Cancel(ctx context.Context, id uuid.UUID) (domain.Notification, error)
@@ -38,6 +41,8 @@ type Options struct {
 	MaxScheduleAhead time.Duration
 	// RequestTimeout bounds each API request. Default 10s.
 	RequestTimeout time.Duration
+	// Metrics counts created notifications. Optional.
+	Metrics *metrics.HTTP
 	// Now returns the current time. Default time.Now.
 	Now func() time.Time
 }
@@ -141,3 +146,9 @@ var docsCSP = func() string {
 		"style-src https://unpkg.com 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; " +
 		"base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 }()
+
+// origin describes the request for the rows it creates: its correlation ID and the traceparent
+// of its span, which the dispatcher continues (FR-4.2, B-5).
+func origin(ctx context.Context) storage.Origin {
+	return storage.Origin{CorrelationID: logging.CorrelationID(ctx), TraceParent: telemetry.TraceParent(ctx)}
+}

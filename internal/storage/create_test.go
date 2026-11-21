@@ -29,7 +29,7 @@ func TestCreateAndGetNotification(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	n, created, err := s.CreateNotification(ctx, sms("hello"), "corr-1")
+	n, created, err := s.CreateNotification(ctx, sms("hello"), Origin{CorrelationID: "corr-1", TraceParent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"})
 	if err != nil || !created {
 		t.Fatalf("create: created=%v err=%v", created, err)
 	}
@@ -46,6 +46,9 @@ func TestCreateAndGetNotification(t *testing.T) {
 	got, err := s.GetNotification(ctx, n.ID)
 	if err != nil {
 		t.Fatalf("get: %v", err)
+	}
+	if got.TraceParent != "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" {
+		t.Errorf("trace parent = %q", got.TraceParent)
 	}
 	if got.ID != n.ID || got.Content != "hello" || got.Channel != domain.ChannelSMS {
 		t.Errorf("get returned %+v", got)
@@ -77,7 +80,7 @@ func TestCreateScheduledNotification(t *testing.T) {
 	in := sms("later")
 	in.ScheduledAt = &at
 
-	n, _, err := s.CreateNotification(context.Background(), in, "")
+	n, _, err := s.CreateNotification(context.Background(), in, Origin{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,10 +105,10 @@ func TestCreateNotifiesDispatcherOnlyWhenDue(t *testing.T) {
 	later := time.Now().Add(time.Hour)
 	scheduled := sms("later")
 	scheduled.ScheduledAt = &later
-	if _, _, err := s.CreateNotification(ctx, scheduled, ""); err != nil {
+	if _, _, err := s.CreateNotification(ctx, scheduled, Origin{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.CreateNotification(ctx, sms("now"), ""); err != nil {
+	if _, _, err := s.CreateNotification(ctx, sms("now"), Origin{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -128,19 +131,19 @@ func TestCreateIdempotency(t *testing.T) {
 
 	in := sms("otp 1234")
 	in.IdempotencyKey = key("k-1", "otp 1234")
-	first, created, err := s.CreateNotification(ctx, in, "")
+	first, created, err := s.CreateNotification(ctx, in, Origin{})
 	if err != nil || !created {
 		t.Fatalf("first: created=%v err=%v", created, err)
 	}
 
-	again, created, err := s.CreateNotification(ctx, in, "")
+	again, created, err := s.CreateNotification(ctx, in, Origin{})
 	if err != nil || created || again.ID != first.ID {
 		t.Fatalf("replay: id=%s created=%v err=%v, want id %s and created=false", again.ID, created, err, first.ID)
 	}
 
 	changed := sms("otp 9999")
 	changed.IdempotencyKey = key("k-1", "otp 9999")
-	if _, _, err := s.CreateNotification(ctx, changed, ""); !errors.Is(err, domain.ErrIdempotencyKeyReused) {
+	if _, _, err := s.CreateNotification(ctx, changed, Origin{}); !errors.Is(err, domain.ErrIdempotencyKeyReused) {
 		t.Fatalf("different body: err = %v, want ErrIdempotencyKeyReused", err)
 	}
 
@@ -163,7 +166,7 @@ func TestCreateIdempotencyConcurrent(t *testing.T) {
 	)
 	for range n {
 		wg.Go(func() {
-			got, c, err := s.CreateNotification(context.Background(), in, "")
+			got, c, err := s.CreateNotification(context.Background(), in, Origin{})
 			if err != nil {
 				t.Errorf("create: %v", err)
 				return
@@ -189,7 +192,7 @@ func TestExpiredIdempotencyKeyIsTakenOver(t *testing.T) {
 	in := sms("a")
 	in.IdempotencyKey = key("k-exp", "a")
 
-	first, _, err := s.CreateNotification(ctx, in, "")
+	first, _, err := s.CreateNotification(ctx, in, Origin{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +201,7 @@ func TestExpiredIdempotencyKeyIsTakenOver(t *testing.T) {
 	// After expiry the key behaves as new, even for a different body.
 	other := sms("b")
 	other.IdempotencyKey = key("k-exp", "b")
-	second, created, err := s.CreateNotification(ctx, other, "")
+	second, created, err := s.CreateNotification(ctx, other, Origin{})
 	if err != nil || !created || second.ID == first.ID {
 		t.Fatalf("after expiry: created=%v err=%v", created, err)
 	}
@@ -224,7 +227,7 @@ func TestCreateBatch(t *testing.T) {
 	}
 	items[7].Priority = domain.PriorityHigh
 
-	res, err := s.CreateBatch(ctx, NewBatch{Items: items}, "corr-b")
+	res, err := s.CreateBatch(ctx, NewBatch{Items: items}, Origin{CorrelationID: "corr-b"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,14 +263,14 @@ func TestCreateBatchIdempotency(t *testing.T) {
 	// An earlier single create whose key appears again as a batch item.
 	single := sms("x")
 	single.IdempotencyKey = key("item-a", "x")
-	prior, _, err := s.CreateNotification(ctx, single, "")
+	prior, _, err := s.CreateNotification(ctx, single, Origin{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	items := []NewNotification{sms("one"), single, sms("three")}
 	batch := NewBatch{Items: items, IdempotencyKey: key("batch-1", "body")}
-	res, err := s.CreateBatch(ctx, batch, "")
+	res, err := s.CreateBatch(ctx, batch, Origin{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +282,7 @@ func TestCreateBatchIdempotency(t *testing.T) {
 	}
 
 	// Replaying the batch key returns the original batch and creates nothing.
-	replay, err := s.CreateBatch(ctx, batch, "")
+	replay, err := s.CreateBatch(ctx, batch, Origin{})
 	if err != nil || replay.Created || replay.Batch.ID != res.Batch.ID || len(replay.Items) != 3 {
 		t.Fatalf("replay: created=%v id=%s items=%d err=%v", replay.Created, replay.Batch.ID, len(replay.Items), err)
 	}
@@ -295,14 +298,14 @@ func TestCreateBatchIdempotency(t *testing.T) {
 	conflicting := sms("different content")
 	conflicting.IdempotencyKey = key("item-a", "different content")
 	var ie *ItemError
-	if _, err := s.CreateBatch(ctx, NewBatch{Items: []NewNotification{sms("ok"), conflicting}}, ""); !errors.As(err, &ie) ||
+	if _, err := s.CreateBatch(ctx, NewBatch{Items: []NewNotification{sms("ok"), conflicting}}, Origin{}); !errors.As(err, &ie) ||
 		ie.Index != 1 || !errors.Is(err, domain.ErrIdempotencyKeyReused) {
 		t.Errorf("err = %v, want ItemError{Index: 1} wrapping ErrIdempotencyKeyReused", err)
 	}
 
 	// The same batch key with another body is rejected.
 	batch.IdempotencyKey = key("batch-1", "other body")
-	if _, err := s.CreateBatch(ctx, batch, ""); !errors.Is(err, domain.ErrIdempotencyKeyReused) {
+	if _, err := s.CreateBatch(ctx, batch, Origin{}); !errors.Is(err, domain.ErrIdempotencyKeyReused) {
 		t.Errorf("err = %v, want ErrIdempotencyKeyReused", err)
 	}
 	if n := count(t, "notifications"); n != 3 {
@@ -325,7 +328,7 @@ func TestCreateBatchRejectsInvalidInput(t *testing.T) {
 	}
 	for name, in := range tests {
 		t.Run(name, func(t *testing.T) {
-			if _, err := s.CreateBatch(context.Background(), in, ""); !errors.Is(err, domain.ErrInvalidArgument) {
+			if _, err := s.CreateBatch(context.Background(), in, Origin{}); !errors.Is(err, domain.ErrInvalidArgument) {
 				t.Errorf("err = %v, want ErrInvalidArgument", err)
 			}
 		})
@@ -359,7 +362,7 @@ func TestConcurrentBatchesWithOverlappingKeysDoNotDeadlock(t *testing.T) {
 	var wg sync.WaitGroup
 	for _, items := range [][]NewNotification{keysA, keysB, keysA, keysB} {
 		wg.Go(func() {
-			if _, err := s.CreateBatch(context.Background(), NewBatch{Items: items}, ""); err != nil {
+			if _, err := s.CreateBatch(context.Background(), NewBatch{Items: items}, Origin{}); err != nil {
 				t.Errorf("batch: %v", err)
 			}
 		})

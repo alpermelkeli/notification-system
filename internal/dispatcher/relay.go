@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/alpermelkeli/notification-system/internal/metrics"
 	"github.com/alpermelkeli/notification-system/internal/storage"
 )
 
@@ -21,6 +22,8 @@ type RelayOptions struct {
 	// PollInterval is the fallback poll period. It bounds the delay of scheduled and retrying
 	// rows, which no NOTIFY announces. Default 500ms.
 	PollInterval time.Duration
+	// Metrics counts failed batches. Optional.
+	Metrics *metrics.Dispatch
 }
 
 // Relay publishes due notifications in next_attempt_at order (ADR-0003). It wakes on
@@ -61,6 +64,7 @@ func (r *Relay) Run(ctx context.Context) {
 		case err != nil:
 			// Kafka or PostgreSQL is unavailable. The rows stay due and nothing is lost.
 			wait = backoff.next()
+			r.opts.Metrics.DispatchFailed()
 			r.logger.Error("dispatch failed", "err", err, "retry_in", wait)
 		case n == r.opts.BatchSize:
 			backoff.reset()

@@ -14,13 +14,14 @@ import (
 
 	"github.com/alpermelkeli/notification-system/internal/health"
 	"github.com/alpermelkeli/notification-system/internal/httpx"
+	"github.com/alpermelkeli/notification-system/internal/metrics"
 )
 
 func discard() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 func TestBaseRouter(t *testing.T) {
 	failing := health.Check{Name: "postgres", Probe: func(context.Context) error { return errors.New("down") }}
-	r := baseRouter(discard(), "api-1", []health.Check{failing})
+	r, _ := baseRouter(discard(), "api-1", []health.Check{failing}, metrics.NewRegistry())
 
 	tests := []struct {
 		method, path string

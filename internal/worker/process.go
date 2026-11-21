@@ -9,11 +9,17 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/alpermelkeli/notification-system/internal/domain"
+	"github.com/alpermelkeli/notification-system/internal/metrics"
 	"github.com/alpermelkeli/notification-system/internal/provider"
 	"github.com/alpermelkeli/notification-system/internal/ratelimit"
 	"github.com/alpermelkeli/notification-system/internal/storage"
+	"github.com/alpermelkeli/notification-system/internal/telemetry"
 )
 
 // staleToken is how old a token may be when the claim finishes; older tokens are replaced.
@@ -51,8 +57,15 @@ const (
 //
 // runCtx is the worker's run context. Once claimed, a send is not abandoned on shutdown: it
 // finishes and persists its outcome within the lease, so the record is not delivered twice.
+//
+// Each record is processed under a consumer span that continues the dispatcher's producer span
+// from the record headers (B-5); the claim, the provider call and the outcome write are its
+// children, and the outcome is counted in the metrics (FR-4.1).
 func (w *Worker) process(runCtx context.Context, r record, adm admission) bool {
-	runCtx = withCorrelation(runCtx, r)
+	runCtx, span := w.startSpan(withCorrelation(runCtx, r), r)
+	defer span.End()
+	w.opts.Metrics.SendStarted(w.channel)
+	defer w.opts.Metrics.SendFinished(w.channel)
 	log := w.logger.With("notification_id", r.msg.ID.String(), "priority", string(r.msg.Priority))
 	reported := false
 	report := func(err error) {
@@ -67,16 +80,20 @@ func (w *Worker) process(runCtx context.Context, r record, adm admission) bool {
 	switch {
 	case errors.Is(err, errStale):
 		log.DebugContext(runCtx, "skipping stale work record", "err", err)
+		w.finish(span, metrics.OutcomeSkipped, nil)
 		return true
 	case errors.Is(err, errAbandoned):
 		log.InfoContext(runCtx, "work record left for the next owner", "err", err)
+		w.finish(span, metrics.OutcomeAbandoned, nil)
 		return false
 	case err != nil:
 		// Not an outage but a failing statement, which retrying cannot fix. The row stays queued;
 		// once this record is committed past, the reaper re-publishes it.
 		log.ErrorContext(runCtx, "claim failed", "err", err)
+		w.finish(span, metrics.OutcomeClaimFailed, err)
 		return true
 	}
+	span.SetAttributes(telemetry.AttrAttempt.Int(n.Attempts))
 	c := claimed{n: n, leaseEnd: claimStart.Add(w.opts.Lease)}
 	c.lease, _ = n.Lease()
 	base := context.WithoutCancel(runCtx)
@@ -86,7 +103,7 @@ func (w *Worker) process(runCtx context.Context, r record, adm admission) bool {
 	// flight failed), do not add to the provider's trouble: hand the attempt back (ADR-0005).
 	if w.circuit.revoked(adm) {
 		log.InfoContext(runCtx, "circuit breaker opened after the claim; releasing")
-		w.release(base, log, c, w.circuit.timeout, "circuit breaker open")
+		w.finish(span, w.release(base, log, c, w.circuit.timeout, "circuit breaker open"), nil)
 		return true
 	}
 
@@ -101,12 +118,13 @@ func (w *Worker) process(runCtx context.Context, r record, adm admission) bool {
 		if err != nil {
 			// No token, no send. Hand the attempt back; it is retried without consuming it.
 			log.WarnContext(runCtx, "no rate-limit token after claim; releasing", "err", err)
-			w.release(base, log, c, w.opts.Retry.BaseDelay, "no rate-limit token")
+			w.finish(span, w.release(base, log, c, w.opts.Retry.BaseDelay, "no rate-limit token"), nil)
 			return true
 		}
 	}
 
 	sctx, cancel := context.WithDeadline(base, sendDeadline)
+	sent := time.Now()
 	res, sendErr := w.sender.Send(sctx, provider.Message{
 		IdempotencyKey: n.ID.String(),
 		CorrelationID:  n.CorrelationID,
@@ -116,8 +134,47 @@ func (w *Worker) process(runCtx context.Context, r record, adm admission) bool {
 	})
 	cancel()
 	report(sendErr)
-	w.settle(base, log, c, res, sendErr)
+	class := provider.Classify(sendErr)
+	w.opts.Metrics.ProviderCall(w.channel, class.String(), time.Since(sent))
+	span.SetAttributes(attrProviderClass.String(class.String()))
+	w.finish(span, w.settle(base, log, c, res, sendErr), sendErr)
 	return true
+}
+
+// Span attributes of a delivery.
+const (
+	attrOutcome       = attribute.Key("notification.outcome")
+	attrProviderClass = attribute.Key("provider.class")
+	attrTries         = attribute.Key("db.tries")
+)
+
+// startSpan starts the consumer span of a work record as a child of the producer span in its
+// headers.
+func (w *Worker) startSpan(ctx context.Context, r record) (context.Context, trace.Span) {
+	return telemetry.Tracer().Start(telemetry.ExtractRecord(ctx, r.kr), "process "+r.kr.Topic,
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			semconv.MessagingSystemKafka,
+			semconv.MessagingOperationTypeProcess,
+			semconv.MessagingDestinationName(r.kr.Topic),
+			semconv.MessagingDestinationPartitionID(fmt.Sprint(r.kr.Partition)),
+			semconv.MessagingKafkaOffset(int(r.kr.Offset)),
+			telemetry.AttrNotificationID.String(r.msg.ID.String()),
+			telemetry.AttrChannel.String(string(r.msg.Channel)),
+			telemetry.AttrPriority.String(string(r.msg.Priority)),
+			telemetry.AttrCorrelationID.String(r.correlationID),
+		))
+}
+
+// finish records what happened to a record: the outcome counter and the span's outcome. A failed
+// send or claim marks the span as an error.
+func (w *Worker) finish(span trace.Span, o metrics.Outcome, err error) {
+	w.opts.Metrics.Outcome(w.channel, o)
+	span.SetAttributes(attrOutcome.String(string(o)))
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, string(o))
+	}
 }
 
 // claimed is a notification this worker holds a lease on.
@@ -130,15 +187,17 @@ type claimed struct {
 }
 
 // release hands a claimed notification back to retrying after delay without consuming the
-// attempt.
-func (w *Worker) release(ctx context.Context, log *slog.Logger, c claimed, delay time.Duration, reason string) {
+// attempt. It returns the outcome for the metrics.
+func (w *Worker) release(ctx context.Context, log *slog.Logger, c claimed, delay time.Duration, reason string) metrics.Outcome {
 	_, err := w.persist(ctx, c, func(ctx context.Context) error {
 		_, err := w.store.Release(ctx, c.lease, delay, reason)
 		return err
 	})
 	if err != nil {
 		log.ErrorContext(ctx, "release not persisted; the lease will expire and be retried", "err", err)
+		return metrics.OutcomeUnpersisted
 	}
+	return metrics.OutcomeReleased
 }
 
 // settle persists the outcome of a send (ADR-0005, FR-3.1–3.3):
@@ -149,7 +208,9 @@ func (w *Worker) release(ctx context.Context, log *slog.Logger, c claimed, delay
 //	                         the attempt, since the provider is healthy and only asks us to slow down
 //	retryable, budget left → retrying after the jittered backoff
 //	retryable, last        → failed + dead letter
-func (w *Worker) settle(ctx context.Context, log *slog.Logger, c claimed, res provider.Result, sendErr error) {
+//
+// It returns the outcome for the metrics.
+func (w *Worker) settle(ctx context.Context, log *slog.Logger, c claimed, res provider.Result, sendErr error) metrics.Outcome {
 	n := c.n
 	class := provider.Classify(sendErr)
 	var (
@@ -174,8 +235,7 @@ func (w *Worker) settle(ctx context.Context, log *slog.Logger, c claimed, res pr
 	case class == provider.ClassRateLimited:
 		delay := max(w.opts.Retry.Delay(n.Attempts), w.cooldown(ctx, sendErr))
 		log.WarnContext(ctx, "rate limited by the provider; releasing", "err", sendErr, "retry_in", delay)
-		w.release(ctx, log, c, delay, class.String()+": "+sendErr.Error())
-		return
+		return w.release(ctx, log, c, delay, class.String()+": "+sendErr.Error())
 	case w.opts.Retry.Exhausted(n.Attempts):
 		fail(fmt.Sprintf("attempts exhausted (%d), last %s: %s", n.Attempts, class, sendErr))
 		log.ErrorContext(ctx, "delivery failed; attempts exhausted", "err", sendErr, "class", class.String())
@@ -209,19 +269,34 @@ func (w *Worker) settle(ctx context.Context, log *slog.Logger, c claimed, res pr
 		if errors.Is(err, domain.ErrLeaseLost) {
 			// The lease expired and the row was reaped; the newer claim owns the outcome.
 			log.WarnContext(ctx, "outcome discarded: lease lost", "err", err)
-			return
+			return metrics.OutcomeUnpersisted
 		}
 		log.ErrorContext(ctx, "outcome not persisted; the lease will expire and be retried", "err", err)
-		return
+		return metrics.OutcomeUnpersisted
 	}
-	if target == domain.StatusFailed && w.opts.DeadLetters != nil {
+	switch target {
+	case domain.StatusSent:
+		// End to end: from when the notification was first due, across retries.
+		due := n.CreatedAt
+		if n.ScheduledAt != nil && n.ScheduledAt.After(due) {
+			due = *n.ScheduledAt
+		}
+		w.opts.Metrics.Delivered(n.Channel, n.Priority, time.Since(due))
+		return metrics.OutcomeSent
+	case domain.StatusRetrying:
+		return metrics.OutcomeRetrying
+	}
+	if w.opts.DeadLetters != nil {
 		// Best effort, after the commit: the failed row is the source of truth (ADR-0005).
 		dctx, cancel := context.WithTimeout(ctx, writeTimeout+outcomeReserve)
 		defer cancel()
-		if err := w.opts.DeadLetters.Publish(dctx, row); err != nil {
+		err := w.opts.DeadLetters.Publish(dctx, row)
+		w.opts.Metrics.DeadLetters(1, err)
+		if err != nil {
 			log.WarnContext(ctx, "dead letter not published", "err", err)
 		}
 	}
+	return metrics.OutcomeFailed
 }
 
 // isOurOutcome reports whether got is the outcome this worker wrote for its attempt. The reaper
@@ -268,32 +343,46 @@ var errAbandoned = errors.New("claim abandoned")
 // on shutdown or revoke; the record then stays below the watermark.
 //
 // It also returns when the successful try started, from which the caller bounds the lease.
-func (w *Worker) claimWithRetry(ctx context.Context, log *slog.Logger, r record) (domain.Notification, time.Time, error) {
+func (w *Worker) claimWithRetry(ctx context.Context, log *slog.Logger, r record) (n domain.Notification, start time.Time, err error) {
+	ctx, span := telemetry.Tracer().Start(ctx, "claim")
+	tries := 0
+	defer func() {
+		span.SetAttributes(attrTries.Int(tries))
+		if err != nil && !errors.Is(err, errStale) {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "claim failed")
+		}
+		span.End()
+	}()
 	backoff := claimBackoffMin
 	token := uuid.New() // the same token on every try makes a retried claim idempotent
 	for try := 1; ; try++ {
+		tries = try
+		if try > 1 {
+			w.opts.Metrics.DBRetry(w.channel, "claim")
+		}
 		// Each try runs to completion even on shutdown: abandoning a claim that committed would
 		// leave the row processing until its lease expires.
-		start := time.Now()
+		tryStart := time.Now()
 		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claimTimeout)
-		n, err := w.claim(cctx, r, token)
+		got, cerr := w.claim(cctx, r, token)
 		cancel()
-		if err == nil || !storage.IsTransient(err) {
-			if err == nil && try > 1 {
+		if cerr == nil || !storage.IsTransient(cerr) {
+			if cerr == nil && try > 1 {
 				log.InfoContext(ctx, "claim succeeded after database errors", "tries", try)
 			}
-			return n, start, err
+			return got, tryStart, cerr
 		}
 		switch {
 		case try == 1:
-			log.WarnContext(ctx, "database unavailable; retrying the claim", "err", err)
+			log.WarnContext(ctx, "database unavailable; retrying the claim", "err", cerr)
 		case try%30 == 0: // about every two minutes at the maximum backoff
-			log.ErrorContext(ctx, "database still unavailable; the claim keeps waiting", "err", err, "tries", try)
+			log.ErrorContext(ctx, "database still unavailable; the claim keeps waiting", "err", cerr, "tries", try)
 		}
 		// Wait in short steps, so a revoke does not wait out a long backoff.
 		for waited := time.Duration(0); waited < backoff; waited += claimBackoffMin {
 			if ctx.Err() != nil || w.tracker.gone(r.part) {
-				return domain.Notification{}, time.Time{}, errors.Join(errAbandoned, err)
+				return domain.Notification{}, time.Time{}, errors.Join(errAbandoned, cerr)
 			}
 			sleep(ctx, claimBackoffMin)
 		}
@@ -319,8 +408,19 @@ func (w *Worker) claim(ctx context.Context, r record, token uuid.UUID) (domain.N
 // budget. Other errors, such as guard failures (lease lost, invalid transition), are final.
 // ambiguous reports that an earlier try failed transiently and may have committed nonetheless.
 func (w *Worker) persist(ctx context.Context, c claimed, write func(context.Context) error) (ambiguous bool, err error) {
+	ctx, span := telemetry.Tracer().Start(ctx, "write outcome")
+	tries := 0
+	defer func() {
+		span.SetAttributes(attrTries.Int(tries))
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "outcome not written")
+		}
+		span.End()
+	}()
 	backoff := writeBackoffMin
 	for {
+		tries++
 		wctx, cancel := context.WithTimeout(ctx, writeTimeout)
 		err = write(wctx)
 		cancel()
@@ -328,6 +428,7 @@ func (w *Worker) persist(ctx context.Context, c claimed, write func(context.Cont
 			return ambiguous, err
 		}
 		ambiguous = true
+		w.opts.Metrics.DBRetry(w.channel, "outcome")
 		sleep(ctx, backoff)
 		backoff = min(backoff*2, writeBackoffMax)
 	}

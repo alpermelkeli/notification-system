@@ -10,6 +10,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kadm"
 
 	"github.com/alpermelkeli/notification-system/internal/domain"
+	"github.com/alpermelkeli/notification-system/internal/metrics"
 	"github.com/alpermelkeli/notification-system/internal/queue"
 	"github.com/alpermelkeli/notification-system/internal/storage"
 )
@@ -80,6 +81,8 @@ type ReaperOptions struct {
 	Limit int
 	// Channels whose work topics are checked. Default all.
 	Channels []domain.Channel
+	// Metrics counts recoveries and dead letters. Optional.
+	Metrics *metrics.Dispatch
 }
 
 // Reaper recovers notifications that would otherwise never be delivered (ADR-0003):
@@ -166,6 +169,12 @@ func (r *Reaper) RunOnce(ctx context.Context) (ReapReport, error) {
 	n, err := r.drain(ctx, func() (int, error) { return r.store.RequeueStuck(ctx, r.opts.StuckAfter, r.opts.Limit) })
 	rep.Stuck = n
 	errs = append(errs, err)
+
+	m := r.opts.Metrics
+	m.Reaped(metrics.ReapExpiredLease, rep.ExpiredLeases)
+	m.Reaped(metrics.ReapExhaustedLease, rep.ExhaustedLeases)
+	m.Reaped(metrics.ReapConsumed, rep.Consumed)
+	m.Reaped(metrics.ReapStuck, rep.Stuck)
 	return rep, errors.Join(errs...)
 }
 
@@ -175,7 +184,9 @@ func (r *Reaper) deadLetter(ctx context.Context, failed []domain.Notification) {
 	if len(failed) == 0 || r.dead == nil {
 		return
 	}
-	if err := r.dead.Publish(ctx, failed...); err != nil {
+	err := r.dead.Publish(ctx, failed...)
+	r.opts.Metrics.DeadLetters(len(failed), err)
+	if err != nil {
 		r.logger.Warn("dead letters not published", "count", len(failed), "err", err)
 	}
 }

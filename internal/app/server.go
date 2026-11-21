@@ -12,10 +12,12 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/alpermelkeli/notification-system/internal/health"
 	"github.com/alpermelkeli/notification-system/internal/httpx"
+	"github.com/alpermelkeli/notification-system/internal/metrics"
+	"github.com/alpermelkeli/notification-system/internal/telemetry"
 )
 
 const readinessTimeout = 2 * time.Second
@@ -28,14 +30,19 @@ const (
 )
 
 // baseRouter returns a router with the shared middleware chain and the health and metrics
-// endpoints mounted.
-func baseRouter(logger *slog.Logger, instance string, checks []health.Check) chi.Router {
+// endpoints mounted. reg is the role's metrics registry, served on /metrics; HTTP request
+// metrics are registered on it too and returned for the API's own counters.
+func baseRouter(logger *slog.Logger, instance string, checks []health.Check, reg *prometheus.Registry) (chi.Router, *metrics.HTTP) {
+	m := metrics.NewHTTP(reg)
 	r := chi.NewRouter()
-	// Order matters: the correlation ID must exist before anything logs, and the recoverer sits
+	// Order matters: the correlation ID must exist before anything logs or traces, the span
+	// before the request log (so the log line carries the trace id), and the recoverer sits
 	// inside the request logger so a recovered panic is logged as a 500.
 	r.Use(
 		httpx.CorrelationID,
 		httpx.InstanceID(instance),
+		telemetry.HTTPMiddleware(pathLiveness, pathReadiness, pathMetrics),
+		m.Middleware,
 		httpx.RequestLogger(logger, pathLiveness, pathReadiness, pathMetrics),
 		httpx.Recoverer(logger),
 	)
@@ -48,8 +55,8 @@ func baseRouter(logger *slog.Logger, instance string, checks []health.Check) chi
 
 	r.Get(pathLiveness, health.Liveness())
 	r.Get(pathReadiness, health.Readiness(logger, readinessTimeout, checks...))
-	r.Method(http.MethodGet, pathMetrics, promhttp.Handler())
-	return r
+	r.Method(http.MethodGet, pathMetrics, metrics.Handler(reg))
+	return r, m
 }
 
 // serveHTTP runs an HTTP server until ctx is cancelled, then shuts it down gracefully within

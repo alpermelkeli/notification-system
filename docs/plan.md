@@ -11,8 +11,8 @@ Living document. Update phase status as work lands. Time budget ≈ 12h of focus
 | 4 | API: create / batch / get / cancel / list + validation + OpenAPI | done |
 | 5 | Processing engine: dispatcher, Kafka topics, workers, capped-aging scheduler, rate limiter, provider client | done |
 | 6 | Delivery & retry: backoff, classification, DLQ, circuit breaker | done |
-| 7 | Observability: metrics endpoint, correlation IDs, tracing | next |
-| 8 | Bonus: scheduling, templates, WebSocket | |
+| 7 | Observability: metrics endpoint, correlation IDs, tracing | done |
+| 8 | Bonus: scheduling, templates, WebSocket | next |
 | 9 | Hardening: integration/e2e tests, load test vs capacity-planning numbers, `--scale` demo, README polish, final review | |
 
 ## Resolved decisions (Phase 1)
@@ -37,15 +37,16 @@ Living document. Update phase status as work lands. Time budget ≈ 12h of focus
 | Reaped lease at the attempt limit | The reaper fails it (with a dead letter) in the same statement instead of dispatching it again | [0005 amendment](adr/0005-delivery-retry-and-failure-handling.md) |
 | Breaker while open | Checked before the pick; records stay buffered and fetching pauses through backpressure, no attempts burned; sends claimed after the trip are released | [0005 amendment](adr/0005-delivery-retry-and-failure-handling.md) |
 | Claim during a PostgreSQL outage | Retried with backoff on transient errors so the watermark holds; abandoned below it on shutdown or revoke | [0005 amendment](adr/0005-delivery-retry-and-failure-handling.md) |
+| Observability | Per-role Prometheus registries; queue depth and consumer lag sampled by the dispatcher; the request's `traceparent` stored with the row and carried in Kafka headers, so one trace covers every attempt; trace ids in logs | [0009](adr/0009-observability.md) |
+| Readiness of multi-channel workers | `/readyz` checks every channel's Kafka client (`kafka-sms`, `kafka-email`, `kafka-push`) | [0009](adr/0009-observability.md) |
 
-## Phase 7 starting point
-Metrics (FR-4.1) should cover at least: queue depth (Kafka consumer lag per topic and the
-pending/retrying/queued row counts), sends by outcome class, provider latency, circuit breaker
-state per channel, dead letters published, reaper recoveries, and claim retries during database
-outages. These events are logged today (the breaker's state changes at WARN/INFO, the reaper's
-recoveries at WARN), so the metrics hook into the same places.
+## Phase 8 starting point
+Scheduled delivery (B-2) already works through `scheduledAt` and `next_attempt_at`; Phase 8 adds
+its tests and docs. Templates (B-3) and WebSocket status updates (B-4, fed by
+`notification.events`) are new. New code paths should record metrics and spans the way the worker
+does (ADR-0009).
 
 ## Open questions
 | Phase | Question | Notes |
 |-------|----------|-------|
-| 7 | Readiness of multi-channel workers | `/readyz` checks only the first channel's Kafka client. |
+| — | None open | |

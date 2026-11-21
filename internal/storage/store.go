@@ -62,7 +62,7 @@ type querier interface {
 var notificationColumns = []string{
 	"id", "created_at", "batch_id", "channel", "priority", "recipient", "content",
 	"status", "attempts", "next_attempt_at", "scheduled_at", "queued_at", "lease_until",
-	"lease_token", "sent_at", "provider_message_id", "last_error", "correlation_id", "updated_at",
+	"lease_token", "sent_at", "provider_message_id", "last_error", "correlation_id", "trace_parent", "updated_at",
 }
 
 // columns returns notificationColumns, each prefixed with "alias." when alias is not empty.
@@ -81,7 +81,7 @@ func scanNotification(row pgx.Row) (domain.Notification, error) {
 	err := row.Scan(
 		&n.ID, &n.CreatedAt, &n.BatchID, &channel, &priority, &n.Recipient, &n.Content,
 		&status, &n.Attempts, &n.NextAttemptAt, &n.ScheduledAt, &n.QueuedAt, &n.LeaseUntil,
-		&n.LeaseToken, &n.SentAt, &n.ProviderMessageID, &n.LastError, &n.CorrelationID, &n.UpdatedAt,
+		&n.LeaseToken, &n.SentAt, &n.ProviderMessageID, &n.LastError, &n.CorrelationID, &n.TraceParent, &n.UpdatedAt,
 	)
 	if err != nil {
 		return domain.Notification{}, err

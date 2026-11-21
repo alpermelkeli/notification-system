@@ -35,13 +35,21 @@ type NewNotification struct {
 	IdempotencyKey *IdempotencyKey
 }
 
+// Origin describes the request that creates notifications. It is stored with each row, so the
+// dispatcher and the workers can tie their logs and spans back to the request (FR-4.2, B-5).
+type Origin struct {
+	CorrelationID string
+	// TraceParent is the W3C traceparent of the request's span, or "".
+	TraceParent string
+}
+
 // CreateNotification stores a pending notification and its first history row, and wakes the
 // dispatcher if it is due now (FR-1.1, ADR-0003).
 //
 // With an idempotency key that was already used for the same request, it returns the original
 // notification and created=false. If the key was used for a different request, it returns
 // domain.ErrIdempotencyKeyReused.
-func (s *Store) CreateNotification(ctx context.Context, in NewNotification, correlationID string) (n domain.Notification, created bool, err error) {
+func (s *Store) CreateNotification(ctx context.Context, in NewNotification, origin Origin) (n domain.Notification, created bool, err error) {
 	id := domain.NewIDAt(s.now())
 	createdAt := domain.IDTime(id)
 
@@ -59,7 +67,7 @@ func (s *Store) CreateNotification(ctx context.Context, in NewNotification, corr
 				return err
 			}
 		}
-		rows, err := insertNotifications(ctx, tx, []uuid.UUID{id}, createdAt, nil, []NewNotification{in}, correlationID)
+		rows, err := insertNotifications(ctx, tx, []uuid.UUID{id}, createdAt, nil, []NewNotification{in}, origin)
 		if err != nil {
 			return err
 		}
@@ -115,7 +123,7 @@ type BatchResult struct {
 // CreateBatch stores up to MaxBatchSize notifications in one transaction with one multi-row
 // INSERT (FR-1.2). All items share the batch's created_at, so they land in one partition and
 // batch queries are pruned to it; their ids sort in request order.
-func (s *Store) CreateBatch(ctx context.Context, in NewBatch, correlationID string) (BatchResult, error) {
+func (s *Store) CreateBatch(ctx context.Context, in NewBatch, origin Origin) (BatchResult, error) {
 	if err := validateBatch(in); err != nil {
 		return BatchResult{}, err
 	}
@@ -175,14 +183,14 @@ func (s *Store) CreateBatch(ctx context.Context, in NewBatch, correlationID stri
 			dueNow = dueNow || isDueNow(item, s.now())
 		}
 
-		res.Batch = domain.Batch{ID: batchID, CreatedAt: createdAt, Total: len(newItems), CorrelationID: correlationID}
+		res.Batch = domain.Batch{ID: batchID, CreatedAt: createdAt, Total: len(newItems), CorrelationID: origin.CorrelationID}
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO batches (id, created_at, total, correlation_id) VALUES ($1, $2, $3, $4)`,
-			batchID, createdAt, len(newItems), correlationID); err != nil {
+			batchID, createdAt, len(newItems), origin.CorrelationID); err != nil {
 			return fmt.Errorf("insert batch: %w", err)
 		}
 		if len(newItems) > 0 {
-			rows, err := insertNotifications(ctx, tx, newIDs, createdAt, &batchID, newItems, correlationID)
+			rows, err := insertNotifications(ctx, tx, newIDs, createdAt, &batchID, newItems, origin)
 			if err != nil {
 				return err
 			}
@@ -228,7 +236,7 @@ func validateBatch(in NewBatch) error {
 
 // insertNotifications inserts rows (all with the same created_at) and their "created" history
 // rows in one statement, and returns them in the order of ids.
-func insertNotifications(ctx context.Context, q querier, ids []uuid.UUID, createdAt time.Time, batchID *uuid.UUID, items []NewNotification, correlationID string) ([]domain.Notification, error) {
+func insertNotifications(ctx context.Context, q querier, ids []uuid.UUID, createdAt time.Time, batchID *uuid.UUID, items []NewNotification, origin Origin) ([]domain.Notification, error) {
 	n := len(items)
 	channels, priorities := make([]string, n), make([]string, n)
 	recipients, contents := make([]string, n), make([]string, n)
@@ -242,9 +250,9 @@ func insertNotifications(ctx context.Context, q querier, ids []uuid.UUID, create
 WITH ins AS (
     INSERT INTO notifications
            (id, created_at, batch_id, channel, priority, recipient, content,
-            next_attempt_at, scheduled_at, correlation_id)
+            next_attempt_at, scheduled_at, correlation_id, trace_parent)
     SELECT u.id, $2, $8, u.channel, u.priority, u.recipient, u.content,
-           COALESCE(u.scheduled_at, now()), u.scheduled_at, $9
+           COALESCE(u.scheduled_at, now()), u.scheduled_at, $9, $10
       FROM unnest($1::uuid[], $3::text[], $4::text[], $5::text[], $6::text[], $7::timestamptz[])
            AS u(id, channel, priority, recipient, content, scheduled_at)
  RETURNING `+columns("")+`
@@ -254,7 +262,7 @@ WITH ins AS (
     SELECT id, created_at, NULL, status, attempts, 'created' FROM ins
 )
 SELECT `+columns("")+` FROM ins`,
-		ids, createdAt, channels, priorities, recipients, contents, scheduled, batchID, correlationID)
+		ids, createdAt, channels, priorities, recipients, contents, scheduled, batchID, origin.CorrelationID, origin.TraceParent)
 	if err != nil {
 		return nil, fmt.Errorf("insert notifications: %w", err)
 	}

@@ -63,6 +63,17 @@ type Config struct {
 	Dispatcher Dispatcher
 	// Worker configures delivery (role: worker).
 	Worker Worker
+	// Tracing configures OpenTelemetry tracing (B-5, ADR-0009).
+	Tracing Tracing
+}
+
+// Tracing configures span export over OTLP/HTTP.
+type Tracing struct {
+	// Endpoint is the base URL of the OTLP/HTTP collector (e.g. http://jaeger:4318); empty
+	// disables tracing.
+	Endpoint string
+	// SampleRatio is the share of new traces recorded, 0 to 1.
+	SampleRatio float64
 }
 
 // Retry configures exponential backoff with equal jitter (ADR-0005, FR-3.1).
@@ -87,6 +98,8 @@ type Dispatcher struct {
 	ReaperGrace time.Duration
 	// ReaperStuckAfter is the age fallback for queued rows.
 	ReaperStuckAfter time.Duration
+	// DepthInterval is how often the queue depth metrics are sampled (FR-4.1).
+	DepthInterval time.Duration
 }
 
 // Worker configures the worker role (ADR-0002, ADR-0005, ADR-0006).
@@ -174,6 +187,7 @@ func load(lookup lookupFunc) (Config, error) {
 			ReaperInterval:   p.duration("REAPER_INTERVAL", 30*time.Second),
 			ReaperGrace:      p.duration("REAPER_GRACE", time.Minute),
 			ReaperStuckAfter: p.duration("REAPER_STUCK_AFTER", 24*time.Hour),
+			DepthInterval:    p.duration("QUEUE_METRICS_INTERVAL", 15*time.Second),
 		},
 		Worker: Worker{
 			Channels:        p.channels("WORKER_CHANNELS"),
@@ -196,6 +210,10 @@ func load(lookup lookupFunc) (Config, error) {
 			},
 			AgingRate:     p.float("SCHEDULER_AGING_RATE", 2, 0, 1000),
 			MinShareEvery: p.integer("SCHEDULER_MIN_SHARE", 10, 0, 1000),
+		},
+		Tracing: Tracing{
+			Endpoint:    p.optionalURL("OTEL_EXPORTER_OTLP_ENDPOINT"),
+			SampleRatio: p.float("TRACE_SAMPLE_RATIO", 1, 0, 1),
 		},
 	}
 
@@ -311,6 +329,14 @@ func (p *parser) url(key, def string) string {
 		return def
 	}
 	return v
+}
+
+// optionalURL is url without a default: unset or blank yields "".
+func (p *parser) optionalURL(key string) string {
+	if _, ok := p.raw(key); !ok {
+		return ""
+	}
+	return p.url(key, "")
 }
 
 // channels parses a channel list; the default is every channel.

@@ -73,8 +73,8 @@ up-scaled: ## Start the stack with 3 API and 3 worker replicas (ADR-0008)
 	docker compose up -d --build --scale api=3 --scale worker=3
 
 .PHONY: infra
-infra: ## Start only infrastructure (postgres + migrations, kafka, redis, mock provider)
-	docker compose up -d --build postgres migrate kafka kafka-init redis mockprovider
+infra: ## Start only infrastructure (postgres + migrations, kafka, redis, mock provider, jaeger)
+	docker compose up -d --build postgres migrate kafka kafka-init redis mockprovider jaeger
 
 .PHONY: down
 down: ## Stop the stack (keeps volumes)

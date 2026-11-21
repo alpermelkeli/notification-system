@@ -17,7 +17,14 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/alpermelkeli/notification-system/internal/domain"
+	"github.com/alpermelkeli/notification-system/internal/telemetry"
 )
 
 // Request headers sent with every delivery.
@@ -102,7 +109,25 @@ type responseBody struct {
 
 // Send delivers m. It returns *Error for a non-2xx answer and a wrapped transport error (timeout,
 // connection refused, ...) when no answer arrived.
-func (c *Client) Send(ctx context.Context, m Message) (Result, error) {
+//
+// Each call gets a client span and sends its traceparent (B-5). The span names only the provider
+// host: the URL path is a credential (the webhook.site inbox id), so it never reaches traces,
+// logs or last_error.
+func (c *Client) Send(ctx context.Context, m Message) (res Result, err error) {
+	ctx, span := telemetry.Tracer().Start(ctx, "POST "+c.name, trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(semconv.HTTPRequestMethodPost, semconv.ServerAddress(c.name)))
+	defer func() {
+		var pe *Error
+		switch {
+		case errors.As(err, &pe):
+			span.SetStatus(codes.Error, http.StatusText(pe.StatusCode))
+		case err != nil:
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "no answer")
+		}
+		span.End()
+	}()
+
 	body, err := json.Marshal(requestBody{To: m.To, Channel: m.Channel, Content: m.Content})
 	if err != nil {
 		return Result{}, fmt.Errorf("encode provider request: %w", err)
@@ -119,12 +144,19 @@ func (c *Client) Send(ctx context.Context, m Message) (Result, error) {
 	if m.CorrelationID != "" {
 		req.Header.Set(HeaderCorrelationID, m.CorrelationID)
 	}
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return Result{}, fmt.Errorf("call provider: %w", err)
+		// *url.Error quotes the full URL; keep only its cause.
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			err = ue.Err
+		}
+		return Result{}, fmt.Errorf("call provider %s: %w", c.name, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	span.SetAttributes(semconv.HTTPResponseStatusCode(resp.StatusCode))
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 	if err != nil {
 		return Result{}, fmt.Errorf("read provider response: %w", err)

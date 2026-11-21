@@ -25,6 +25,7 @@ import (
 
 	"github.com/alpermelkeli/notification-system/internal/domain"
 	"github.com/alpermelkeli/notification-system/internal/logging"
+	"github.com/alpermelkeli/notification-system/internal/metrics"
 	"github.com/alpermelkeli/notification-system/internal/provider"
 	"github.com/alpermelkeli/notification-system/internal/queue"
 	"github.com/alpermelkeli/notification-system/internal/retry"
@@ -81,6 +82,8 @@ type Options struct {
 	Breaker BreakerOptions
 	// Policy is the priority policy. Default DefaultPolicy().
 	Policy *Policy
+	// Metrics records delivery metrics (FR-4.1). Optional.
+	Metrics *metrics.Delivery
 	// Now returns the current time. Default time.Now.
 	Now func() time.Time
 }
@@ -153,11 +156,14 @@ type Worker struct {
 func New(c domain.Channel, store Store, sender Sender, limiter Limiter, logger *slog.Logger, opts Options) *Worker {
 	opts.defaults()
 	logger = logger.With("channel", string(c))
+	opts.Metrics.BreakerState(c, metrics.BreakerClosed, "")
 	return &Worker{
 		channel: c, store: store, sender: sender, limiter: limiter, logger: logger, opts: opts,
 		sched: newScheduler(*opts.Policy), paused: map[domain.Priority]bool{},
 		ready: make(chan struct{}, 1), tracker: newTracker(),
-		circuit: newCircuit("provider-"+string(c), opts.Breaker, logger),
+		circuit: newCircuit("provider-"+string(c), opts.Breaker, logger, func(state int, to string) {
+			opts.Metrics.BreakerState(c, state, to)
+		}),
 	}
 }
 
@@ -256,6 +262,7 @@ func (w *Worker) enqueue(kr *kgo.Record) {
 		w.paused[msg.Priority] = true
 		w.fetch.PauseFetchTopics(kr.Topic)
 	}
+	w.opts.Metrics.Buffered(w.channel, msg.Priority, n)
 	w.mu.Unlock()
 
 	select {
@@ -265,8 +272,10 @@ func (w *Worker) enqueue(kr *kgo.Record) {
 }
 
 // resumeIfDrained resumes fetching a paused priority whose buffer fell below the low-water mark.
-// Callers hold w.mu.
+// It is called whenever records leave a buffer, so it also updates the buffer gauge. Callers hold
+// w.mu.
 func (w *Worker) resumeIfDrained(pr domain.Priority) {
+	w.opts.Metrics.Buffered(w.channel, pr, w.sched.len(pr))
 	if w.paused[pr] && w.sched.len(pr) < w.opts.LowWater {
 		w.paused[pr] = false
 		w.fetch.ResumeFetchTopics(queue.Topic(w.channel, pr))
@@ -317,6 +326,7 @@ func (w *Worker) schedule(ctx context.Context) {
 		}
 
 		it.rec.tokenAt = time.Now()
+		w.opts.Metrics.Picked(w.channel, pr, it.rec.tokenAt.Sub(it.dueAt))
 		w.tracker.start(it.rec.part)
 		w.inFlight.Add(1)
 		go func(r record) {

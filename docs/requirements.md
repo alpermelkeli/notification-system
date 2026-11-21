@@ -42,8 +42,8 @@ Left open by the brief ("thinking and design by candidate"). Our design must be 
 ### FR-4 Observability
 | ID | Requirement | Status | Where |
 |----|-------------|--------|-------|
-| FR-4.1 | Real-time metrics endpoint: queue depth, success/failure rates, latency | [ ] | |
-| FR-4.2 | Structured logging with correlation IDs | [~] | `internal/logging`, `internal/httpx/middleware.go`, Kafka `correlation_id` header → worker logs and provider `X-Correlation-ID` (metrics/tracing in Phase 7) |
+| FR-4.1 | Real-time metrics endpoint: queue depth, success/failure rates, latency | [x] | `/metrics` on every role (`internal/metrics`); queue depth and consumer lag sampled by `internal/dispatcher/depth.go`; delivery outcomes, provider and end-to-end latency in `internal/worker` |
+| FR-4.2 | Structured logging with correlation IDs | [x] | `internal/logging` (`correlation_id`, `trace_id`, `span_id`), `internal/httpx/middleware.go`, Kafka `correlation_id` header → worker logs and provider `X-Correlation-ID` |
 | FR-4.3 | Health check endpoint | [x] | `internal/health`, `/healthz` + `/readyz` on every role |
 
 ## External provider (webhook.site)
@@ -58,7 +58,7 @@ Left open by the brief ("thinking and design by candidate"). Our design must be 
 | B-2 | Scheduled notifications (future delivery) | [ ] |
 | B-3 | Template system with variable substitution | [ ] |
 | B-4 | WebSocket real-time status updates | [ ] |
-| B-5 | Distributed tracing | [ ] |
+| B-5 | Distributed tracing | [x] |
 | B-6 | GitHub Actions CI/CD (test + lint) | [x] |
 
 ## Deliverables

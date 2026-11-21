@@ -6,6 +6,7 @@ import (
 	"runtime/debug"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
 
@@ -123,4 +124,28 @@ func Recoverer(logger *slog.Logger) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// RoutePattern returns the chi route pattern that served r (e.g. /v1/notifications/{id}), or
+// "unmatched". Metrics and span names use it so ids do not explode their cardinality. Call it
+// after the router has served r, when the pattern is complete.
+func RoutePattern(r *http.Request) string {
+	if rctx := chi.RouteContext(r.Context()); rctx != nil {
+		if p := rctx.RoutePattern(); p != "" {
+			return p
+		}
+	}
+	return "unmatched"
+}
+
+// MethodLabel returns m if it is a standard HTTP method and "_OTHER" otherwise, as the
+// OpenTelemetry conventions do. net/http accepts any token as a method, so a client could
+// otherwise create a metric series or span name per request.
+func MethodLabel(m string) string {
+	switch m {
+	case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch,
+		http.MethodDelete, http.MethodConnect, http.MethodOptions, http.MethodTrace:
+		return m
+	}
+	return "_OTHER"
 }

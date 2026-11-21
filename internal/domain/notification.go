@@ -88,7 +88,9 @@ type Notification struct {
 	LastError         *string
 
 	CorrelationID string
-	UpdatedAt     time.Time
+	// TraceParent is the W3C traceparent of the creating request, or "" (B-5).
+	TraceParent string
+	UpdatedAt   time.Time
 }
 
 // Lease identifies one claim of a notification by a worker. Every outcome transition is guarded

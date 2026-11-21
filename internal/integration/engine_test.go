@@ -20,6 +20,12 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/alpermelkeli/notification-system/internal/dispatcher"
 	"github.com/alpermelkeli/notification-system/internal/domain"
@@ -135,12 +141,14 @@ type fakeProvider struct {
 	failAlways map[string]bool
 	reject     map[string]bool
 	down       bool
+	traces     map[string][]string // Idempotency-Key -> traceparent headers
 }
 
 func newFakeProvider() *fakeProvider {
 	return &fakeProvider{
 		calls: map[string]int{}, at: map[string][]time.Time{},
 		failOnce: map[string]bool{}, failAlways: map[string]bool{}, reject: map[string]bool{},
+		traces: map[string][]string{},
 	}
 }
 
@@ -171,6 +179,7 @@ func (p *fakeProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	p.times = append(p.times, now)
 	p.at[key] = append(p.at[key], now)
+	p.traces[key] = append(p.traces[key], r.Header.Get("traceparent"))
 	fail := p.down || p.failAlways[body.To] || (p.failOnce[body.To] && p.calls[key] == 1)
 	reject := p.reject[body.To]
 	p.mu.Unlock()
@@ -206,7 +215,7 @@ func startEngine(t *testing.T, store *storage.Store, providerURL string, workers
 		t.Fatal(err)
 	}
 	t.Cleanup(producer.Close)
-	relay := dispatcher.NewRelay(store, dispatcher.NewPublisher(producer).Publish, quiet,
+	relay := dispatcher.NewRelay(store, dispatcher.NewPublisher(producer, nil).Publish, quiet,
 		dispatcher.RelayOptions{PollInterval: 50 * time.Millisecond})
 	dead := queue.NewDeadLetters(producer, dispatcher.PublishTimeout)
 	reaper := dispatcher.NewReaper(store, dispatcher.NewKafkaOffsets(kadm.NewClient(producer)), dead, quiet,
@@ -281,7 +290,7 @@ func TestEngineDeliversEveryNotificationOnce(t *testing.T) {
 	// Cancelled before any dispatcher runs: it must never reach the provider.
 	cancelled, _, err := store.CreateNotification(ctx, storage.NewNotification{
 		Channel: domain.ChannelSMS, Priority: domain.PriorityNormal, Recipient: "+905559999999", Content: "x",
-	}, "")
+	}, storage.Origin{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,7 +310,7 @@ func TestEngineDeliversEveryNotificationOnce(t *testing.T) {
 		}
 		n, _, err := store.CreateNotification(ctx, storage.NewNotification{
 			Channel: domain.ChannelSMS, Priority: domain.Priorities[i%3], Recipient: recipient, Content: "hello",
-		}, "corr-e2e")
+		}, storage.Origin{CorrelationID: "corr-e2e"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -362,7 +371,7 @@ func TestReaperRecoversARecordConsumedWithoutClaim(t *testing.T) {
 	// Deliver one notification so the group commits an offset on its partition.
 	first, _, err := store.CreateNotification(ctx, storage.NewNotification{
 		Channel: domain.ChannelSMS, Priority: domain.PriorityHigh, Recipient: "+905551110000", Content: "a",
-	}, "")
+	}, storage.Origin{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -383,7 +392,7 @@ func TestReaperRecoversARecordConsumedWithoutClaim(t *testing.T) {
 	lost, _, err := store.CreateNotification(ctx, storage.NewNotification{
 		Channel: domain.ChannelSMS, Priority: domain.PriorityHigh, Recipient: "+905551110001", Content: "b",
 		ScheduledAt: ptr(time.Now().Add(time.Hour)), // not due, so the relay leaves it alone
-	}, "")
+	}, storage.Origin{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -428,7 +437,7 @@ func TestEngineFailsPermanentAndExhaustedDeliveries(t *testing.T) {
 	create := func(recipient string) domain.Notification {
 		n, _, err := store.CreateNotification(ctx, storage.NewNotification{
 			Channel: domain.ChannelSMS, Priority: domain.PriorityNormal, Recipient: recipient, Content: "x",
-		}, "corr-fail")
+		}, storage.Origin{CorrelationID: "corr-fail"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -491,7 +500,7 @@ func TestEngineBreakerHoldsDeliveriesDuringAnOutage(t *testing.T) {
 	for i := range 20 {
 		n, _, err := store.CreateNotification(ctx, storage.NewNotification{
 			Channel: domain.ChannelSMS, Priority: domain.PriorityHigh, Recipient: fmt.Sprintf("+90555333%04d", i), Content: "x",
-		}, "")
+		}, storage.Origin{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -595,3 +604,93 @@ func mustClient(t *testing.T) *kgo.Client {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// TestEngineTracesADeliveryAcrossRetries follows one notification through a failed and a
+// successful attempt (B-5): both dispatches continue the trace stored with the row, each delivery
+// continues its dispatch from the Kafka headers, and both provider calls carry the trace.
+func TestEngineTracesADeliveryAcrossRetries(t *testing.T) {
+	if pool == nil {
+		t.Skip("integration test: needs Docker (skipped with -short)")
+	}
+	rec := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+	prevProp := otel.GetTextMapPropagator()
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() {
+		otel.SetTracerProvider(noop.NewTracerProvider())
+		otel.SetTextMapPropagator(prevProp)
+		_ = tp.Shutdown(context.Background())
+	})
+
+	ctx := context.Background()
+	store := storage.New(pool, storage.Options{})
+	fp := newFakeProvider()
+	fp.failOnce["+905557770001"] = true
+	srv := httptest.NewServer(fp)
+	defer srv.Close()
+	startEngine(t, store, srv.URL, 1, 50)
+
+	const (
+		traceID      = "0af7651916cd43dd8448eb211c80319c"
+		requestSpan  = "b7ad6b7169203331"
+		storedParent = "00-" + traceID + "-" + requestSpan + "-01"
+	)
+	n, _, err := store.CreateNotification(ctx, storage.NewNotification{
+		Channel: domain.ChannelSMS, Priority: domain.PriorityNormal, Recipient: "+905557770001", Content: "traced",
+	}, storage.Origin{CorrelationID: "corr-trace", TraceParent: storedParent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 30*time.Second, "sent after a retry", func() bool { return status(t, store, n).Status == domain.StatusSent })
+	_ = tp.ForceFlush(ctx)
+
+	fp.mu.Lock()
+	headers := append([]string(nil), fp.traces[n.ID.String()]...)
+	fp.mu.Unlock()
+	if len(headers) != 2 {
+		t.Fatalf("provider saw %d calls, want 2", len(headers))
+	}
+	for i, h := range headers {
+		if len(h) != 55 || h[3:35] != traceID {
+			t.Errorf("call %d carried traceparent %q, want trace %s", i+1, h, traceID)
+		}
+	}
+
+	var publishes, processes []sdktrace.ReadOnlySpan
+	byID := map[string]sdktrace.ReadOnlySpan{}
+	for _, s := range rec.Ended() {
+		if s.SpanContext().TraceID().String() != traceID {
+			continue
+		}
+		byID[s.SpanContext().SpanID().String()] = s
+		switch s.Name() {
+		case "send " + queue.Topic(domain.ChannelSMS, domain.PriorityNormal):
+			publishes = append(publishes, s)
+		case "process " + queue.Topic(domain.ChannelSMS, domain.PriorityNormal):
+			processes = append(processes, s)
+		}
+	}
+	if len(publishes) != 2 || len(processes) != 2 {
+		t.Fatalf("%d publish and %d process spans in the trace, want 2 each", len(publishes), len(processes))
+	}
+	for _, p := range publishes {
+		if p.Parent().SpanID().String() != requestSpan {
+			t.Errorf("publish span's parent = %s, want the stored request span", p.Parent().SpanID())
+		}
+	}
+	outcomes := map[string]bool{}
+	for _, p := range processes {
+		if parent := byID[p.Parent().SpanID().String()]; parent == nil || parent.SpanKind() != trace.SpanKindProducer {
+			t.Errorf("process span's parent %s is not a publish span", p.Parent().SpanID())
+		}
+		for _, a := range p.Attributes() {
+			if a.Key == "notification.outcome" {
+				outcomes[a.Value.AsString()] = true
+			}
+		}
+	}
+	if !outcomes["retrying"] || !outcomes["sent"] {
+		t.Errorf("process outcomes = %v, want retrying and sent", outcomes)
+	}
+}

@@ -5,10 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/alpermelkeli/notification-system/internal/domain"
+	"github.com/alpermelkeli/notification-system/internal/metrics"
 	"github.com/alpermelkeli/notification-system/internal/storage"
 )
 
@@ -130,8 +134,9 @@ func TestReaperDeadLettersExhaustedLeases(t *testing.T) {
 	a, b := domain.Notification{ID: domain.NewIDAt(time.Now())}, domain.Notification{ID: domain.NewIDAt(time.Now())}
 	store := &fakeReaperStore{leases: []int{1, 0}, exhausted: [][]domain.Notification{{a}, {b}}}
 	dead := &fakeDeadLetters{err: errors.New("broker down")} // best effort: the run still succeeds
+	reg := metrics.NewRegistry()
 	r := NewReaper(store, fakeOffsets{}, dead, discard, ReaperOptions{
-		Limit: 2, MaxAttempts: 3, Channels: []domain.Channel{domain.ChannelSMS},
+		Limit: 2, MaxAttempts: 3, Channels: []domain.Channel{domain.ChannelSMS}, Metrics: metrics.NewDispatch(reg),
 	})
 	rep, err := r.RunOnce(context.Background())
 	if err != nil {
@@ -146,5 +151,18 @@ func TestReaperDeadLettersExhaustedLeases(t *testing.T) {
 	}
 	if len(dead.published) != 2 || dead.published[0].ID != a.ID || dead.published[1].ID != b.ID {
 		t.Errorf("dead letters = %+v", dead.published)
+	}
+	want := `
+# HELP notifier_dead_letters_total Dead letters of failed notifications, by publishing component and result (published, failed).
+# TYPE notifier_dead_letters_total counter
+notifier_dead_letters_total{result="failed",source="reaper"} 2
+# HELP notifier_reaper_recovered_total Notifications recovered by the reaper, by reason (expired_lease, exhausted_lease, consumed, stuck).
+# TYPE notifier_reaper_recovered_total counter
+notifier_reaper_recovered_total{reason="exhausted_lease"} 2
+notifier_reaper_recovered_total{reason="expired_lease"} 1
+`
+	if err := testutil.GatherAndCompare(reg, strings.NewReader(want),
+		"notifier_dead_letters_total", "notifier_reaper_recovered_total"); err != nil {
+		t.Error(err)
 	}
 }

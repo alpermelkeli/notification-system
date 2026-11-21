@@ -4,7 +4,8 @@
 #   docker compose up --build --scale api=3 --scale worker=3   # scaling demo (ADR-0008)
 #
 # Host ports: 8080 API (via lb); bound to 127.0.0.1 only: 8081 mock provider, 5432 PostgreSQL,
-# 9092 Kafka, 6379 Redis. Stop local PostgreSQL/Redis installs first if they use these ports.
+# 9092 Kafka, 6379 Redis, 16686 Jaeger UI, 4318 Jaeger OTLP, 9091 Prometheus UI. Stop local PostgreSQL/Redis installs
+# first if they use these ports.
 
 name: notification-system
 
@@ -28,6 +29,9 @@ x-app: &app
     REDIS_ADDR: redis:6379
     # Workers deliver to the local mock provider unless .env points PROVIDER_URL at webhook.site.
     PROVIDER_URL: ${PROVIDER_URL:-http://mockprovider:8081/}
+    # Spans go to Jaeger (B-5). If Jaeger is down, spans are dropped; delivery is unaffected.
+    OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT-http://jaeger:4318}
+    TRACE_SAMPLE_RATIO: ${TRACE_SAMPLE_RATIO:-1}
 
 services:
   # ---------------------------------------------------------------- infrastructure
@@ -87,6 +91,24 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+
+  # ---------------------------------------------------------------- observability (ADR-0009)
+  # Traces: OTLP/HTTP in on 4318 (published for `make run-*`), UI on http://localhost:16686.
+  # In-memory storage.
+  jaeger:
+    image: jaegertracing/jaeger:2.12.0
+    ports: ["127.0.0.1:16686:16686", "127.0.0.1:4318:4318"]
+    restart: unless-stopped
+
+  # Metrics: scrapes every replica's /metrics, UI on http://localhost:9091.
+  prometheus:
+    image: prom/prometheus:v3.7.3
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=1d
+    ports: ["127.0.0.1:9091:9090"]
+    volumes: [./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro]
+    restart: unless-stopped
 
   # Local stand-in for webhook.site, with fault injection (ADR-0006).
   mockprovider:

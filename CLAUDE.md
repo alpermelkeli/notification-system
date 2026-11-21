@@ -63,7 +63,9 @@ migrations/            goose SQL migrations, embedded (forward-only, never edite
 internal/api/          v1 HTTP handlers, request validation, error mapping, Swagger UI (/docs)
 api/                   openapi.yaml (spec-first contract, Redocly-linted) embedded as package apispec
 internal/config/       env -> typed Config (all errors reported at once)
-internal/logging/      slog JSON logger; correlation ID carried in context.Context
+internal/logging/      slog JSON logger; correlation ID carried in context.Context, trace/span ids added from it
+internal/metrics/      Prometheus metric sets per role (HTTP/API, dispatch + queue depth, delivery)
+internal/telemetry/    OpenTelemetry setup, HTTP server spans, traceparent in rows and Kafka headers
 internal/httpx/        error envelope, JSON helpers, middleware (correlation id, instance id, logging, recovery)
 internal/health/       /healthz (liveness) and /readyz (concurrent dependency checks)
 internal/platform/     lazy PostgreSQL / Kafka / Redis clients + readiness checks
@@ -76,6 +78,6 @@ internal/ratelimit/    reserving GCRA in Redis + fleet cool-down
 internal/provider/     HTTP client of the delivery provider, outcome classification
 internal/testinfra/    containers for integration tests (PostgreSQL, Kafka, Redis)
 internal/integration/  end-to-end engine tests (containers + httptest provider)
-deploy/                nginx LB config, Kafka topic creation script
+deploy/                nginx LB config, Kafka topic creation script, Prometheus scrape config
 docs/                  requirements, plan, conventions, ADRs, capacity planning, diagrams
 ```
