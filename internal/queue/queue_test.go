@@ -1,6 +1,8 @@
 package queue
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -85,5 +87,36 @@ func TestDecodeRejectsInconsistentRecords(t *testing.T) {
 		if _, err := Decode(rec); err == nil {
 			t.Errorf("%s: decoded without error", name)
 		}
+	}
+}
+
+func TestDeadLetterRecord(t *testing.T) {
+	id := domain.NewIDAt(time.Now())
+	batch := domain.NewIDAt(time.Now())
+	cause := "permanent: provider returned 400: bad recipient"
+	failedAt := time.Now().UTC().Truncate(time.Millisecond)
+	n := domain.Notification{
+		ID: id, CreatedAt: domain.IDTime(id), BatchID: &batch, Channel: domain.ChannelEmail,
+		Priority: domain.PriorityHigh, Recipient: "a@example.com", Content: "secret", Status: domain.StatusFailed,
+		Attempts: 1, LastError: &cause, CorrelationID: "corr-1", UpdatedAt: failedAt,
+	}
+	r, err := NewDeadLetter(n).Record()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Topic != DeadLetterTopic || string(r.Key) != id.String() || CorrelationID(r) != "corr-1" {
+		t.Fatalf("record = topic %s key %s headers %v", r.Topic, r.Key, r.Headers)
+	}
+	var got DeadLetter
+	if err := json.Unmarshal(r.Value, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != id || *got.BatchID != batch || got.Channel != domain.ChannelEmail || got.Priority != domain.PriorityHigh ||
+		got.Attempts != 1 || got.LastError != cause || !got.FailedAt.Equal(failedAt) {
+		t.Errorf("dead letter = %+v", got)
+	}
+	// Claim-check: no personal data on the topic.
+	if s := string(r.Value); strings.Contains(s, "a@example.com") || strings.Contains(s, "secret") {
+		t.Errorf("dead letter leaks the recipient or content: %s", s)
 	}
 }
