@@ -3,6 +3,7 @@ package queue
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/google/uuid"
@@ -47,9 +48,26 @@ func NewStatusEvent(n domain.Notification) StatusEvent {
 	}
 	switch n.Status {
 	case domain.StatusRetrying, domain.StatusFailed:
-		e.LastError = n.LastError
+		e.LastError = eventError(n.LastError)
 	}
 	return e
+}
+
+// providerAnswer ends the part of a last error that the event keeps.
+var providerAnswer = regexp.MustCompile(`provider returned \d{3}`)
+
+// eventError shortens a last error to its classification and status code: the provider's response
+// body that follows may echo the recipient, which events never carry (ADR-0011). The REST API
+// still shows the full error.
+func eventError(s *string) *string {
+	if s == nil {
+		return nil
+	}
+	if loc := providerAnswer.FindStringIndex(*s); loc != nil {
+		short := (*s)[:loc[1]]
+		return &short
+	}
+	return s
 }
 
 // Record encodes e as a record on EventsTopic, keyed by the notification id so a notification's

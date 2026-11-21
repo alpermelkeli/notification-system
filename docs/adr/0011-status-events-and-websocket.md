@@ -67,7 +67,8 @@ state:
 ```
 
 `at` is the row's `updated_at`, the database time of the transition. Events never carry the
-recipient or the content.
+recipient or the content. `lastError` is cut after the provider's status code, because the
+response body that follows may echo the recipient; the REST API shows the full error.
 
 **Publishing:** `internal/events.Publisher` uses franz-go's `TryProduce`.
 - When the client's buffer is full, the record is dropped instead of blocking. A record that is

@@ -15,7 +15,7 @@ func TestStatusEventRoundTrip(t *testing.T) {
 	now := time.Date(2026, 11, 21, 15, 4, 5, 123456000, time.UTC)
 	id := domain.NewIDAt(now)
 	batch := domain.NewIDAt(now)
-	cause := "server_error: provider returned 503"
+	cause := "retryable: provider returned 503: invalid recipient +905551234567"
 	n := domain.Notification{
 		ID: id, CreatedAt: domain.IDTime(id), BatchID: &batch, Channel: domain.ChannelSMS, Priority: domain.PriorityHigh,
 		Recipient: "+905551234567", Content: "secret code 482913", Status: domain.StatusRetrying, Attempts: 2,
@@ -46,7 +46,7 @@ func TestStatusEventRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if e.NotificationID != id || *e.BatchID != batch || e.Status != domain.StatusRetrying || e.Attempts != 2 ||
-		!e.At.Equal(now) || !e.NextAttemptAt.Equal(n.NextAttemptAt) || *e.LastError != cause {
+		!e.At.Equal(now) || !e.NextAttemptAt.Equal(n.NextAttemptAt) || *e.LastError != "retryable: provider returned 503" {
 		t.Errorf("decoded %+v", e)
 	}
 }
