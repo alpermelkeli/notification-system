@@ -5,20 +5,23 @@ Living document. Update phase status as work lands. Time budget ≈ 12h of focus
 | Phase | Scope | Status |
 |-------|-------|--------|
 | 0 | Repo bootstrap: README, CLAUDE.md, docs, Claude subagents | done |
-| 1 | Architecture decisions (ADRs 0001..n): stack, queue, storage, retry, rate limit, idempotency | next |
-| 2 | Skeleton: Go module, layout, config, logging, health, docker-compose, Makefile, CI | |
+| 1 | Architecture decisions (ADRs 0001–0007) + architecture diagram | done |
+| 2 | Skeleton: Go module, layout, config, logging, health, docker-compose (postgres, kafka, redis, mock provider), Makefile, CI | next |
 | 3 | Domain + persistence: model, state machine, migrations, repository | |
 | 4 | API: create / batch / get / cancel / list + validation + OpenAPI | |
-| 5 | Processing engine: priority queues, workers, rate limiter, idempotency, provider client | |
+| 5 | Processing engine: dispatcher, Kafka topics, workers, capped-aging scheduler, rate limiter, provider client | |
 | 6 | Delivery & retry: backoff, classification, DLQ, circuit breaker | |
 | 7 | Observability: metrics endpoint, correlation IDs, tracing | |
 | 8 | Bonus: scheduling, templates, WebSocket | |
 | 9 | Hardening: integration/e2e tests, load sanity check, README polish, final review | |
 
-## Open questions (to resolve in Phase 1)
-- Queue/broker: Redis (streams / sorted sets), RabbitMQ, Kafka, or Postgres-as-queue (`SKIP LOCKED`)?
-- Storage: PostgreSQL (assumed) — confirm.
-- Rate limiter scope: per channel global (distributed, Redis) vs. per process.
-- Idempotency: client `Idempotency-Key` header + DB unique constraint? provider-side dedupe?
-- Deployment shape: single binary with `api` / `worker` modes vs. separate services.
-- HTTP framework: stdlib `net/http` (Go 1.22+ routing) vs. chi / gin / echo.
+## Resolved decisions (Phase 1)
+| Question | Decision | ADR |
+|----------|----------|-----|
+| Queue / broker | PostgreSQL (state + timing) + Kafka (distribution + events) | [0001](adr/0001-architecture-overview.md) |
+| Topics & consumers | 9 channel × priority topics, classic consumer groups, franz-go | [0002](adr/0002-kafka-topology-and-consumer-model.md) |
+| Dual write | Notifications table is the outbox, FIFO dispatcher + reaper | [0003](adr/0003-dispatch-without-separate-outbox.md) |
+| Idempotency | Idempotency-Key + request hash, guarded claim, provider header | [0004](adr/0004-idempotency.md) |
+| Retry / DLQ | Out-of-band backoff + jitter, classification, DLQ topic, circuit breaker | [0005](adr/0005-delivery-retry-and-failure-handling.md) |
+| Rate limit & priority | Redis GCRA per channel/provider, 429 cool-down, capped-aging scheduler | [0006](adr/0006-rate-limiting-and-priority-scheduling.md) |
+| Stack & deployment | Go 1.25, chi, pgx, goose; one binary: api / dispatcher / worker / migrate | [0007](adr/0007-technology-stack.md) |
