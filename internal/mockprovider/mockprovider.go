@@ -2,7 +2,8 @@
 //
 // It speaks the provider contract from the assessment brief
 // (POST {to, channel, content} -> 202 {messageId, status, timestamp}) and can inject latency,
-// 5xx failures and 429 rate limiting, so retries, the circuit breaker and the rate limiter can be
+// 5xx failures, permanent 400 rejections and 429 rate limiting, so retries, dead letters, the
+// circuit breaker and the rate limiter can be
 // exercised locally and in load tests without calling the real webhook.site (ADR-0006).
 package mockprovider
 
@@ -27,6 +28,9 @@ type Config struct {
 	FailureRate float64
 	// RateLimitRate is the probability (0..1) of answering 429 with Retry-After.
 	RateLimitRate float64
+	// PermanentFailureRate is the probability (0..1) of answering 400, a failure the worker must
+	// not retry (ADR-0005).
+	PermanentFailureRate float64
 	// RetryAfter is the Retry-After value sent with 429 responses.
 	RetryAfter time.Duration
 }
@@ -135,6 +139,10 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	case roll < s.cfg.RateLimitRate+s.cfg.FailureRate:
 		s.record(req.Channel, "failed", false)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "simulated provider failure"})
+		return
+	case roll < s.cfg.RateLimitRate+s.cfg.FailureRate+s.cfg.PermanentFailureRate:
+		s.record(req.Channel, "rejected", false)
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "simulated permanent rejection"})
 		return
 	}
 

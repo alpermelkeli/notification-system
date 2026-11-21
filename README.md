@@ -291,6 +291,7 @@ stop the process with a message listing every problem. Copy [`.env.example`](.en
 | `MOCK_LATENCY` / `MOCK_LATENCY_JITTER` | `50ms` / `100ms` | mockprovider | Simulated latency: base + uniform `[0, jitter)` |
 | `MOCK_FAILURE_RATE` | `0` | mockprovider | Probability of HTTP 500 |
 | `MOCK_RATE_LIMIT_RATE` | `0` | mockprovider | Probability of HTTP 429 with `Retry-After` |
+| `MOCK_PERMANENT_RATE` | `0` | mockprovider | Probability of HTTP 400 (a permanent failure: not retried, dead-lettered) |
 | `MOCK_RETRY_AFTER` | `1s` | mockprovider | `Retry-After` value for 429 |
 
 ## Testing
