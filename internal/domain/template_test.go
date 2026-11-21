@@ -60,9 +60,18 @@ func TestValidateTemplateBodyLimits(t *testing.T) {
 	if _, err := ValidateTemplateBody(ChannelEmail, many.String()); err == nil || !strings.Contains(err.Error(), "more than 50") {
 		t.Errorf("51 variables: got %v", err)
 	}
-	// The body as written must fit the channel: 1531 GSM-7 characters need 11 segments.
+	// The body must fit the channel: 1531 GSM-7 characters need 11 segments.
 	if _, err := ValidateTemplateBody(ChannelSMS, strings.Repeat("x", 1531)); err == nil || !strings.Contains(err.Error(), "SMS segments") {
 		t.Errorf("oversized SMS body: got %v", err)
+	}
+	// A placeholder counts as one character, not as four extension characters: 1529 characters
+	// plus one placeholder fit in 10 segments.
+	if _, err := ValidateTemplateBody(ChannelSMS, strings.Repeat("x", 1529)+"{{v}}"); err != nil {
+		t.Errorf("a body at the limit with a placeholder: %v", err)
+	}
+	// A body that is only a placeholder is not empty.
+	if _, err := ValidateTemplateBody(ChannelPush, "{{message}}"); err != nil {
+		t.Errorf("placeholder-only body: %v", err)
 	}
 }
 

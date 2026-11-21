@@ -45,8 +45,9 @@ Constraints from earlier decisions:
   - Placeholders are `{{ name }}`, where the name matches `[A-Za-z_][A-Za-z0-9_]{0,63}`; spaces
     inside the braces are allowed.
   - A body has at most 50 distinct variables.
-  - The body must pass the channel's content rules as written. This catches an oversized body
-    early; the rendered text is checked again.
+  - The body must pass the channel's content rules, with each placeholder counted as one
+    character (`{` and `}` are GSM-7 extension characters and would overcount). This catches an
+    oversized body early; the rendered text is checked again.
   - The channel cannot change, because the body was validated for it.
   - Updates replace the name and body. Old versions are not kept, because no notification needs
     them: each one stores its rendered text.

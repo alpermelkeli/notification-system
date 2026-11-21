@@ -48,14 +48,26 @@ func ValidateTemplateName(name string) error {
 }
 
 // ValidateTemplateBody checks a template body for ch: its placeholders must be well formed and
-// the body as written must pass the channel's content rules. It returns the variables in order of
+// the body, with each placeholder counted as one character, must pass the channel's content
+// rules. It returns the variables in order of
 // first use.
 func ValidateTemplateBody(ch Channel, body string) ([]string, error) {
 	segs, err := parseTemplate(body)
 	if err != nil {
 		return nil, err
 	}
-	if err := ValidateContent(ch, body); err != nil {
+	// Check the text with each placeholder as one character: "{" and "}" are GSM-7 extension
+	// characters that cost two septets each, so the body as written would overcount. The rendered
+	// text is checked again at creation.
+	var b strings.Builder
+	for _, s := range segs {
+		if s.variable {
+			b.WriteByte('x')
+		} else {
+			b.WriteString(s.text)
+		}
+	}
+	if err := ValidateContent(ch, b.String()); err != nil {
 		return nil, err
 	}
 	return variablesOf(segs), nil
