@@ -6,8 +6,8 @@ Living document. Update phase status as work lands. Time budget ≈ 12h of focus
 |-------|-------|--------|
 | 0 | Repo bootstrap: README, CLAUDE.md, docs, Claude subagents | done |
 | 1 | Architecture decisions (ADRs 0001–0008), capacity planning, architecture + deployment diagrams | done |
-| 2 | Skeleton: Go module, layout, config, logging, health, docker-compose (postgres, kafka, redis, nginx lb, mock provider), Makefile, CI | next |
-| 3 | Domain + persistence: model, state machine, migrations (daily partitions, partial index, fillfactor, idempotency_keys), repository | |
+| 2 | Skeleton: Go module, layout, config, logging, health, docker-compose (postgres, kafka, redis, nginx lb, mock provider), Makefile, CI | done |
+| 3 | Domain + persistence: model, state machine, migrations (daily partitions, partial index, fillfactor, idempotency_keys), `notifier migrate` + compose migrate job, repository | next |
 | 4 | API: create / batch / get / cancel / list + validation + OpenAPI | |
 | 5 | Processing engine: dispatcher, Kafka topics, workers, capped-aging scheduler, rate limiter, provider client | |
 | 6 | Delivery & retry: backoff, classification, DLQ, circuit breaker | |
