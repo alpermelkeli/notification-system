@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/alpermelkeli/notification-system/internal/api"
 	"github.com/alpermelkeli/notification-system/internal/config"
 	"github.com/alpermelkeli/notification-system/internal/health"
 	"github.com/alpermelkeli/notification-system/internal/platform"
@@ -54,7 +55,10 @@ func RunAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	defer pool.Close()
 
 	router := baseRouter(logger, cfg.InstanceID, []health.Check{platform.PostgresCheck(pool)})
-	// The /v1 notification endpoints are mounted here in Phase 4.
+	store := storage.New(pool, storage.Options{IdempotencyTTL: cfg.IdempotencyTTL})
+	api.New(store, logger, api.Options{
+		MaxScheduleAhead: cfg.MaxScheduleAhead, RequestTimeout: cfg.RequestTimeout,
+	}).Routes(router)
 
 	return serveHTTP(ctx, logger, cfg.HTTPAddr, router, cfg.ShutdownTimeout)
 }
