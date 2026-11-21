@@ -35,6 +35,11 @@ func NewBatchItemID(t time.Time, seq int) uuid.UUID {
 	return u
 }
 
+// BatchSeq returns the sequence number NewBatchItemID stored in id.
+func BatchSeq(id uuid.UUID) int {
+	return int(id[6]&0x0f)<<8 | int(id[7])
+}
+
 func newV7(t time.Time) uuid.UUID {
 	var u uuid.UUID
 	_, _ = rand.Read(u[6:]) // crypto/rand.Read never returns an error (Go 1.24+)

@@ -280,11 +280,24 @@ func TestCreateBatchIdempotency(t *testing.T) {
 
 	// Replaying the batch key returns the original batch and creates nothing.
 	replay, err := s.CreateBatch(ctx, batch, "")
-	if err != nil || replay.Created || replay.Batch.ID != res.Batch.ID || len(replay.Items) != 2 {
+	if err != nil || replay.Created || replay.Batch.ID != res.Batch.ID || len(replay.Items) != 3 {
 		t.Fatalf("replay: created=%v id=%s items=%d err=%v", replay.Created, replay.Batch.ID, len(replay.Items), err)
 	}
-	if replay.Items[0].Notification.ID != res.Items[0].Notification.ID {
-		t.Error("replayed items are not in request order")
+	// The replay reproduces the original response position by position, duplicates included.
+	for i := range res.Items {
+		if replay.Items[i].Notification.ID != res.Items[i].Notification.ID || replay.Items[i].Duplicate != res.Items[i].Duplicate {
+			t.Errorf("replay item %d = %s (dup %v), want %s (dup %v)", i, replay.Items[i].Notification.ID,
+				replay.Items[i].Duplicate, res.Items[i].Notification.ID, res.Items[i].Duplicate)
+		}
+	}
+
+	// An item key reused with different content fails the batch and names the item.
+	conflicting := sms("different content")
+	conflicting.IdempotencyKey = key("item-a", "different content")
+	var ie *ItemError
+	if _, err := s.CreateBatch(ctx, NewBatch{Items: []NewNotification{sms("ok"), conflicting}}, ""); !errors.As(err, &ie) ||
+		ie.Index != 1 || !errors.Is(err, domain.ErrIdempotencyKeyReused) {
+		t.Errorf("err = %v, want ItemError{Index: 1} wrapping ErrIdempotencyKeyReused", err)
 	}
 
 	// The same batch key with another body is rejected.
