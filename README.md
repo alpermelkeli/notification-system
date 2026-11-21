@@ -4,7 +4,7 @@ An event-driven, multi-channel notification service written in Go. It accepts no
 requests over HTTP, processes them asynchronously through prioritized queue workers, and delivers
 them via SMS, Email and Push providers with rate limiting, retries and real-time status tracking.
 
-> **Status:** 🚧 Skeleton running (Phase 2): every role starts, reports health and runs under docker-compose. The notification API and processing engine land in the next phases. See [`docs/plan.md`](docs/plan.md).
+> **Status:** 🚧 Phase 3 done: every role runs under docker-compose, and the domain model, schema, migrations and repository are in place and tested against PostgreSQL. The HTTP API (Phase 4) and the processing engine (Phase 5) come next. See [`docs/plan.md`](docs/plan.md).
 
 ## Features (target)
 - **Notification API:** single and batch create (up to 1000), status by ID / batch ID, cancel, filtered + paginated listing
@@ -31,6 +31,7 @@ curl localhost:8080/readyz       # API readiness: {"status":"ok","checks":{"post
 | `mockprovider` | local fake of webhook.site with fault injection | 8081 (127.0.0.1 only) |
 | `postgres`, `kafka`, `redis` | infrastructure | 5432, 9092, 6379 (127.0.0.1 only) |
 | `kafka-init` | one-shot job creating the [ADR-0002](docs/adr/0002-kafka-topology-and-consumer-model.md) topics | |
+| `migrate` | one-shot job: schema migrations + daily partitions (`notifier migrate`); the roles start after it | |
 
 Every role exposes `GET /healthz` (liveness, never checks dependencies), `GET /readyz`
 (readiness, checks the role's dependencies; failures are reported as `unavailable` and the error
@@ -81,6 +82,33 @@ curl localhost:8081/stats        # accepted/rejected per channel + rate in the l
 | [0006](docs/adr/0006-rate-limiting-and-priority-scheduling.md) | Redis GCRA per channel/provider, 429 fleet cool-down, capped-aging priority scheduler |
 | [0007](docs/adr/0007-technology-stack.md) | Go 1.26, chi, pgx, goose, franz-go, go-redis, OpenTelemetry, testcontainers |
 | [0008](docs/adr/0008-scalability-and-deployment-topology.md) | Scaling model per component, single PG primary + HA/replica/partitioning, nginx scaling demo |
+
+## Data model
+Schema: [`migrations/`](migrations) (goose, forward-only, embedded in the binary and applied by
+`notifier migrate`).
+
+| Table | Purpose |
+|-------|---------|
+| `notifications` | One row per message: content, status, attempts, `next_attempt_at` (drives dispatch, scheduling and retries), lease, provider result. Also the dispatch outbox ([ADR-0003](docs/adr/0003-dispatch-without-separate-outbox.md)) |
+| `notification_status_history` | Append-only audit trail: one row per transition (from, to, attempt, reason) |
+| `batches` | One row per batch request; status counts are aggregated from its notifications |
+| `idempotency_keys` | `Idempotency-Key` → request hash + created resource, with a TTL ([ADR-0004](docs/adr/0004-idempotency.md)) |
+
+- **Daily partitions** of `notifications` and its history, created days ahead and dropped after
+  `RETENTION_DAYS` by a maintenance loop in the dispatcher (advisory-locked, `DETACH ...
+  CONCURRENTLY`). Dropping a partition replaces bulk `DELETE`s and vacuum storms.
+- **Ids are UUIDv7 and `created_at` is the timestamp inside the id**, so a lookup by id alone is
+  pruned to one partition and list pagination is a keyset on `id`. Batch items share the batch's
+  timestamp and sort in request order.
+- **Every status change is a guarded `UPDATE ... WHERE status = ANY(allowed)`** that appends the
+  history row in the same statement and is checked against the state machine in
+  [`internal/domain/status.go`](internal/domain/status.go). Outcomes reported by a worker are also
+  fenced by the `lease_token` of its claim. Racing transitions (a Kafka redelivery, a late worker
+  whose lease was reaped and the row claimed again, a cancel during dispatch) have exactly one
+  winner, and each of these races has an integration test.
+- Indexes: partial indexes on `next_attempt_at` (due work), `lease_until` (expired leases) and
+  `queued_at` (stuck `queued` rows), `(status, id)` for filtered lists and `(batch_id, id)` for
+  batches. Batches older than the retention are deleted by the same maintenance loop.
 
 ## Scalability & capacity
 
@@ -143,6 +171,10 @@ stop the process with a message listing every problem. Copy [`.env.example`](.en
 | `KAFKA_BROKERS` | `localhost:9092` | dispatcher, worker | Comma-separated seed brokers |
 | `REDIS_ADDR` | `localhost:6379` | worker | Redis address |
 | `REDIS_PASSWORD` | _(empty)_ | worker | Redis password |
+| `IDEMPOTENCY_TTL` | `72h` | api | How long an `Idempotency-Key` is remembered. Must not exceed `RETENTION_DAYS` |
+| `RETENTION_DAYS` | `30` | dispatcher | Daily partitions older than this are dropped |
+| `PARTITION_PREMAKE_DAYS` | `7` | migrate, dispatcher | Partitions kept ready ahead of today |
+| `MAINTENANCE_INTERVAL` | `1h` | dispatcher | How often partition and key maintenance runs |
 | `MOCK_ADDR` | `:8081` | mockprovider | Listen address |
 | `MOCK_LATENCY` / `MOCK_LATENCY_JITTER` | `50ms` / `100ms` | mockprovider | Simulated latency: base + uniform `[0, jitter)` |
 | `MOCK_FAILURE_RATE` | `0` | mockprovider | Probability of HTTP 500 |
@@ -156,6 +188,10 @@ make test-short   # unit tests only, no Docker needed
 make lint         # golangci-lint (config: .golangci.yml)
 make cover        # coverage summary
 ```
+Repository tests in `internal/storage` are integration tests: they start PostgreSQL 17 with
+[testcontainers-go](https://golang.testcontainers.org/) and cover concurrency (`SKIP LOCKED`
+dispatchers, racing claims, concurrent idempotent creates), partition pruning and the partition
+lifecycle. They need Docker and are skipped by `make test-short`.
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs lint, race-enabled tests with
 coverage and a Docker image build on every push to `main` and every pull request. No test calls
 the real webhook.site; the provider is faked with `httptest` or the mock provider.

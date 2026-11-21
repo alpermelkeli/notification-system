@@ -43,19 +43,23 @@ judged on architecture, reliability, code quality, tests, docs and **commit hist
 make help          # list all targets
 make up            # docker compose up -d --build (API via nginx on :8080)
 make up-scaled     # 3 API + 3 worker replicas (scaling demo)
-make infra         # only postgres, kafka, redis, mock provider (for `make run-*`)
+make infra         # only postgres (+ migrate job), kafka, redis, mock provider (for `make run-*`)
+make migrate       # apply migrations + create partitions against DATABASE_URL (also migrate-status)
 make run-api       # also run-dispatcher, run-worker, run-mockprovider
 make test          # go test -race ./... (must be green before every commit)
-make test-short    # unit tests only, no Docker
+make test-short    # unit tests only, no Docker (storage integration tests are skipped)
 make lint          # golangci-lint v2 (.golangci.yml)
 make down / clean  # stop / stop and delete volumes
 ```
 
 ## Layout
 ```
-cmd/notifier/          single binary; subcommands api | dispatcher | worker | healthcheck | version
+cmd/notifier/          single binary; subcommands api | dispatcher | worker | migrate | healthcheck | version
 cmd/mockprovider/      local fake of webhook.site (fault injection, /stats)
-internal/app/          role wiring (RunAPI, RunDispatcher, RunWorker), shared router, graceful HTTP server
+internal/app/          role wiring (RunAPI, RunDispatcher, RunWorker, RunMigrate), shared router, graceful HTTP server
+internal/domain/       channels, priorities, status state machine, UUIDv7 ids, domain errors (no I/O)
+internal/storage/      PostgreSQL repository: create/batch/idempotency, guarded transitions, list, partitions
+migrations/            goose SQL migrations, embedded (forward-only, never edited after merge)
 internal/config/       env -> typed Config (all errors reported at once)
 internal/logging/      slog JSON logger; correlation ID carried in context.Context
 internal/httpx/        error envelope, JSON helpers, middleware (correlation id, instance id, logging, recovery)
@@ -65,6 +69,5 @@ internal/mockprovider/ mock provider handler
 deploy/                nginx LB config, Kafka topic creation script
 docs/                  requirements, plan, conventions, ADRs, capacity planning, diagrams
 ```
-Packages added by later phases: `internal/domain`, `internal/storage` + `migrations/` (Phase 3),
-`internal/api` + `api/openapi.yaml` (Phase 4), `internal/dispatcher`, `internal/worker`,
-`internal/ratelimit`, `internal/provider` (Phases 5–6).
+Packages added by later phases: `internal/api` + `api/openapi.yaml` (Phase 4),
+`internal/dispatcher`, `internal/worker`, `internal/ratelimit`, `internal/provider` (Phases 5–6).
