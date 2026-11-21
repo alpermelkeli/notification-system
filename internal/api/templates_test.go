@@ -196,10 +196,44 @@ func TestTemplateRequestReplaysAfterTemplateEdit(t *testing.T) {
 		t.Errorf("retry after the edit: replayed=%q %+v", res.Header().Get("Idempotent-Replayed"), again)
 	}
 
+	// An edit that renames the variable, and then a delete, would both fail validation now; the
+	// retry still replays without rendering.
+	s.do(t, http.MethodPut, "/v1/templates/"+tpl.ID.String(),
+		`{"name":"otp","channel":"sms","body":"Code: {{otp}}"}`).wantStatus(http.StatusOK)
+	s.do(t, http.MethodPost, "/v1/notifications", body, "Idempotency-Key", "otp-1").wantStatus(http.StatusAccepted)
+	s.do(t, http.MethodDelete, "/v1/templates/"+tpl.ID.String(), "").wantStatus(http.StatusNoContent)
+	res = s.do(t, http.MethodPost, "/v1/notifications", body, "Idempotency-Key", "otp-1").wantStatus(http.StatusAccepted)
+	res.decode(&again)
+	if res.Header().Get("Idempotent-Replayed") != "true" || again.ID != first.ID {
+		t.Errorf("retry after the delete: replayed=%q %+v", res.Header().Get("Idempotent-Replayed"), again)
+	}
+
 	// Different variables under the same key are a different request.
 	s.do(t, http.MethodPost, "/v1/notifications",
 		fmt.Sprintf(`{"recipient":"+905551234567","templateId":%q,"variables":{"code":"000000"}}`, tpl.ID),
 		"Idempotency-Key", "otp-1").wantStatus(http.StatusConflict)
+}
+
+// TestTemplateBatchReplaysAfterTemplateDelete is the batch form of the replay rule: the batch key
+// is checked before the templates are loaded.
+func TestTemplateBatchReplaysAfterTemplateDelete(t *testing.T) {
+	s := newServer(t)
+	tpl := s.createTemplate(t, "sale", "sms", "Sale: {{pct}}% off")
+	body := fmt.Sprintf(`{"notifications":[{"recipient":"+905551234567","templateId":%q,"variables":{"pct":"20"}}]}`, tpl.ID)
+	var first batchCreatedJSON
+	s.do(t, http.MethodPost, "/v1/notifications/batch", body, "Idempotency-Key", "b-1").wantStatus(http.StatusAccepted).decode(&first)
+	s.do(t, http.MethodDelete, "/v1/templates/"+tpl.ID.String(), "").wantStatus(http.StatusNoContent)
+
+	res := s.do(t, http.MethodPost, "/v1/notifications/batch", body, "Idempotency-Key", "b-1").wantStatus(http.StatusAccepted)
+	var again batchCreatedJSON
+	res.decode(&again)
+	if res.Header().Get("Idempotent-Replayed") != "true" || again.Batch.ID != first.Batch.ID {
+		t.Errorf("batch retry after the delete: replayed=%q batch %s, want %s", res.Header().Get("Idempotent-Replayed"), again.Batch.ID, first.Batch.ID)
+	}
+	// The same key on a single create is a different request.
+	s.do(t, http.MethodPost, "/v1/notifications",
+		fmt.Sprintf(`{"recipient":"+905551234567","templateId":%q,"variables":{"pct":"20"}}`, tpl.ID),
+		"Idempotency-Key", "b-1").wantStatus(http.StatusConflict)
 }
 
 func TestBatchFromTemplates(t *testing.T) {

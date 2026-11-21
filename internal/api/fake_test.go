@@ -301,3 +301,31 @@ func (f *fakeStore) newNotificationForTest(st domain.Status) uuid.UUID {
 	f.byID[n.ID] = n
 	return n.ID
 }
+
+func (f *fakeStore) FindIdempotencyKey(_ context.Context, k storage.IdempotencyKey) (storage.KeyMatch, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return storage.KeyMatch{}, f.err
+	}
+	prior, ok := f.keys[k.Key]
+	if !ok {
+		return storage.KeyMatch{}, nil
+	}
+	if prior.hash != k.RequestHash {
+		return storage.KeyMatch{}, domain.ErrIdempotencyKeyReused
+	}
+	_, isBatch := f.batches[prior.id]
+	return storage.KeyMatch{Found: true, Batch: isBatch, ID: prior.id}, nil
+}
+
+func (f *fakeStore) ReplayBatch(_ context.Context, id uuid.UUID, _ []storage.NewNotification) (storage.BatchResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	res, ok := f.batches[id]
+	if !ok {
+		return storage.BatchResult{}, domain.ErrNotFound
+	}
+	res.Created = false
+	return res, nil
+}

@@ -33,6 +33,8 @@ type Store interface {
 	Replay(ctx context.Context, id uuid.UUID) (domain.Notification, error)
 	ListNotifications(ctx context.Context, f storage.ListFilter) (storage.ListPage, error)
 	GetBatch(ctx context.Context, id uuid.UUID) (domain.Batch, error)
+	FindIdempotencyKey(ctx context.Context, k storage.IdempotencyKey) (storage.KeyMatch, error)
+	ReplayBatch(ctx context.Context, id uuid.UUID, items []storage.NewNotification) (storage.BatchResult, error)
 
 	CreateTemplate(ctx context.Context, in storage.TemplateInput) (domain.Template, error)
 	GetTemplate(ctx context.Context, id uuid.UUID) (domain.Template, error)

@@ -341,6 +341,12 @@ func getBatch(ctx context.Context, q querier, id uuid.UUID) (domain.Batch, error
 	return b, nil
 }
 
+// ReplayBatch returns the result of the earlier batch request id, as a replay (Created false).
+// items is the replayed request, of which only the item keys are used. See FindIdempotencyKey.
+func (s *Store) ReplayBatch(ctx context.Context, id uuid.UUID, items []NewNotification) (BatchResult, error) {
+	return loadBatch(ctx, s.pool, id, items)
+}
+
 // loadBatch rebuilds the result of an earlier CreateBatch call for a replay of the same request
 // (same batch key and hash, so items is the same list). Created items are placed by the request
 // index stored in their ids (domain.BatchSeq); the remaining positions were duplicates of

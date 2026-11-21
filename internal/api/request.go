@@ -75,11 +75,10 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, limit int64, dst any) *r
 	return nil
 }
 
-// validateCreate validates one create request and converts it to the store input and the
-// canonical form its idempotency hash covers. prefix is prepended to field names (e.g.
-// "notifications[3].") so batch violations point at the item. templates holds the templates the
-// request may name, loaded beforehand (see loadTemplates).
-func (h *Handler) validateCreate(prefix string, req createRequest, now time.Time, templates map[uuid.UUID]domain.Template) (storage.NewNotification, canonical, []violation) {
+// validateCreate validates one create request and converts it to the store input. prefix is
+// prepended to field names (e.g. "notifications[3].") so batch violations point at the item.
+// templates holds the templates the request may name, loaded beforehand (see loadTemplates).
+func (h *Handler) validateCreate(prefix string, req createRequest, now time.Time, templates map[uuid.UUID]domain.Template) (storage.NewNotification, []violation) {
 	var vs []violation
 	add := func(field, msg string) { vs = append(vs, violation{Field: prefix + field, Message: msg}) }
 
@@ -172,16 +171,33 @@ func (h *Handler) validateCreate(prefix string, req createRequest, now time.Time
 	in := storage.NewNotification{
 		Channel: ch, Priority: prio, Recipient: req.Recipient, Content: content, ScheduledAt: scheduledAt,
 	}
-	canon := canonical{
-		Channel: string(ch), Priority: string(prio), Recipient: req.Recipient, Content: req.Content, ScheduledAt: scheduledAt,
-	}
 	if tpl != nil {
 		in.Template = &storage.TemplateRef{ID: tpl.ID, Version: tpl.Version}
-		// The hash covers what the client sent, not the rendered text, so a retry after the
-		// template was edited still replays the original notification (ADR-0010).
-		canon.TemplateID, canon.Variables = tpl.ID.String(), req.Variables
 	}
-	return in, canon, vs
+	return in, vs
+}
+
+// canonicalOf is the form of a create request that idempotency hashes cover (ADR-0004). It is
+// built from what the client sent, before validation: a templated request hashes its templateId
+// and variables, not the rendered text, so a retry still matches after the template was edited
+// or deleted (ADR-0010). For valid plain requests it equals the validated values, so their hashes
+// are the same as before templates existed.
+func canonicalOf(req createRequest) canonical {
+	c := canonical{Channel: req.Channel, Priority: req.Priority, Recipient: req.Recipient, Content: req.Content, Variables: req.Variables}
+	if c.Priority == "" {
+		c.Priority = string(domain.PriorityNormal)
+	}
+	if req.ScheduledAt != nil {
+		at := req.ScheduledAt.UTC().Truncate(time.Microsecond)
+		c.ScheduledAt = &at
+	}
+	if req.TemplateID != nil {
+		c.TemplateID = *req.TemplateID
+		if id, err := uuid.Parse(*req.TemplateID); err == nil {
+			c.TemplateID = id.String() // one spelling per id
+		}
+	}
+	return c
 }
 
 // loadTemplates loads every template the requests name, in one query. Ids that are not UUIDs are

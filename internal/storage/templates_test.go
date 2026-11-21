@@ -147,3 +147,44 @@ func TestCreateNotificationRecordsItsTemplate(t *testing.T) {
 		t.Errorf("batch item 1 has a template: %+v", got)
 	}
 }
+
+func TestFindIdempotencyKey(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	in := sms("x")
+	in.IdempotencyKey = key("single", "a")
+	n, _, err := s.CreateNotification(ctx, in, Origin{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.CreateBatch(ctx, NewBatch{Items: []NewNotification{sms("y")}, IdempotencyKey: key("batch", "b")}, Origin{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if m, err := s.FindIdempotencyKey(ctx, *key("single", "a")); err != nil || !m.Found || m.Batch || m.ID != n.ID {
+		t.Errorf("single: %+v, %v", m, err)
+	}
+	if m, err := s.FindIdempotencyKey(ctx, *key("batch", "b")); err != nil || !m.Found || !m.Batch || m.ID != res.Batch.ID {
+		t.Errorf("batch: %+v, %v", m, err)
+	}
+	if _, err := s.FindIdempotencyKey(ctx, *key("single", "other body")); !errors.Is(err, domain.ErrIdempotencyKeyReused) {
+		t.Errorf("different hash: %v", err)
+	}
+	if m, err := s.FindIdempotencyKey(ctx, *key("unknown", "a")); err != nil || m.Found {
+		t.Errorf("unknown key: %+v, %v", m, err)
+	}
+	// An expired key is not live.
+	if _, err := testPool.Exec(ctx, `UPDATE idempotency_keys SET expires_at = now() - interval '1 second' WHERE key = 'single'`); err != nil {
+		t.Fatal(err)
+	}
+	if m, err := s.FindIdempotencyKey(ctx, *key("single", "a")); err != nil || m.Found {
+		t.Errorf("expired key: %+v, %v", m, err)
+	}
+
+	replay, err := s.ReplayBatch(ctx, res.Batch.ID, []NewNotification{{}})
+	if err != nil || replay.Created || replay.Batch.ID != res.Batch.ID || len(replay.Items) != 1 ||
+		replay.Items[0].Notification.ID != res.Items[0].Notification.ID {
+		t.Errorf("replay = %+v, %v", replay, err)
+	}
+}

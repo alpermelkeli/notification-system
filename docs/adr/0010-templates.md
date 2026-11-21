@@ -57,10 +57,16 @@ Constraints from earlier decisions:
   - A missing or unused variable is a 422 violation that names the variable.
   - If the rendered text breaks the channel's limits, the violation is reported on `content`.
   - In a batch, every template is loaded with one query.
-- **Idempotency:** the request hash covers `templateId` and `variables` instead of the rendered
-  text. A retry after the template was edited still replays the original notification instead
-  of failing with 409. The new fields are omitted when empty, so hashes of plain-content requests
-  are unchanged.
+- **Idempotency:** the request hash is built from what the client sent: `templateId` and
+  `variables`, with `channel` as given (possibly empty), never the rendered text. The new fields
+  are omitted when empty, so hashes of plain-content requests are unchanged.
+  - For a templated request that carries an `Idempotency-Key`, the API looks the key up *before*
+    loading and rendering the template, and replays a match straight away. A retry after the
+    template was edited, even incompatibly (a renamed variable, text over the limit), or deleted
+    still returns the original notification or batch instead of 422 or 409.
+  - Item keys of a batch sent without a batch key are still checked after validation. Such a
+    retry fails validation if its template changed incompatibly; clients that retry batches send
+    the `Idempotency-Key` header.
 - **Schema:** migration `00004` creates `templates` and adds the nullable `template_id` and
   `template_version` columns to `notifications`. Both are catalog-only changes on the
   partitioned table.
