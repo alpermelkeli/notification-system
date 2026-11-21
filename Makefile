@@ -21,6 +21,12 @@ build: ## Build bin/notifier and bin/mockprovider
 	CGO_ENABLED=0 go build -trimpath -ldflags="$(LDFLAGS)" -o bin/notifier ./cmd/notifier
 	CGO_ENABLED=0 go build -trimpath -o bin/mockprovider ./cmd/mockprovider
 
+.PHONY: migrate migrate-status
+migrate: ## Apply database migrations and create partitions (needs PostgreSQL)
+	go run ./cmd/notifier migrate
+migrate-status: ## List migrations and whether they are applied
+	go run ./cmd/notifier migrate status
+
 .PHONY: run-api run-dispatcher run-worker run-mockprovider
 run-api: ## Run the API locally (needs `make infra`)
 	go run ./cmd/notifier api
@@ -67,8 +73,8 @@ up-scaled: ## Start the stack with 3 API and 3 worker replicas (ADR-0008)
 	docker compose up -d --build --scale api=3 --scale worker=3
 
 .PHONY: infra
-infra: ## Start only infrastructure (postgres, kafka, redis, mock provider)
-	docker compose up -d --build postgres kafka kafka-init redis mockprovider
+infra: ## Start only infrastructure (postgres + migrations, kafka, redis, mock provider)
+	docker compose up -d --build postgres migrate kafka kafka-init redis mockprovider
 
 .PHONY: down
 down: ## Stop the stack (keeps volumes)

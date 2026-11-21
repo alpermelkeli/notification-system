@@ -34,6 +34,11 @@ func TestLoadDefaults(t *testing.T) {
 	if !reflect.DeepEqual(cfg.KafkaBrokers, []string{"localhost:9092"}) {
 		t.Errorf("KafkaBrokers = %v", cfg.KafkaBrokers)
 	}
+	if cfg.IdempotencyTTL != 72*time.Hour || cfg.RetentionDays != 30 ||
+		cfg.PartitionPremakeDays != 7 || cfg.MaintenanceInterval != time.Hour {
+		t.Errorf("lifecycle defaults = %v/%d/%d/%v",
+			cfg.IdempotencyTTL, cfg.RetentionDays, cfg.PartitionPremakeDays, cfg.MaintenanceInterval)
+	}
 }
 
 func TestLoadOverrides(t *testing.T) {
@@ -46,6 +51,8 @@ func TestLoadOverrides(t *testing.T) {
 		"KAFKA_BROKERS":    " k1:9092, ,k2:9092 ",
 		"REDIS_ADDR":       "redis:6379",
 		"DATABASE_URL":     "postgres://x",
+		"IDEMPOTENCY_TTL":  "24h",
+		"RETENTION_DAYS":   "7",
 	}))
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -60,6 +67,11 @@ func TestLoadOverrides(t *testing.T) {
 		DatabaseURL:     "postgres://x",
 		KafkaBrokers:    []string{"k1:9092", "k2:9092"},
 		RedisAddr:       "redis:6379",
+
+		IdempotencyTTL:       24 * time.Hour,
+		RetentionDays:        7,
+		PartitionPremakeDays: 7,
+		MaintenanceInterval:  time.Hour,
 	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Errorf("got  %+v\nwant %+v", cfg, want)
@@ -78,17 +90,28 @@ func TestLoadBlankValueUsesDefault(t *testing.T) {
 
 func TestLoadReportsAllErrors(t *testing.T) {
 	_, err := load(env(map[string]string{
-		"LOG_LEVEL":        "verbose",
-		"LOG_FORMAT":       "xml",
-		"SHUTDOWN_TIMEOUT": "-1s",
-		"KAFKA_BROKERS":    " , ",
+		"LOG_LEVEL":              "verbose",
+		"LOG_FORMAT":             "xml",
+		"SHUTDOWN_TIMEOUT":       "-1s",
+		"KAFKA_BROKERS":          " , ",
+		"RETENTION_DAYS":         "0",
+		"PARTITION_PREMAKE_DAYS": "many",
 	}))
 	if err == nil {
 		t.Fatal("expected an error")
 	}
-	for _, key := range []string{"LOG_LEVEL", "LOG_FORMAT", "SHUTDOWN_TIMEOUT", "KAFKA_BROKERS"} {
+	for _, key := range []string{
+		"LOG_LEVEL", "LOG_FORMAT", "SHUTDOWN_TIMEOUT", "KAFKA_BROKERS", "RETENTION_DAYS", "PARTITION_PREMAKE_DAYS",
+	} {
 		if !strings.Contains(err.Error(), key) {
 			t.Errorf("error does not mention %s: %v", key, err)
 		}
+	}
+}
+
+func TestLoadRejectsTTLLongerThanRetention(t *testing.T) {
+	_, err := load(env(map[string]string{"IDEMPOTENCY_TTL": "72h", "RETENTION_DAYS": "2"}))
+	if err == nil || !strings.Contains(err.Error(), "IDEMPOTENCY_TTL") {
+		t.Fatalf("err = %v, want an IDEMPOTENCY_TTL vs RETENTION_DAYS error", err)
 	}
 }

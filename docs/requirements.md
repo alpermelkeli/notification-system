@@ -15,11 +15,11 @@ teams and API consumers.
 ### FR-1 Notification Management API
 | ID | Requirement | Status | Where |
 |----|-------------|--------|-------|
-| FR-1.1 | Create notification: recipient, channel, content, priority | [ ] | |
-| FR-1.2 | Batch create, up to **1000** per request | [ ] | |
-| FR-1.3 | Query status by notification ID or batch ID | [ ] | |
-| FR-1.4 | Cancel pending notifications | [ ] | |
-| FR-1.5 | List with filters (status, channel, date range) + pagination | [ ] | |
+| FR-1.1 | Create notification: recipient, channel, content, priority | [~] | storage: `internal/storage/create.go` (API in Phase 4) |
+| FR-1.2 | Batch create, up to **1000** per request | [~] | storage: `CreateBatch`, one multi-row INSERT (API in Phase 4) |
+| FR-1.3 | Query status by notification ID or batch ID | [~] | storage: `GetNotification`, `GetBatch`, `History` (API in Phase 4) |
+| FR-1.4 | Cancel pending notifications | [~] | storage: `Cancel`, guarded on pending/queued/retrying (API in Phase 4) |
+| FR-1.5 | List with filters (status, channel, date range) + pagination | [~] | storage: `ListNotifications`, keyset on UUIDv7 id (API in Phase 4) |
 
 ### FR-2 Processing Engine
 | ID | Requirement | Status | Where |
@@ -28,7 +28,7 @@ teams and API consumers.
 | FR-2.2 | Rate limit: max **100 msg/s per channel** | [ ] | |
 | FR-2.3 | Priority queues: high / normal / low | [ ] | |
 | FR-2.4 | Content validation (char limits, required fields) | [ ] | |
-| FR-2.5 | Idempotency — no duplicate sends | [ ] | |
+| FR-2.5 | Idempotency — no duplicate sends | [~] | `internal/storage/idempotency.go`, guarded `Claim` (header handling in Phase 4, provider header in Phase 5) |
 
 ### FR-3 Delivery & Retry Logic
 Left open by the brief ("thinking and design by candidate"). Our design must be documented in an ADR.
@@ -37,7 +37,7 @@ Left open by the brief ("thinking and design by candidate"). Our design must be 
 | FR-3.1 | Retry policy (backoff + jitter, max attempts) | [ ] | |
 | FR-3.2 | Retryable vs. permanent failure classification | [ ] | |
 | FR-3.3 | Dead-letter handling / terminal failed state | [ ] | |
-| FR-3.4 | Status lifecycle & state machine | [ ] | |
+| FR-3.4 | Status lifecycle & state machine | [x] | `internal/domain/status.go`, guarded transitions + history in `internal/storage/transitions.go` |
 
 ### FR-4 Observability
 | ID | Requirement | Status | Where |
@@ -68,5 +68,5 @@ Left open by the brief ("thinking and design by candidate"). Our design must be 
 | D-2 | README: setup, architecture overview, API examples | [~] |
 | D-3 | `docker-compose up` one-command setup | [~] |
 | D-4 | Swagger / OpenAPI spec | [ ] |
-| D-5 | Versioned DB migrations | [ ] |
+| D-5 | Versioned DB migrations | [x] |
 | D-6 | Test suite runnable with a single command | [x] |
