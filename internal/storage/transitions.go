@@ -306,9 +306,9 @@ SELECT id, created_at, prev_status, 'retrying', attempts, 'lease expired' FROM u
 }
 
 // RequeueStuck moves up to limit notifications that have been queued for longer than olderThan
-// back to pending, so the dispatcher publishes them again (ADR-0003). It is the last-resort net
-// for Kafka records that never reach a worker. olderThan must exceed the longest expected Kafka
-// backlog, or a burst would be re-published (see docs/plan.md, open questions).
+// back to pending, so the dispatcher publishes them again. Not wired to any loop yet: the reaper
+// uses it only as the long age fallback (default 24 h). Its main rule compares stored Kafka
+// offsets with the consumer group's committed offsets (ADR-0003 amendment), added in Phase 5.
 func (s *Store) RequeueStuck(ctx context.Context, olderThan time.Duration, limit int) (int, error) {
 	t := transition{from: []domain.Status{domain.StatusQueued}, to: domain.StatusPending}
 	if err := t.validate(); err != nil {

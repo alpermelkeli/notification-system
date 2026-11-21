@@ -86,8 +86,9 @@ event stream for status consumers (B-4). Kafka has no per-message priority.
 - ✅ A channel can be paused (circuit open) without touching other channels.
 - ✅ Throughput per channel/priority can be tuned with the partition count.
 - ✅ Watermark commits mean a crash never skips an unfinished record. It can only re-deliver
-  finished ones, which the guarded claim filters (ADR-0004). The dispatcher's reaper for rows
-  stuck in `queued` (ADR-0003) remains a last-resort safety net, not the primary mechanism.
+  finished ones, which the guarded claim filters (ADR-0004). The dispatcher's reaper for `queued`
+  rows whose record the group has already committed past (ADR-0003, offset comparison) is the
+  safety net, not the primary mechanism.
 - ⚠️ One slow record holds back its partition's commit (not its processing). After a crash, at
   most the in-flight window is re-read.
 - ⚠️ The range assignor uses eager rebalancing, so all partitions briefly stop during a

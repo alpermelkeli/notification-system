@@ -27,8 +27,12 @@ Living document. Update phase status as work lands. Time budget ≈ 12h of focus
 | Stack & deployment | Go 1.26, chi, pgx, goose; one binary: api / dispatcher / worker / migrate | [0007](adr/0007-technology-stack.md) |
 | Scaling & topology | Per-component scaling model, single PG primary + HA/replica/partitions, nginx + `--scale` demo | [0008](adr/0008-scalability-and-deployment-topology.md) |
 
+## Resolved decisions (later phases)
+| Question | Decision | ADR |
+|----------|----------|-----|
+| Reaper rule for `queued` rows | Compare each row's stored Kafka offset with the consumer group's committed offset instead of a fixed 10-min age; 24 h age fallback. Implemented in Phase 5 (migration 00002 adds `kafka_partition`, `kafka_offset`) | [0003 amendment](adr/0003-dispatch-without-separate-outbox.md) |
+
 ## Open questions
 | Phase | Question | Notes |
 |-------|----------|-------|
-| 5 | Reaper rule for `queued` rows (ADR-0003: back to `pending` after 10 min) | `storage.RequeueStuck(olderThan)` and its index exist; the policy does not. During a burst, `queued` rows legitimately wait in Kafka for hours (2 M SMS ≈ 5.6 h at 100 msg/s), so a fixed 10-min threshold would re-publish the whole backlog. Options: disable by default, compare against consumer lag / committed offsets, or use a much larger threshold. |
 | 6 | Reaped lease at the attempt limit | `ReapExpiredLeases` keeps the attempt counted, so a row reaped at `max_attempts` is dispatched once more. Move it to `failed` at claim time (or in the reaper) when attempts ≥ max. |
