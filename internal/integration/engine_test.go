@@ -90,7 +90,7 @@ func run(m *testing.M) int {
 	return m.Run()
 }
 
-// createTopics creates the work topics with the partition counts of ADR-0002.
+// createTopics creates the work and dead-letter topics with the partition counts of ADR-0002.
 func createTopics(ctx context.Context) error {
 	cl, err := kgo.NewClient(kgo.SeedBrokers(kafkaAddr))
 	if err != nil {
@@ -98,6 +98,13 @@ func createTopics(ctx context.Context) error {
 	}
 	defer cl.Close()
 	adm := kadm.NewClient(cl)
+	resp, err := adm.CreateTopic(ctx, 3, 1, nil, queue.DeadLetterTopic)
+	if err == nil {
+		err = resp.Err
+	}
+	if err != nil {
+		return fmt.Errorf("create topic %s: %w", queue.DeadLetterTopic, err)
+	}
 	for _, c := range domain.Channels {
 		for _, p := range domain.Priorities {
 			partitions := int32(6)
@@ -116,13 +123,43 @@ func createTopics(ctx context.Context) error {
 	return nil
 }
 
-// fakeProvider is the provider: it records every request and fails the first attempt of
-// recipients listed in failOnce with 503.
+// fakeProvider is the provider: it records every request, fails the first attempt of recipients
+// in failOnce and every attempt of recipients in failAlways with 503, rejects recipients in
+// reject with 400, and answers 503 to everything while down is set.
 type fakeProvider struct {
-	mu       sync.Mutex
-	calls    map[string]int // Idempotency-Key -> requests
-	times    []time.Time
-	failOnce map[string]bool
+	mu         sync.Mutex
+	calls      map[string]int // Idempotency-Key -> requests
+	times      []time.Time
+	at         map[string][]time.Time // Idempotency-Key -> request times
+	failOnce   map[string]bool
+	failAlways map[string]bool
+	reject     map[string]bool
+	down       bool
+}
+
+func newFakeProvider() *fakeProvider {
+	return &fakeProvider{
+		calls: map[string]int{}, at: map[string][]time.Time{},
+		failOnce: map[string]bool{}, failAlways: map[string]bool{}, reject: map[string]bool{},
+	}
+}
+
+func (p *fakeProvider) setDown(down bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.down = down
+}
+
+func (p *fakeProvider) total() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.times)
+}
+
+func (p *fakeProvider) timesFor(key string) []time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]time.Time(nil), p.at[key]...)
 }
 
 func (p *fakeProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -131,11 +168,19 @@ func (p *fakeProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mu.Lock()
 	key := r.Header.Get(provider.HeaderIdempotencyKey)
 	p.calls[key]++
-	p.times = append(p.times, time.Now())
-	fail := p.failOnce[body.To] && p.calls[key] == 1
+	now := time.Now()
+	p.times = append(p.times, now)
+	p.at[key] = append(p.at[key], now)
+	fail := p.down || p.failAlways[body.To] || (p.failOnce[body.To] && p.calls[key] == 1)
+	reject := p.reject[body.To]
 	p.mu.Unlock()
-	if fail {
+	switch {
+	case fail:
 		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	case reject:
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"invalid recipient"}`))
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
@@ -148,8 +193,9 @@ func (p *fakeProvider) callsFor(key string) int {
 	return p.calls[key]
 }
 
-// engine runs a dispatcher (relay + reaper) and n SMS workers until the test ends.
-func startEngine(t *testing.T, store *storage.Store, providerURL string, workers int, rate int) {
+// startEngine runs a dispatcher (relay + reaper) and n SMS workers until the test ends. Dead
+// letters go to the real topic. opts adjust the workers' options.
+func startEngine(t *testing.T, store *storage.Store, providerURL string, workers int, rate int, opts ...func(*worker.Options)) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
@@ -162,8 +208,9 @@ func startEngine(t *testing.T, store *storage.Store, providerURL string, workers
 	t.Cleanup(producer.Close)
 	relay := dispatcher.NewRelay(store, dispatcher.NewPublisher(producer).Publish, quiet,
 		dispatcher.RelayOptions{PollInterval: 50 * time.Millisecond})
-	reaper := dispatcher.NewReaper(store, dispatcher.NewKafkaOffsets(kadm.NewClient(producer)), nil, quiet,
-		dispatcher.ReaperOptions{Interval: 200 * time.Millisecond, Grace: 100 * time.Millisecond})
+	dead := queue.NewDeadLetters(producer, dispatcher.PublishTimeout)
+	reaper := dispatcher.NewReaper(store, dispatcher.NewKafkaOffsets(kadm.NewClient(producer)), dead, quiet,
+		dispatcher.ReaperOptions{Interval: 200 * time.Millisecond, Grace: 100 * time.Millisecond, MaxAttempts: 3})
 	wg.Go(func() { relay.Run(ctx) })
 	wg.Go(func() { reaper.Run(ctx) })
 
@@ -180,10 +227,14 @@ func startEngine(t *testing.T, store *storage.Store, providerURL string, workers
 		t.Fatal(err)
 	}
 	for range workers {
-		w := worker.New(domain.ChannelSMS, store, sender, limiter, quiet, worker.Options{
+		o := worker.Options{
 			Retry: retry.Policy{BaseDelay: 200 * time.Millisecond, MaxAttempts: 3}, Lease: 10 * time.Second,
-			CommitInterval: 100 * time.Millisecond,
-		})
+			CommitInterval: 100 * time.Millisecond, DeadLetters: dead,
+		}
+		for _, f := range opts {
+			f(&o)
+		}
+		w := worker.New(domain.ChannelSMS, store, sender, limiter, quiet, o)
 		cl, err := kgo.NewClient(append(w.ConsumerOptions(), kgo.SeedBrokers(kafkaAddr))...)
 		if err != nil {
 			t.Fatal(err)
@@ -222,7 +273,8 @@ func TestEngineDeliversEveryNotificationOnce(t *testing.T) {
 	}
 	ctx := context.Background()
 	store := storage.New(pool, storage.Options{})
-	fp := &fakeProvider{calls: map[string]int{}, failOnce: map[string]bool{"+905550000001": true}}
+	fp := newFakeProvider()
+	fp.failOnce["+905550000001"] = true
 	srv := httptest.NewServer(fp)
 	defer srv.Close()
 
@@ -302,7 +354,7 @@ func TestReaperRecoversARecordConsumedWithoutClaim(t *testing.T) {
 	}
 	ctx := context.Background()
 	store := storage.New(pool, storage.Options{})
-	fp := &fakeProvider{calls: map[string]int{}}
+	fp := newFakeProvider()
 	srv := httptest.NewServer(fp)
 	defer srv.Close()
 	startEngine(t, store, srv.URL, 1, 100)
@@ -355,6 +407,147 @@ func TestReaperRecoversARecordConsumedWithoutClaim(t *testing.T) {
 	if !found || fp.callsFor(lost.ID.String()) != 1 {
 		t.Errorf("history %+v, provider calls %d", hist, fp.callsFor(lost.ID.String()))
 	}
+}
+
+// TestEngineFailsPermanentAndExhaustedDeliveries: a 400 fails at once, a provider that keeps
+// answering 503 is retried with growing backoff until the attempt budget is spent; both end in
+// failed with a dead letter on notifications.dlq (FR-3.1–3.3).
+func TestEngineFailsPermanentAndExhaustedDeliveries(t *testing.T) {
+	if pool == nil {
+		t.Skip("integration test: needs Docker (skipped with -short)")
+	}
+	ctx := context.Background()
+	store := storage.New(pool, storage.Options{})
+	fp := newFakeProvider()
+	fp.reject["+905552220001"] = true
+	fp.failAlways["+905552220002"] = true
+	srv := httptest.NewServer(fp)
+	defer srv.Close()
+	startEngine(t, store, srv.URL, 1, 100)
+
+	create := func(recipient string) domain.Notification {
+		n, _, err := store.CreateNotification(ctx, storage.NewNotification{
+			Channel: domain.ChannelSMS, Priority: domain.PriorityNormal, Recipient: recipient, Content: "x",
+		}, "corr-fail")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	rejected, exhausted := create("+905552220001"), create("+905552220002")
+	waitUntil(t, 30*time.Second, "both failed", func() bool {
+		return status(t, store, rejected).Status == domain.StatusFailed && status(t, store, exhausted).Status == domain.StatusFailed
+	})
+
+	if got := status(t, store, rejected); got.Attempts != 1 || fp.callsFor(rejected.ID.String()) != 1 ||
+		got.LastError == nil || *got.LastError != `permanent: provider returned 400: {"error":"invalid recipient"}` {
+		t.Errorf("rejected: attempts %d, calls %d, last error %v", got.Attempts, fp.callsFor(rejected.ID.String()), got.LastError)
+	}
+	got := status(t, store, exhausted)
+	if got.Attempts != 3 || fp.callsFor(exhausted.ID.String()) != 3 || got.LastError == nil ||
+		*got.LastError != "attempts exhausted (3), last retryable: provider returned 503" {
+		t.Errorf("exhausted: attempts %d, calls %d, last error %v", got.Attempts, fp.callsFor(exhausted.ID.String()), got.LastError)
+	}
+	// Equal jitter keeps at least half of each backoff ceiling (200ms, then 400ms).
+	if at := fp.timesFor(exhausted.ID.String()); len(at) == 3 {
+		if g1, g2 := at[1].Sub(at[0]), at[2].Sub(at[1]); g1 < 100*time.Millisecond || g2 < 200*time.Millisecond {
+			t.Errorf("retry gaps %v, %v; want at least 100ms and 200ms", g1, g2)
+		}
+	}
+
+	letters := readDeadLetters(t, 2)
+	for _, n := range []domain.Notification{rejected, exhausted} {
+		d, ok := letters[n.ID.String()]
+		if !ok {
+			t.Errorf("no dead letter for %s", n.ID)
+			continue
+		}
+		if d.Channel != domain.ChannelSMS || d.CorrelationID != "corr-fail" || d.LastError != *status(t, store, n).LastError {
+			t.Errorf("dead letter %+v", d)
+		}
+	}
+}
+
+// TestEngineBreakerHoldsDeliveriesDuringAnOutage: while the provider is down the breaker stops
+// the calls after a few failures, no attempt budget is spent waiting, and everything is
+// delivered once the provider recovers (B-1).
+func TestEngineBreakerHoldsDeliveriesDuringAnOutage(t *testing.T) {
+	if pool == nil {
+		t.Skip("integration test: needs Docker (skipped with -short)")
+	}
+	ctx := context.Background()
+	store := storage.New(pool, storage.Options{})
+	fp := newFakeProvider()
+	fp.setDown(true)
+	srv := httptest.NewServer(fp)
+	defer srv.Close()
+	startEngine(t, store, srv.URL, 1, 100, func(o *worker.Options) {
+		o.Concurrency = 2
+		o.Retry.MaxAttempts = 10
+		o.Breaker = worker.BreakerOptions{ConsecutiveFailures: 3, OpenTimeout: time.Second}
+	})
+
+	var ns []domain.Notification
+	for i := range 20 {
+		n, _, err := store.CreateNotification(ctx, storage.NewNotification{
+			Channel: domain.ChannelSMS, Priority: domain.PriorityHigh, Recipient: fmt.Sprintf("+90555333%04d", i), Content: "x",
+		}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ns = append(ns, n)
+	}
+	waitUntil(t, 20*time.Second, "the breaker to stop the calls", func() bool { return fp.total() >= 3 })
+	time.Sleep(3 * time.Second) // three open periods: at most one probe each, plus sends in flight at the trip
+	calls := fp.total()
+	t.Logf("provider calls during the outage: %d", calls)
+	if calls > 3+2+3 {
+		t.Errorf("%d provider calls during a 3s outage; the breaker should have stopped them", calls)
+	}
+
+	fp.setDown(false)
+	waitUntil(t, 30*time.Second, "every notification sent after recovery", func() bool {
+		for _, n := range ns {
+			if status(t, store, n).Status != domain.StatusSent {
+				return false
+			}
+		}
+		return true
+	})
+	for _, n := range ns {
+		if got := status(t, store, n); got.Attempts != fp.callsFor(n.ID.String()) {
+			t.Errorf("%s: %d attempts counted for %d provider calls", n.ID, got.Attempts, fp.callsFor(n.ID.String()))
+		}
+	}
+}
+
+// readDeadLetters reads notifications.dlq from the start until it has at least n records.
+func readDeadLetters(t *testing.T, n int) map[string]queue.DeadLetter {
+	t.Helper()
+	cl, err := kgo.NewClient(kgo.SeedBrokers(kafkaAddr), kgo.ConsumeTopics(queue.DeadLetterTopic),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	out := map[string]queue.DeadLetter{}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	for len(out) < n {
+		fetches := cl.PollFetches(ctx)
+		if ctx.Err() != nil {
+			t.Fatalf("read %d dead letters, want %d", len(out), n)
+		}
+		fetches.EachRecord(func(r *kgo.Record) {
+			var d queue.DeadLetter
+			if err := json.Unmarshal(r.Value, &d); err != nil {
+				t.Errorf("dead letter %s: %v", r.Value, err)
+				return
+			}
+			out[d.ID.String()] = d
+		})
+	}
+	return out
 }
 
 // waitForSpread waits until the SMS group is stable with n members, and checks that the range
