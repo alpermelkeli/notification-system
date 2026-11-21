@@ -4,7 +4,7 @@ An event-driven, multi-channel notification service written in Go. It accepts no
 requests over HTTP, processes them asynchronously through prioritized queue workers, and delivers
 them via SMS, Email and Push providers with rate limiting, retries and real-time status tracking.
 
-> **Status:** 🚧 Phase 4 done: the v1 API accepts, validates, stores, lists and cancels notifications (OpenAPI + Swagger UI). Notifications stay `pending` until the processing engine (dispatcher → Kafka → workers → provider) lands in Phase 5. See [`docs/plan.md`](docs/plan.md).
+> **Status:** 🚧 Phase 5 done: notifications flow end to end (API → PostgreSQL → dispatcher → Kafka → priority-scheduled workers → Redis rate limiter → provider), with a reaper for lost records. Exponential backoff, failure classification, DLQ and the circuit breaker follow in Phase 6. See [`docs/plan.md`](docs/plan.md).
 
 ## Features (target)
 - **Notification API:** single and batch create (up to 1000), status by ID / batch ID, cancel, filtered + paginated listing
@@ -26,7 +26,7 @@ curl localhost:8080/readyz       # API readiness: {"status":"ok","checks":{"post
 |---------|------|-----------|
 | `lb` | nginx load balancer in front of `api` | 8080 |
 | `api` | public HTTP API (`notifier api`) | (via `lb`) |
-| `dispatcher` ×2 | PostgreSQL → Kafka relay (`notifier dispatcher`) | (admin :9090 in-network) |
+| `dispatcher` ×2 | PostgreSQL → Kafka relay + reaper + maintenance (`notifier dispatcher`) | (admin :9090 in-network) |
 | `worker` | channel consumers + delivery (`notifier worker`) | (admin :9090 in-network) |
 | `mockprovider` | local fake of webhook.site with fault injection | 8081 (127.0.0.1 only) |
 | `postgres`, `kafka`, `redis` | infrastructure | 5432, 9092, 6379 (127.0.0.1 only) |
@@ -67,9 +67,35 @@ curl localhost:8081/stats        # accepted/rejected per channel + rate in the l
 4. **Channel workers** (one consumer group per channel) buffer records per priority and pick the
    next one with a **capped-aging scheduler**. `high` is never overtaken, while `normal`/`low` age
    and get a guaranteed minimum share. Each send takes a token from the shared **Redis** rate
-   limiter, passes a per-channel circuit breaker, and the outcome is written back with a guarded
-   status transition.
-5. **Status events** stream to `notification.events` for WebSocket clients.
+   limiter, passes a per-channel circuit breaker (Phase 6), and the outcome is written back with a
+   guarded status transition.
+5. **Status events** stream to `notification.events` for WebSocket clients (Phase 8).
+
+### Processing engine (Phase 5)
+- **Dispatcher** ([`internal/dispatcher`](internal/dispatcher)): the relay locks up to 500 due rows,
+  publishes them with an idempotent `acks=all` producer, and marks them `queued` together with the
+  Kafka partition and offset of each record. It wakes on `NOTIFY notifications_due` and polls every
+  500 ms as a fallback (scheduled and retrying rows). Replicas share the work through
+  `FOR UPDATE SKIP LOCKED`.
+- **Reaper** (every 30 s, in every dispatcher): expired worker leases go to `retrying`. A `queued`
+  row whose offset is behind the committed offset of `workers.{channel}` was consumed without a
+  claim, so it goes back to `pending` (after a 1-minute grace period). A burst backlog is never
+  re-published, however long it waits. Rows queued for more than 24 h fall back to `pending`.
+- **Worker** ([`internal/worker`](internal/worker)): one consumer group member per channel. Records
+  are routed into one min-heap per priority (pausing a topic when its heap is full). For each send
+  the worker waits for a free sender (20 per channel), then for a rate-limit slot, and only then
+  picks the head with the highest *capped-aging* score. It claims the row (the claim waits on the
+  dispatcher's row lock if the record arrived before its commit), calls the provider with the
+  notification id as `Idempotency-Key`, and persists the outcome. Offsets are committed per
+  partition up to the highest contiguous finished record.
+- **Rate limiter** ([`internal/ratelimit`](internal/ratelimit)): a reserving GCRA in Redis. Each send
+  atomically reserves the channel's next 10 ms slot, shared by all replicas. A `429` sets a
+  fleet-wide cool-down. If Redis is down nothing is sent (fail closed).
+- Measured on the compose stack (1000 `low` SMS, then 100 `high`): all 1100 sent in 11.1 s with one
+  worker and 11.4 s with three (the floor at 100/s is 11.0 s). The provider never saw more than 100
+  SMS in a second, and the 100 `high` were delivered within 1.4 s despite the backlog.
+- Until Phase 6, every failed attempt is retried after `RETRY_DELAY` until `MAX_ATTEMPTS`, then the
+  notification is `failed`.
 
 ### Design decisions
 | ADR | Decision |
@@ -106,9 +132,11 @@ Schema: [`migrations/`](migrations) (goose, forward-only, embedded in the binary
   fenced by the `lease_token` of its claim. Racing transitions (a Kafka redelivery, a late worker
   whose lease was reaped and the row claimed again, a cancel during dispatch) have exactly one
   winner, and each of these races has an integration test.
-- Indexes: partial indexes on `next_attempt_at` (due work), `lease_until` (expired leases) and
-  `queued_at` (stuck `queued` rows), `(status, id)` for filtered lists and `(batch_id, id)` for
-  batches. Batches older than the retention are deleted by the same maintenance loop.
+- Indexes: partial indexes on `next_attempt_at` (due work), `lease_until` (expired leases),
+  `queued_at` (age fallback for `queued` rows) and `(channel, priority, kafka_partition,
+  kafka_offset)` (queued rows behind the committed offset), `(status, id)` for filtered lists and
+  `(batch_id, id)` for batches. Batches older than the retention are deleted by the same
+  maintenance loop.
 
 ## Scalability & capacity
 
@@ -231,6 +259,22 @@ stop the process with a message listing every problem. Copy [`.env.example`](.en
 | `RETENTION_DAYS` | `30` | dispatcher | Daily partitions older than this are dropped |
 | `PARTITION_PREMAKE_DAYS` | `7` | migrate, dispatcher | Partitions kept ready ahead of today |
 | `MAINTENANCE_INTERVAL` | `1h` | dispatcher | How often partition and key maintenance runs |
+| `DISPATCH_BATCH_SIZE` | `500` | dispatcher | Due rows published per transaction |
+| `DISPATCH_POLL_INTERVAL` | `500ms` | dispatcher | Fallback poll for scheduled and retrying rows; new rows wake the relay through `NOTIFY` |
+| `REAPER_INTERVAL` | `30s` | dispatcher | How often expired leases and lost `queued` rows are recovered |
+| `REAPER_GRACE` | `1m` | dispatcher | `queued` rows younger than this are never requeued |
+| `REAPER_STUCK_AFTER` | `24h` | dispatcher | Age fallback for `queued` rows the offset rule cannot judge |
+| `WORKER_CHANNELS` | `sms,email,push` | worker | Channels this process delivers (one consumer group member each) |
+| `WORKER_CONCURRENCY` | `20` | worker | Sends in flight per channel |
+| `PROVIDER_URL` | `http://localhost:8081/` | worker | Delivery provider endpoint, e.g. `https://webhook.site/<uuid>`. Compose defaults to the mock provider |
+| `PROVIDER_TIMEOUT` | `10s` | worker | Timeout of each provider request |
+| `LEASE_DURATION` | `30s` | worker | Claim lifetime; must be at least `PROVIDER_TIMEOUT` + 5s |
+| `RATE_LIMIT_SMS` / `_EMAIL` / `_PUSH` | `100` | worker | Messages per second per channel, across all workers (FR-2.2) |
+| `RATE_LIMIT_BURST` | `1` | worker | Sends allowed back to back after an idle period; above 1 a second can exceed the limit by `burst - 1` |
+| `RETRY_DELAY` | `5s` | worker | Delay before a failed attempt is retried (exponential backoff in Phase 6) |
+| `MAX_ATTEMPTS` | `5` | worker | Attempt budget; the last failure marks the notification `failed` |
+| `SCHEDULER_AGING_RATE` | `2` | worker | Priority points gained per second waited (capped per priority, [ADR-0006](docs/adr/0006-rate-limiting-and-priority-scheduling.md)) |
+| `SCHEDULER_MIN_SHARE` | `10` | worker | Every Nth send goes to `normal`/`low` under a `high` flood (0 disables) |
 | `MOCK_ADDR` | `:8081` | mockprovider | Listen address |
 | `MOCK_LATENCY` / `MOCK_LATENCY_JITTER` | `50ms` / `100ms` | mockprovider | Simulated latency: base + uniform `[0, jitter)` |
 | `MOCK_FAILURE_RATE` | `0` | mockprovider | Probability of HTTP 500 |
@@ -244,10 +288,20 @@ make test-short   # unit tests only, no Docker needed
 make lint         # golangci-lint (config: .golangci.yml)
 make cover        # coverage summary
 ```
-Repository tests in `internal/storage` are integration tests: they start PostgreSQL 17 with
-[testcontainers-go](https://golang.testcontainers.org/) and cover concurrency (`SKIP LOCKED`
-dispatchers, racing claims, concurrent idempotent creates), partition pruning and the partition
-lifecycle. They need Docker and are skipped by `make test-short`.
+Integration tests start the compose images (PostgreSQL 17, Kafka 4.1, Redis 7) with
+[testcontainers-go](https://golang.testcontainers.org/) (`internal/testinfra`). They need Docker
+and are skipped by `make test-short`:
+- `internal/storage`: concurrency (`SKIP LOCKED` dispatchers, racing claims, a claim racing the
+  dispatch commit, concurrent idempotent creates), Kafka positions and the offset reaper rule,
+  partition pruning and the partition lifecycle.
+- `internal/dispatcher`, `internal/ratelimit`: publishing and committed offsets on Kafka, and the
+  shared rate across several limiters on Redis.
+- `internal/integration`: the engine end to end. Two workers share the group, every notification is
+  delivered exactly once, a 503 is retried, a cancelled row is never sent, the rate holds, and a
+  lost record is recovered by the reaper.
+
+The worker engine (scheduler, watermarks, backpressure, rebalance, shutdown) is unit-tested with
+fakes, without Kafka.
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs lint, race-enabled tests with
 coverage and a Docker image build on every push to `main` and every pull request. No test calls
 the real webhook.site; the provider is faked with `httptest` or the mock provider.

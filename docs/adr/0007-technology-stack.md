@@ -16,7 +16,7 @@ library and small, well-maintained libraries over frameworks.
 | PostgreSQL | PostgreSQL 17 + `jackc/pgx/v5` (pgxpool) | Fast native driver, `LISTEN/NOTIFY`, `COPY` for batches |
 | Migrations | `pressly/goose/v3` (SQL files) | Versioned SQL, embeddable, runs as a compose job |
 | Kafka | Apache Kafka 4.x (KRaft, single node locally) + `twmb/franz-go` | ADR-0002 |
-| Redis | Redis 7 + `redis/go-redis/v9` + `go-redis/redis_rate/v10` | ADR-0006 |
+| Redis | Redis 7 + `redis/go-redis/v9` (`go-redis/redis_rate/v10` planned, replaced in Phase 5) | ADR-0006 |
 | Validation | Hand-written rules in `internal/domain` (amended, see below) | Channel-specific rules with per-field messages |
 | Circuit breaker | `sony/gobreaker/v2` | Small and proven |
 | API contract | Spec-first `api/openapi.yaml`, served with Swagger UI, linted with Redocly CLI in CI | The contract is reviewed before code |
@@ -42,6 +42,15 @@ segment counting with GSM-7/UCS-2 detection), which struct tags cannot express, 
 violations as `field` paths such as `notifications[3].content`. Plain Go functions in
 `internal/domain` do both with one dependency fewer. Swagger UI is loaded from a pinned CDN
 build (`swagger-ui-dist@5.17.14`) rather than embedded, so it adds no Go dependency.
+
+**Amendment (2026-11-21, Phase 5):** `twmb/franz-go/pkg/kadm` was added. It is the admin client
+of the franz-go project, shipped as its own module, and the reaper uses it to read committed
+offsets (ADR-0003). It is pinned to v1.20.0, the release paired with franz-go v1.22.3. The
+listed `go-redis/redis_rate/v10` was dropped: measurements showed its try-and-retry model loses
+send slots under contention, and a 30-line reserving GCRA script on plain go-redis replaces it
+(ADR-0006 amendment). No testcontainers module was added for Kafka or Redis: the Kafka module
+only supports Confluent images, so `internal/testinfra` starts the compose images
+(`apache/kafka`, `redis`) as generic containers.
 
 ## Consequences
 - ✅ A small, mainstream dependency set that reviewers will recognise.
