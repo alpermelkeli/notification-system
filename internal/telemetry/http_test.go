@@ -13,6 +13,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/alpermelkeli/notification-system/internal/httpx"
 )
@@ -20,11 +21,11 @@ import (
 func TestHTTPMiddlewareNamesSpansAfterTheRoute(t *testing.T) {
 	rec := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
-	prevTP, prevProp := otel.GetTracerProvider(), otel.GetTextMapPropagator()
+	prevProp := otel.GetTextMapPropagator()
 	otel.SetTracerProvider(tp)
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 	t.Cleanup(func() {
-		otel.SetTracerProvider(prevTP)
+		otel.SetTracerProvider(noop.NewTracerProvider())
 		otel.SetTextMapPropagator(prevProp)
 		_ = tp.Shutdown(context.Background())
 	})
