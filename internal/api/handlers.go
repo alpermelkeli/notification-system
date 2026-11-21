@@ -355,9 +355,17 @@ func parseListFilter(r *http.Request) (storage.ListFilter, *requestError) {
 	return f, nil
 }
 
+// maxViolations bounds the violations listed in one response, so a request with thousands of
+// bad fields does not get an equally large answer.
+const maxViolations = 100
+
 func validationFailed(vs []violation) *requestError {
-	return &requestError{status: http.StatusUnprocessableEntity, code: "validation_failed",
-		message: "request validation failed", violations: vs}
+	msg := "request validation failed"
+	if len(vs) > maxViolations {
+		msg = fmt.Sprintf("request validation failed; the first %d of %d violations are listed", maxViolations, len(vs))
+		vs = vs[:maxViolations]
+	}
+	return &requestError{status: http.StatusUnprocessableEntity, code: "validation_failed", message: msg, violations: vs}
 }
 
 // writeError maps an error to the error envelope. Only this function knows HTTP status codes

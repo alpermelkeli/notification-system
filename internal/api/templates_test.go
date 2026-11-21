@@ -275,3 +275,17 @@ func assertViolations(t *testing.T, res response, fields ...string) {
 		t.Errorf("violations on %v, want %v (%s)", got, want, res.Body.String())
 	}
 }
+
+func TestViolationsAreCapped(t *testing.T) {
+	s := newServer(t)
+	tpl := s.createTemplate(t, "otp", "sms", "Code {{code}}")
+	vars := make([]string, 300)
+	for i := range vars {
+		vars[i] = fmt.Sprintf(`"v%d":"x"`, i)
+	}
+	body := fmt.Sprintf(`{"recipient":"+905551234567","templateId":%q,"variables":{"code":"1",%s}}`, tpl.ID, strings.Join(vars, ","))
+	e := s.do(t, http.MethodPost, "/v1/notifications", body).wantStatus(http.StatusUnprocessableEntity).errorBody()
+	if len(e.Details) != maxViolations || !strings.Contains(e.Message, "100 of 300") {
+		t.Errorf("%d details, message %q", len(e.Details), e.Message)
+	}
+}

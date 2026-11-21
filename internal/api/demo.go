@@ -23,7 +23,7 @@ function log(kind, text) {
 
 function render(e) {
   const prev = rows.get(e.notificationId);
-  if (prev && prev.at > e.at) return; // events may arrive out of order; keep the latest
+  if (prev && Date.parse(prev.at) > Date.parse(e.at)) return; // events may arrive out of order; keep the latest
   rows.set(e.notificationId, e);
   let tr = document.querySelector('tr[data-id="' + e.notificationId + '"]');
   if (!tr) {
