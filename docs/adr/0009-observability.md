@@ -40,12 +40,14 @@ Two properties of the design shape the work:
      gets a fresh registry, and each role only exports what it does.
    - *The default global registry.* It is simpler, but conflicts with the no-globals convention
      and leaks state between tests.
-4. **HTTP server spans**
-   - *Our own middleware* (chosen). otelhttp's handler names spans after `http.Request.Pattern`,
-     which chi sets to the mount point (`/v1/*`) for sub-router routes. Our middleware names the
-     span after the complete chi route once routing is done.
-   - otelhttp is still used for the provider client (`otelhttp.NewTransport`), where it adds the
-     client span and the `traceparent` header.
+4. **HTTP spans**
+   - *Our own server middleware and provider client span* (chosen). otelhttp's handler names spans
+     after `http.Request.Pattern`, which chi sets to the mount point (`/v1/*`) for sub-router
+     routes; ours names the span after the complete chi route once routing is done. otelhttp's
+     transport records `url.full`, and the provider URL's path is a credential (the webhook.site
+     inbox id), so the provider client starts its own span with only the host and injects
+     `traceparent` itself. Transport errors are also stripped of the URL before they reach logs,
+     spans and `last_error`.
 
 ## Decision
 **Metrics** (`internal/metrics`, served on `/metrics` by every role; blocked at the public LB):
@@ -59,7 +61,8 @@ Two properties of the design shape the work:
 | Worker state | `notifier_worker_sends_in_flight`, `notifier_worker_buffered_records{channel,priority}`, `notifier_circuit_breaker_state{channel}` (0/1/2), `notifier_circuit_breaker_transitions_total`, `notifier_worker_db_retries_total{channel,operation}` |
 | Failures | `notifier_dead_letters_total{source,result}` |
 
-Route labels use the chi pattern (`/v1/notifications/{id}`), never the raw path. Every
+Route labels use the chi pattern (`/v1/notifications/{id}`), never the raw path, and methods
+outside the standard set are reported as `_OTHER`, so clients cannot create series. Every
 dispatcher replica reports the same depth values, so queries take `max()` over instances.
 
 **Traces** (`internal/telemetry`): `main` installs the W3C propagator, plus an OTLP/HTTP
@@ -88,8 +91,13 @@ context holds a recorded span, so a log line leads to its trace and back.
 - ✅ Every requirement of FR-4.1 can be read from Prometheus: backlog per stage, rates by
   outcome, and latency at three levels (API request, provider call, end to end).
 - ✅ One trace per notification shows where its time went, retries included.
-- ✅ Tracing is optional. Without an endpoint the provider stays no-op, spans cost nothing, and no
-  `traceparent` is stored. An unreachable collector only drops spans.
+- ✅ Tracing is optional. Without an endpoint the provider stays no-op and spans cost nothing; an
+  unreachable collector only drops spans. The propagator is installed either way, so a
+  `traceparent` sent by a client is still stored and passed on, which keeps traces whole across
+  services that do trace.
+- ⚠️ Sampling is parent-based, so a client that sends `traceparent` with the sampled flag is always
+  recorded, whatever `TRACE_SAMPLE_RATIO` says. That suits internal callers; a public edge would
+  start a new root with a link to the client's span instead.
 - ⚠️ The depth query counts unfinished rows. During a multi-million-row burst it scans the status
   index range of the backlog every 15 s per dispatcher replica. At that scale, sample from one
   replica (behind the maintenance advisory lock) or switch to estimates.

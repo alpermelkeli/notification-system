@@ -53,9 +53,10 @@ only supports Confluent images, so `internal/testinfra` starts the compose image
 (`apache/kafka`, `redis`) as generic containers.
 
 **Amendment (2026-11-21, Phase 7):** the OpenTelemetry row is implemented with
-`go.opentelemetry.io/otel`, `otel/trace` and `otel/sdk` v1.47.0, the OTLP/HTTP trace exporter
-(`otel/exporters/otlp/otlptrace/otlptracehttp` v1.47.0), and `contrib/.../otelhttp` v0.72.0 for
-the provider client only. HTTP was chosen over the gRPC exporter to keep a gRPC client out of the
+`go.opentelemetry.io/otel`, `otel/trace` and `otel/sdk` v1.47.0 and the OTLP/HTTP trace exporter
+(`otel/exporters/otlp/otlptrace/otlptracehttp` v1.47.0). `contrib/.../otelhttp` is not used: its
+server spans are misnamed under chi sub-routers and its client spans record the full provider URL,
+whose path is a credential. HTTP was chosen over the gRPC exporter to keep a gRPC client out of the
 binary. The exporter's config package still imports `google.golang.org/grpc` for shared types, so
 it appears as an indirect module. Kafka headers carry the trace context through a 30-line carrier
 in `internal/telemetry` instead of the `franz-go/plugin/kotel` module, and the database hop is

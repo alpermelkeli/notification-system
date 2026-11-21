@@ -33,7 +33,7 @@ func NewDispatch(reg prometheus.Registerer) *Dispatch {
 	m := &Dispatch{
 		dispatched: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace, Name: "dispatched_total",
-			Help: "Notifications published to the Kafka work topics, by channel and priority.",
+			Help: "Notifications published to the Kafka work topics, by channel and priority. Counted on publish, before the relay commits; a failed commit leaves duplicates that the workers discard.",
 		}, []string{"channel", "priority"}),
 		dispatchErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace, Name: "dispatch_errors_total",
