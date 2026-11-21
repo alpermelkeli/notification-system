@@ -4,6 +4,7 @@
 //	notifier api           public HTTP API
 //	notifier dispatcher    PostgreSQL -> Kafka relay and reaper
 //	notifier worker        channel consumers and provider delivery
+//	notifier migrate       apply database migrations ("migrate status" lists them)
 //	notifier healthcheck   probe a local health endpoint (for container health checks)
 //	notifier version       print the build version
 package main
@@ -33,6 +34,10 @@ var roles = map[string]roleFunc{
 	"api":        app.RunAPI,
 	"dispatcher": app.RunDispatcher,
 	"worker":     app.RunWorker,
+	// migrate is a one-shot job; "migrate up" is an alias of "migrate".
+	"migrate":        app.RunMigrate,
+	"migrate up":     app.RunMigrate,
+	"migrate status": app.RunMigrateStatus,
 }
 
 func main() {
@@ -56,9 +61,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	role, ok := roles[args[0]]
+	name := args[0]
+	if name == "migrate" && len(args) > 1 {
+		name += " " + args[1]
+	}
+	role, ok := roles[name]
 	if !ok {
-		_, _ = fmt.Fprintf(stderr, "unknown command %q\n\n", args[0])
+		_, _ = fmt.Fprintf(stderr, "unknown command %q\n\n", name)
 		usage(stderr)
 		return 2
 	}
@@ -126,6 +135,7 @@ commands:
   api           serve the public HTTP API
   dispatcher    relay due notifications from PostgreSQL to Kafka
   worker        consume channel topics and deliver notifications
+  migrate       [up|status] apply database migrations and create partitions, or list them
   healthcheck   [url] exit 0 if url (default http://127.0.0.1:8080/healthz) returns 200
   version       print the build version
 

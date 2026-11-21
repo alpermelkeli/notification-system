@@ -18,6 +18,7 @@ func TestRunCommands(t *testing.T) {
 	}{
 		{"no args", nil, 2, "", "usage: notifier"},
 		{"unknown", []string{"nope"}, 2, "", `unknown command "nope"`},
+		{"migrations are forward-only", []string{"migrate", "down"}, 2, "", `unknown command "migrate down"`},
 		{"help", []string{"help"}, 0, "usage: notifier", ""},
 		{"version", []string{"version"}, 0, "dev", ""},
 	}

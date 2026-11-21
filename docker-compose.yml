@@ -105,11 +105,19 @@ services:
       retries: 10
 
   # ---------------------------------------------------------------- notifier roles
+  # One-shot job: schema migrations and initial partitions. The roles below wait for it.
+  migrate:
+    <<: *app
+    command: ["migrate"]
+    restart: "no"
+    depends_on:
+      postgres: { condition: service_healthy }
+
   api:
     <<: *app
     command: ["api"]
     depends_on:
-      postgres: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
     healthcheck:
       test: ["CMD", "notifier", "healthcheck", "http://127.0.0.1:8080/healthz"]
       interval: 5s
@@ -122,7 +130,7 @@ services:
     deploy:
       replicas: 2 # HA; replicas coordinate through FOR UPDATE SKIP LOCKED (ADR-0003)
     depends_on:
-      postgres: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
       kafka-init: { condition: service_completed_successfully }
     healthcheck:
       test: ["CMD", "notifier", "healthcheck", "http://127.0.0.1:9090/healthz"]
@@ -134,7 +142,7 @@ services:
     <<: *app
     command: ["worker"]
     depends_on:
-      postgres: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
       redis: { condition: service_healthy }
       kafka-init: { condition: service_completed_successfully }
       mockprovider: { condition: service_healthy }
