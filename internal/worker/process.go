@@ -94,6 +94,7 @@ func (w *Worker) process(runCtx context.Context, r record, adm admission) bool {
 		return true
 	}
 	span.SetAttributes(telemetry.AttrAttempt.Int(n.Attempts))
+	w.opts.Events.Publish(runCtx, n)
 	c := claimed{n: n, leaseEnd: claimStart.Add(w.opts.Lease)}
 	c.lease, _ = n.Lease()
 	base := context.WithoutCancel(runCtx)
@@ -189,14 +190,17 @@ type claimed struct {
 // release hands a claimed notification back to retrying after delay without consuming the
 // attempt. It returns the outcome for the metrics.
 func (w *Worker) release(ctx context.Context, log *slog.Logger, c claimed, delay time.Duration, reason string) metrics.Outcome {
+	var row domain.Notification
 	_, err := w.persist(ctx, c, func(ctx context.Context) error {
-		_, err := w.store.Release(ctx, c.lease, delay, reason)
+		var err error
+		row, err = w.store.Release(ctx, c.lease, delay, reason)
 		return err
 	})
 	if err != nil {
 		log.ErrorContext(ctx, "release not persisted; the lease will expire and be retried", "err", err)
 		return metrics.OutcomeUnpersisted
 	}
+	w.opts.Events.Publish(ctx, row)
 	return metrics.OutcomeReleased
 }
 
@@ -274,6 +278,7 @@ func (w *Worker) settle(ctx context.Context, log *slog.Logger, c claimed, res pr
 		log.ErrorContext(ctx, "outcome not persisted; the lease will expire and be retried", "err", err)
 		return metrics.OutcomeUnpersisted
 	}
+	w.opts.Events.Publish(ctx, row)
 	switch target {
 	case domain.StatusSent:
 		// End to end: from when the notification was first due, across retries.

@@ -11,12 +11,15 @@ import (
 )
 
 // createRequest is the body of POST /v1/notifications (schema CreateNotificationRequest).
+// Content comes either from Content or from a template and its variables (B-3).
 type createRequest struct {
-	Recipient   string     `json:"recipient"`
-	Channel     string     `json:"channel"`
-	Content     string     `json:"content"`
-	Priority    string     `json:"priority,omitempty"`
-	ScheduledAt *time.Time `json:"scheduledAt,omitempty"`
+	Recipient   string            `json:"recipient"`
+	Channel     string            `json:"channel"`
+	Content     string            `json:"content"`
+	TemplateID  *string           `json:"templateId,omitempty"`
+	Variables   map[string]string `json:"variables,omitempty"`
+	Priority    string            `json:"priority,omitempty"`
+	ScheduledAt *time.Time        `json:"scheduledAt,omitempty"`
 }
 
 // batchItemRequest is one item of POST /v1/notifications/batch (schema BatchItemRequest).
@@ -47,6 +50,8 @@ type notificationJSON struct {
 	ProviderMessageID *string    `json:"providerMessageId,omitempty"`
 	LastError         *string    `json:"lastError,omitempty"`
 	CorrelationID     string     `json:"correlationId,omitempty"`
+	TemplateID        *uuid.UUID `json:"templateId,omitempty"`
+	TemplateVersion   *int       `json:"templateVersion,omitempty"`
 	CreatedAt         time.Time  `json:"createdAt"`
 	UpdatedAt         time.Time  `json:"updatedAt"`
 }
@@ -57,8 +62,45 @@ func toNotificationJSON(n domain.Notification) notificationJSON {
 		Recipient: n.Recipient, Content: n.Content, Status: string(n.Status), Attempts: n.Attempts,
 		NextAttemptAt: n.NextAttemptAt, ScheduledAt: n.ScheduledAt, QueuedAt: n.QueuedAt, SentAt: n.SentAt,
 		ProviderMessageID: n.ProviderMessageID, LastError: n.LastError, CorrelationID: n.CorrelationID,
-		CreatedAt: n.CreatedAt, UpdatedAt: n.UpdatedAt,
+		TemplateID: n.TemplateID, TemplateVersion: n.TemplateVersion, CreatedAt: n.CreatedAt, UpdatedAt: n.UpdatedAt,
 	}
+}
+
+// templateRequest is the body of POST /v1/templates and PUT /v1/templates/{id} (schema
+// TemplateRequest).
+type templateRequest struct {
+	Name    string `json:"name"`
+	Channel string `json:"channel"`
+	Body    string `json:"body"`
+}
+
+// templateJSON is schema Template.
+type templateJSON struct {
+	ID        uuid.UUID `json:"id"`
+	Name      string    `json:"name"`
+	Channel   string    `json:"channel"`
+	Body      string    `json:"body"`
+	Variables []string  `json:"variables"`
+	Version   int       `json:"version"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+func toTemplateJSON(t domain.Template) templateJSON {
+	vars := t.Variables()
+	if vars == nil {
+		vars = []string{}
+	}
+	return templateJSON{
+		ID: t.ID, Name: t.Name, Channel: string(t.Channel), Body: t.Body, Variables: vars,
+		Version: t.Version, CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt,
+	}
+}
+
+// templateListJSON is schema TemplateList.
+type templateListJSON struct {
+	Items      []templateJSON `json:"items"`
+	NextCursor string         `json:"nextCursor,omitempty"`
 }
 
 // listJSON is schema NotificationList.

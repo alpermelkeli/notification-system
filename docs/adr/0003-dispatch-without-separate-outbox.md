@@ -51,7 +51,8 @@ COMMIT;            -- on publish failure: ROLLBACK, back off, retry
     crash recovery is handled by watermark offset commits (ADR-0002).
 - **Status events** (`notification.events`) are published **best-effort after commit** by the
   component that changed the state. PostgreSQL remains the truth. Losing an event only delays a
-  WebSocket update, and clients can always query the API.
+  WebSocket update, and clients can always query the API. Implemented in Phase 8
+  ([ADR-0011](0011-status-events-and-websocket.md)).
 
 **Amendment (2026-11-21, before Phase 5): the `queued` reaper compares Kafka offsets, not ages.**
 

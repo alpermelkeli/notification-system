@@ -253,13 +253,13 @@ type PublishFunc func(context.Context, []domain.Notification) ([]KafkaPosition, 
 // stay due.
 //
 // A crash between a successful publish and the commit re-publishes the rows later; workers
-// discard the duplicates through the guarded claim (ADR-0004).
-func (s *Store) DispatchDue(ctx context.Context, limit int, publish PublishFunc) (int, error) {
+// discard the duplicates through the guarded claim (ADR-0004). It returns the rows as queued.
+func (s *Store) DispatchDue(ctx context.Context, limit int, publish PublishFunc) ([]domain.Notification, error) {
 	t := transition{from: domain.DispatchableStatuses, to: domain.StatusQueued}
 	if err := t.validate(); err != nil {
-		return 0, err
+		return nil, err
 	}
-	var n int
+	var queued []domain.Notification
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			SELECT `+columns("")+` FROM notifications
@@ -294,7 +294,7 @@ func (s *Store) DispatchDue(ctx context.Context, limit int, publish PublishFunc)
 			ids[i], createdAts[i], prev[i] = d.ID, d.CreatedAt, string(d.Status)
 			partitions[i], offsets[i] = positions[i].Partition, positions[i].Offset
 		}
-		tag, err := tx.Exec(ctx, `
+		rows, err = tx.Query(ctx, `
 WITH b AS (
     SELECT * FROM unnest($1::uuid[], $2::timestamptz[], $3::text[], $4::integer[], $5::bigint[])
         AS b(id, created_at, prev_status, kafka_partition, kafka_offset)
@@ -304,29 +304,38 @@ WITH b AS (
            kafka_partition = b.kafka_partition, kafka_offset = b.kafka_offset
       FROM b
      WHERE n.id = b.id AND n.created_at = b.created_at AND n.status = b.prev_status
- RETURNING n.id, n.created_at, n.attempts, b.prev_status
+ RETURNING `+columns("n")+`, b.prev_status
+), hist AS (
+    INSERT INTO notification_status_history
+           (notification_id, notification_created_at, from_status, to_status, attempt, reason)
+    SELECT id, created_at, prev_status, 'queued', attempts, 'dispatched' FROM upd
 )
-INSERT INTO notification_status_history
-       (notification_id, notification_created_at, from_status, to_status, attempt, reason)
-SELECT id, created_at, prev_status, 'queued', attempts, 'dispatched' FROM upd`,
+SELECT `+columns("")+` FROM upd`,
 			ids, createdAts, prev, partitions, offsets)
 		if err != nil {
 			return fmt.Errorf("mark queued: %w", err)
 		}
-		// The rows are locked by this transaction, so all of them must have been updated.
-		if int(tag.RowsAffected()) != len(due) {
-			return fmt.Errorf("mark queued: updated %d of %d rows", tag.RowsAffected(), len(due))
+		updated, err := collectNotifications(rows)
+		if err != nil {
+			return fmt.Errorf("mark queued: %w", err)
 		}
-		n = len(due)
+		// The rows are locked by this transaction, so all of them must have been updated.
+		if len(updated) != len(due) {
+			return fmt.Errorf("mark queued: updated %d of %d rows", len(updated), len(due))
+		}
+		queued = updated
 		return nil
 	})
-	return n, err
+	if err != nil {
+		return nil, err
+	}
+	return queued, nil
 }
 
 // ReapResult is what one ReapExpiredLeases call changed.
 type ReapResult struct {
-	// Retried counts rows moved to retrying.
-	Retried int
+	// Retried holds rows moved to retrying.
+	Retried []domain.Notification
 	// Failed holds rows moved to failed because their expired claim was their last attempt; the
 	// caller publishes their dead letters.
 	Failed []domain.Notification
@@ -378,7 +387,7 @@ SELECT `+columns("")+` FROM upd`, limit, maxAttempts)
 		if n.Status == domain.StatusFailed {
 			res.Failed = append(res.Failed, n)
 		} else {
-			res.Retried++
+			res.Retried = append(res.Retried, n)
 		}
 	}
 	return res, nil
@@ -397,19 +406,19 @@ type CommittedOffset struct {
 }
 
 // RequeueConsumed moves up to limit queued notifications whose Kafka record the workers have
-// already consumed back to pending (ADR-0003 amendment). Workers commit an offset only after the
+// already consumed back to pending, and returns them (ADR-0003 amendment). Workers commit an offset only after the
 // record's outcome or skip is persisted (ADR-0002), so a row still queued behind its partition's
 // committed offset was seen without a successful claim: its record was dropped, or it reached a
 // worker before the dispatcher's commit made the row queued. Rows queued less than grace ago are
 // left alone, and rows at or above the committed offset are still in the backlog and are never
 // touched, however long they wait.
-func (s *Store) RequeueConsumed(ctx context.Context, committed []CommittedOffset, grace time.Duration, limit int) (int, error) {
+func (s *Store) RequeueConsumed(ctx context.Context, committed []CommittedOffset, grace time.Duration, limit int) ([]domain.Notification, error) {
 	t := transition{from: []domain.Status{domain.StatusQueued}, to: domain.StatusPending}
 	if err := t.validate(); err != nil {
-		return 0, err
+		return nil, err
 	}
 	if len(committed) == 0 {
-		return 0, nil
+		return nil, nil
 	}
 	channels := make([]string, len(committed))
 	priorities := make([]string, len(committed))
@@ -419,7 +428,7 @@ func (s *Store) RequeueConsumed(ctx context.Context, committed []CommittedOffset
 		channels[i], priorities[i] = string(c.Channel), string(c.Priority)
 		partitions[i], offsets[i] = c.Partition, c.Offset
 	}
-	tag, err := s.pool.Exec(ctx, `
+	rows, err := s.pool.Query(ctx, `
 WITH c AS (
     SELECT * FROM unnest($1::text[], $2::text[], $3::integer[], $4::bigint[])
         AS c(channel, priority, kafka_partition, committed)
@@ -436,28 +445,34 @@ WITH c AS (
        SET status = 'pending', next_attempt_at = now(), updated_at = now()`+clearQueued+`
       FROM prev
      WHERE n.id = prev.id AND n.created_at = prev.created_at
- RETURNING n.id, n.created_at, n.attempts, prev.status AS prev_status
+ RETURNING `+columns("n")+`, prev.status AS prev_status
+), hist AS (
+    INSERT INTO notification_status_history
+           (notification_id, notification_created_at, from_status, to_status, attempt, reason)
+    SELECT id, created_at, prev_status, 'pending', attempts, 'kafka record consumed without claim' FROM upd
 )
-INSERT INTO notification_status_history
-       (notification_id, notification_created_at, from_status, to_status, attempt, reason)
-SELECT id, created_at, prev_status, 'pending', attempts, 'kafka record consumed without claim' FROM upd`,
+SELECT `+columns("")+` FROM upd`,
 		channels, priorities, partitions, offsets, grace.Seconds(), limit)
 	if err != nil {
-		return 0, fmt.Errorf("requeue consumed notifications: %w", err)
+		return nil, fmt.Errorf("requeue consumed notifications: %w", err)
 	}
-	return int(tag.RowsAffected()), nil
+	requeued, err := collectNotifications(rows)
+	if err != nil {
+		return nil, fmt.Errorf("requeue consumed notifications: %w", err)
+	}
+	return requeued, nil
 }
 
 // RequeueStuck moves up to limit notifications that have been queued for longer than olderThan
-// back to pending, so the dispatcher publishes them again. It is the reaper's long age fallback
+// back to pending, so the dispatcher publishes them again, and returns them. It is the reaper's long age fallback
 // (default 24 h) for rows RequeueConsumed cannot judge, e.g. after a topic was recreated and its
 // offsets restarted from zero (ADR-0003 amendment).
-func (s *Store) RequeueStuck(ctx context.Context, olderThan time.Duration, limit int) (int, error) {
+func (s *Store) RequeueStuck(ctx context.Context, olderThan time.Duration, limit int) ([]domain.Notification, error) {
 	t := transition{from: []domain.Status{domain.StatusQueued}, to: domain.StatusPending}
 	if err := t.validate(); err != nil {
-		return 0, err
+		return nil, err
 	}
-	tag, err := s.pool.Exec(ctx, `
+	rows, err := s.pool.Query(ctx, `
 WITH prev AS (
     SELECT id, created_at, status FROM notifications
      WHERE status = 'queued' AND queued_at < now() - make_interval(secs => $1)
@@ -469,15 +484,21 @@ WITH prev AS (
        SET status = 'pending', next_attempt_at = now(), updated_at = now()`+clearQueued+`
       FROM prev
      WHERE n.id = prev.id AND n.created_at = prev.created_at
- RETURNING n.id, n.created_at, n.attempts, prev.status AS prev_status
+ RETURNING `+columns("n")+`, prev.status AS prev_status
+), hist AS (
+    INSERT INTO notification_status_history
+           (notification_id, notification_created_at, from_status, to_status, attempt, reason)
+    SELECT id, created_at, prev_status, 'pending', attempts, 'stuck in queued' FROM upd
 )
-INSERT INTO notification_status_history
-       (notification_id, notification_created_at, from_status, to_status, attempt, reason)
-SELECT id, created_at, prev_status, 'pending', attempts, 'stuck in queued' FROM upd`, olderThan.Seconds(), limit)
+SELECT `+columns("")+` FROM upd`, olderThan.Seconds(), limit)
 	if err != nil {
-		return 0, fmt.Errorf("requeue stuck notifications: %w", err)
+		return nil, fmt.Errorf("requeue stuck notifications: %w", err)
 	}
-	return int(tag.RowsAffected()), nil
+	requeued, err := collectNotifications(rows)
+	if err != nil {
+		return nil, fmt.Errorf("requeue stuck notifications: %w", err)
+	}
+	return requeued, nil
 }
 
 func notifyDue(ctx context.Context, q querier) error {

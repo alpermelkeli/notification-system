@@ -1,4 +1,4 @@
-// Package api implements the public HTTP API (FR-1.x) described by api/openapi.yaml. Handlers
+// Package api implements the public HTTP API (FR-1.x, B-3 templates) described by api/openapi.yaml. Handlers
 // decode and validate requests, call the store and map domain errors to HTTP responses; they
 // never talk to Kafka (ADR-0003).
 package api
@@ -16,6 +16,7 @@ import (
 
 	apispec "github.com/alpermelkeli/notification-system/api"
 	"github.com/alpermelkeli/notification-system/internal/domain"
+	"github.com/alpermelkeli/notification-system/internal/httpx"
 	"github.com/alpermelkeli/notification-system/internal/logging"
 	"github.com/alpermelkeli/notification-system/internal/metrics"
 	"github.com/alpermelkeli/notification-system/internal/storage"
@@ -32,7 +33,26 @@ type Store interface {
 	Replay(ctx context.Context, id uuid.UUID) (domain.Notification, error)
 	ListNotifications(ctx context.Context, f storage.ListFilter) (storage.ListPage, error)
 	GetBatch(ctx context.Context, id uuid.UUID) (domain.Batch, error)
+	FindIdempotencyKey(ctx context.Context, k storage.IdempotencyKey) (storage.KeyMatch, error)
+	ReplayBatch(ctx context.Context, id uuid.UUID, items []storage.NewNotification) (storage.BatchResult, error)
+
+	CreateTemplate(ctx context.Context, in storage.TemplateInput) (domain.Template, error)
+	GetTemplate(ctx context.Context, id uuid.UUID) (domain.Template, error)
+	GetTemplates(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]domain.Template, error)
+	ListTemplates(ctx context.Context, f storage.TemplateFilter) (storage.TemplatePage, error)
+	UpdateTemplate(ctx context.Context, id uuid.UUID, in storage.TemplateInput) (domain.Template, error)
+	DeleteTemplate(ctx context.Context, id uuid.UUID) error
 }
+
+// EventPublisher publishes the status events of changed rows (ADR-0011). It must not block.
+// *events.Publisher implements it.
+type EventPublisher interface {
+	Publish(ctx context.Context, ns ...domain.Notification)
+}
+
+type noEvents struct{}
+
+func (noEvents) Publish(context.Context, ...domain.Notification) {}
 
 // Options configures the API.
 type Options struct {
@@ -43,6 +63,12 @@ type Options struct {
 	RequestTimeout time.Duration
 	// Metrics counts created notifications. Optional.
 	Metrics *metrics.HTTP
+	// Events receives every notification the API creates, cancels or replays (ADR-0011).
+	// Optional.
+	Events EventPublisher
+	// WebSocket serves GET /v1/ws, the live status stream (B-4). Without it the route answers
+	// 404.
+	WebSocket http.Handler
 	// Now returns the current time. Default time.Now.
 	Now func() time.Time
 }
@@ -79,21 +105,21 @@ func New(store Store, logger *slog.Logger, opts Options) *Handler {
 	if opts.MaxScheduleAhead <= 0 {
 		opts.MaxScheduleAhead = 7 * 24 * time.Hour
 	}
+	if opts.Events == nil {
+		opts.Events = noEvents{}
+	}
 	return &Handler{store: store, logger: logger, opts: opts}
 }
 
 // Routes mounts the API and its documentation on r.
 func (h *Handler) Routes(r chi.Router) {
 	r.Route("/v1", func(r chi.Router) {
-		r.Use(h.deadline)
-		r.Post("/notifications", h.createNotification)
-		r.Get("/notifications", h.listNotifications)
-		r.Post("/notifications/batch", h.createBatch)
-		r.Get("/notifications/{id}", h.getNotification)
-		r.Get("/notifications/{id}/history", h.getHistory)
-		r.Post("/notifications/{id}/cancel", h.cancelNotification)
-		r.Post("/notifications/{id}/retry", h.retryNotification)
-		r.Get("/batches/{id}", h.getBatch)
+		// A WebSocket connection lasts for hours, so it gets no request deadline.
+		r.Method(http.MethodGet, "/ws", h.websocket())
+		r.Group(func(r chi.Router) {
+			r.Use(h.deadline)
+			h.v1Routes(r)
+		})
 	})
 	r.Get("/openapi.yaml", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/yaml")
@@ -103,6 +129,37 @@ func (h *Handler) Routes(r chi.Router) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Content-Security-Policy", docsCSP)
 		_, _ = w.Write([]byte(swaggerUI))
+	})
+	r.Get("/ws-demo", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Content-Security-Policy", demoCSP)
+		_, _ = w.Write([]byte(demoPage))
+	})
+}
+
+// v1Routes mounts the request/response endpoints of /v1.
+func (h *Handler) v1Routes(r chi.Router) {
+	r.Post("/notifications", h.createNotification)
+	r.Get("/notifications", h.listNotifications)
+	r.Post("/notifications/batch", h.createBatch)
+	r.Get("/notifications/{id}", h.getNotification)
+	r.Get("/notifications/{id}/history", h.getHistory)
+	r.Post("/notifications/{id}/cancel", h.cancelNotification)
+	r.Post("/notifications/{id}/retry", h.retryNotification)
+	r.Get("/batches/{id}", h.getBatch)
+	r.Post("/templates", h.createTemplate)
+	r.Get("/templates", h.listTemplates)
+	r.Get("/templates/{id}", h.getTemplate)
+	r.Put("/templates/{id}", h.updateTemplate)
+	r.Delete("/templates/{id}", h.deleteTemplate)
+}
+
+func (h *Handler) websocket() http.Handler {
+	if h.opts.WebSocket != nil {
+		return h.opts.WebSocket
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		httpx.WriteError(w, http.StatusNotFound, "not_found", "resource not found")
 	})
 }
 

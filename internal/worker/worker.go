@@ -52,6 +52,16 @@ type DeadLetterPublisher interface {
 	Publish(ctx context.Context, ns ...domain.Notification) error
 }
 
+// EventPublisher publishes the status events of rows the worker changed (ADR-0011). It must not
+// block. *events.Publisher implements it.
+type EventPublisher interface {
+	Publish(ctx context.Context, ns ...domain.Notification)
+}
+
+type noEvents struct{}
+
+func (noEvents) Publish(context.Context, ...domain.Notification) {}
+
 // Limiter hands out send tokens. *ratelimit.Limiter implements it.
 type Limiter interface {
 	Wait(ctx context.Context, c domain.Channel) error
@@ -74,6 +84,9 @@ type Options struct {
 	Retry retry.Policy
 	// DeadLetters, if set, receives every notification this worker moves to failed.
 	DeadLetters DeadLetterPublisher
+	// Events receives every row this worker changes: claimed, sent, retrying, failed, released.
+	// Optional.
+	Events EventPublisher
 	// CommitInterval is how often watermarks are committed. Default 1s.
 	CommitInterval time.Duration
 	// RevokeTimeout bounds the wait for in-flight sends when partitions are revoked. Default 10s.
@@ -106,6 +119,9 @@ func (o *Options) defaults() {
 	}
 	if o.Now == nil {
 		o.Now = time.Now
+	}
+	if o.Events == nil {
+		o.Events = noEvents{}
 	}
 }
 

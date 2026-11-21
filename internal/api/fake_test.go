@@ -14,12 +14,13 @@ import (
 // fakeStore is an in-memory Store. It implements idempotency like the real one so handler tests
 // can check status codes and headers; storage semantics are tested in internal/storage.
 type fakeStore struct {
-	mu      sync.Mutex
-	byID    map[uuid.UUID]domain.Notification
-	keys    map[string]fakeKey
-	batches map[uuid.UUID]storage.BatchResult
-	err     error // returned by every method when set
-	block   bool  // CreateNotification waits until its context ends
+	mu        sync.Mutex
+	byID      map[uuid.UUID]domain.Notification
+	keys      map[string]fakeKey
+	batches   map[uuid.UUID]storage.BatchResult
+	templates map[uuid.UUID]domain.Template
+	err       error // returned by every method when set
+	block     bool  // CreateNotification waits until its context ends
 
 	lastCreate      storage.NewNotification
 	lastBatch       storage.NewBatch
@@ -35,7 +36,10 @@ type fakeKey struct {
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{byID: map[uuid.UUID]domain.Notification{}, keys: map[string]fakeKey{}, batches: map[uuid.UUID]storage.BatchResult{}}
+	return &fakeStore{
+		byID: map[uuid.UUID]domain.Notification{}, keys: map[string]fakeKey{},
+		batches: map[uuid.UUID]storage.BatchResult{}, templates: map[uuid.UUID]domain.Template{},
+	}
 }
 
 func (f *fakeStore) newNotification(in storage.NewNotification, correlationID string, batchID *uuid.UUID) domain.Notification {
@@ -49,6 +53,10 @@ func (f *fakeStore) newNotification(in storage.NewNotification, correlationID st
 		ID: id, CreatedAt: domain.IDTime(id), BatchID: batchID, Channel: in.Channel, Priority: in.Priority,
 		Recipient: in.Recipient, Content: in.Content, Status: domain.StatusPending, NextAttemptAt: next,
 		ScheduledAt: in.ScheduledAt, CorrelationID: correlationID, UpdatedAt: now,
+	}
+	if in.Template != nil {
+		tid, v := in.Template.ID, in.Template.Version
+		n.TemplateID, n.TemplateVersion = &tid, &v
 	}
 	f.byID[id] = n
 	return n
@@ -194,4 +202,130 @@ func (f *fakeStore) setStatus(id uuid.UUID, s domain.Status) {
 	n := f.byID[id]
 	n.Status = s
 	f.byID[id] = n
+}
+
+func (f *fakeStore) CreateTemplate(_ context.Context, in storage.TemplateInput) (domain.Template, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return domain.Template{}, f.err
+	}
+	for _, t := range f.templates {
+		if t.Name == in.Name {
+			return domain.Template{}, domain.ErrAlreadyExists
+		}
+	}
+	now := time.Now().UTC()
+	t := domain.Template{ID: domain.NewIDAt(now), Name: in.Name, Channel: in.Channel, Body: in.Body, Version: 1, CreatedAt: now, UpdatedAt: now}
+	f.templates[t.ID] = t
+	return t, nil
+}
+
+func (f *fakeStore) GetTemplate(_ context.Context, id uuid.UUID) (domain.Template, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return domain.Template{}, f.err
+	}
+	t, ok := f.templates[id]
+	if !ok {
+		return domain.Template{}, domain.ErrNotFound
+	}
+	return t, nil
+}
+
+func (f *fakeStore) GetTemplates(_ context.Context, ids []uuid.UUID) (map[uuid.UUID]domain.Template, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := map[uuid.UUID]domain.Template{}
+	for _, id := range ids {
+		if t, ok := f.templates[id]; ok {
+			out[id] = t
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeStore) ListTemplates(_ context.Context, filter storage.TemplateFilter) (storage.TemplatePage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return storage.TemplatePage{}, f.err
+	}
+	var page storage.TemplatePage
+	for _, t := range f.templates {
+		if filter.Channel == nil || t.Channel == *filter.Channel {
+			page.Items = append(page.Items, t)
+		}
+	}
+	return page, nil
+}
+
+func (f *fakeStore) UpdateTemplate(_ context.Context, id uuid.UUID, in storage.TemplateInput) (domain.Template, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return domain.Template{}, f.err
+	}
+	t, ok := f.templates[id]
+	if !ok {
+		return domain.Template{}, domain.ErrNotFound
+	}
+	t.Name, t.Body, t.Version, t.UpdatedAt = in.Name, in.Body, t.Version+1, time.Now().UTC()
+	f.templates[id] = t
+	return t, nil
+}
+
+func (f *fakeStore) DeleteTemplate(_ context.Context, id uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	if _, ok := f.templates[id]; !ok {
+		return domain.ErrNotFound
+	}
+	delete(f.templates, id)
+	return nil
+}
+
+// newNotificationForTest stores a notification in status st and returns its id.
+func (f *fakeStore) newNotificationForTest(st domain.Status) uuid.UUID {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := f.newNotification(storage.NewNotification{Channel: domain.ChannelSMS, Priority: domain.PriorityNormal}, "", nil)
+	n.Status = st
+	f.byID[n.ID] = n
+	return n.ID
+}
+
+func (f *fakeStore) FindIdempotencyKey(_ context.Context, k storage.IdempotencyKey) (storage.KeyMatch, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return storage.KeyMatch{}, f.err
+	}
+	prior, ok := f.keys[k.Key]
+	if !ok {
+		return storage.KeyMatch{}, nil
+	}
+	if prior.hash != k.RequestHash {
+		return storage.KeyMatch{}, domain.ErrIdempotencyKeyReused
+	}
+	_, isBatch := f.batches[prior.id]
+	return storage.KeyMatch{Found: true, Batch: isBatch, ID: prior.id}, nil
+}
+
+func (f *fakeStore) ReplayBatch(_ context.Context, id uuid.UUID, _ []storage.NewNotification) (storage.BatchResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	res, ok := f.batches[id]
+	if !ok {
+		return storage.BatchResult{}, domain.ErrNotFound
+	}
+	res.Created = false
+	return res, nil
 }

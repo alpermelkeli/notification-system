@@ -4,14 +4,14 @@ An event-driven, multi-channel notification service written in Go. It accepts no
 requests over HTTP, processes them asynchronously through prioritized queue workers, and delivers
 them via SMS, Email and Push providers with rate limiting, retries and real-time status tracking.
 
-> **Status:** 🚧 Phase 7 done: notifications flow end to end (API → PostgreSQL → dispatcher → Kafka → priority-scheduled workers → Redis rate limiter → provider). Failures are classified and retried with exponential backoff and jitter, terminal failures are dead-lettered, and a per-channel circuit breaker holds the backlog during provider outages. Every role exports Prometheus metrics (queue depth, outcome rates, latency), and one OpenTelemetry trace follows each notification from the API request to the provider call, retries included. Bonus features follow in Phase 8. See [`docs/plan.md`](docs/plan.md).
+> **Status:** 🚧 Phase 8 done: notifications flow end to end (API → PostgreSQL → dispatcher → Kafka → priority-scheduled workers → Redis rate limiter → provider). Failures are classified and retried with exponential backoff and jitter, terminal failures are dead-lettered, and a per-channel circuit breaker holds the backlog during provider outages. Every role exports Prometheus metrics, and one OpenTelemetry trace follows each notification from the API request to the provider call. Notifications can be scheduled and rendered from templates, and every status change streams to WebSocket clients (try http://localhost:8080/ws-demo). Hardening follows in Phase 9. See [`docs/plan.md`](docs/plan.md).
 
 ## Features (target)
 - **Notification API:** single and batch create (up to 1000), status by ID / batch ID, cancel, filtered + paginated listing
 - **Processing engine:** async workers, high / normal / low priority queues, 100 msg/s per channel rate limit, content validation, idempotency
 - **Delivery & retry:** exponential backoff with jitter, failure classification, dead-letter handling
 - **Observability:** Prometheus metrics (queue depth, success/failure rates, latency), structured logs with correlation and trace IDs, health checks, OpenTelemetry traces in Jaeger
-- **Bonus:** scheduled notifications, templates, WebSocket status updates, distributed tracing, CI/CD
+- **Bonus:** scheduled notifications, `{{variable}}` templates, WebSocket status updates, distributed tracing, CI/CD
 
 ## Quick start
 Requirements: Docker with Compose v2. Go 1.26+ only for local development.
@@ -60,7 +60,8 @@ curl localhost:8081/stats        # accepted/rejected per channel + rate in the l
 **PostgreSQL decides *when*, Kafka moves *what*, workers deliver at ≤ 100 msg/s per channel.**
 
 1. **API** validates the request, enforces `Idempotency-Key`, inserts the notification
-   (`status=pending`) and returns `202 Accepted`. It never talks to Kafka directly.
+   (`status=pending`) and returns `202 Accepted`. It never publishes work to Kafka; the
+   dispatcher does.
 2. **Dispatcher** claims due rows (`FOR UPDATE SKIP LOCKED`, FIFO by `next_attempt_at`), publishes
    them to Kafka and marks them `queued`. The same mechanism handles new, scheduled and retrying
    notifications.
@@ -71,7 +72,9 @@ curl localhost:8081/stats        # accepted/rejected per channel + rate in the l
    and get a guaranteed minimum share. Each send takes a token from the shared **Redis** rate
    limiter, passes a per-channel circuit breaker (Phase 6), and the outcome is written back with a
    guarded status transition.
-5. **Status events** stream to `notification.events` for WebSocket clients (Phase 8).
+5. **Status events:** every component publishes the rows it changed to `notification.events`
+   after the commit (best effort, [ADR-0011](docs/adr/0011-status-events-and-websocket.md)), and
+   every API instance fans them out to WebSocket subscribers.
 
 ### Processing engine (Phase 5)
 - **Dispatcher** ([`internal/dispatcher`](internal/dispatcher)): the relay locks up to 500 due rows,
@@ -109,6 +112,37 @@ curl localhost:8081/stats        # accepted/rejected per channel + rate in the l
   stay in its buffers and in Kafka, fetching pauses, and no attempts are burned. After 30 s one
   probe is let through; its success closes the breaker. `4xx` and `429` answers do not count.
 
+### Live status updates (Phase 8)
+See [ADR-0011](docs/adr/0011-status-events-and-websocket.md) for the design.
+
+- **Events:** the API, the dispatcher (relay and reaper) and the workers publish every row they
+  change to `notification.events` right after the commit. Publishing never waits; a lost event
+  only delays an update, and `notifier_status_events_total{result}` counts the failures.
+- **Hub:** each API instance reads every partition from the end without a consumer group, so any
+  instance can serve any client and the load balancer needs no sticky sessions.
+- **Protocol:** a client opens `GET /v1/ws` and subscribes to notification ids and batch ids. It
+  first gets the current state (a snapshot), then every change. Updates may arrive out of order,
+  so clients keep the latest `at` per notification.
+- **Demo page:** http://localhost:8080/ws-demo sends a notification and follows it live.
+
+```bash
+websocat ws://localhost:8080/v1/ws
+{"type":"subscribe","batchIds":["<batchId>"]}
+# {"type":"subscribed","notificationIds":[],"batchIds":["<batchId>"]}
+# {"type":"batch","batch":{"id":"<batchId>","total":2,"statusCounts":{"pending":2},...}}
+# {"type":"status","event":{"notificationId":"…","batchId":"<batchId>","status":"queued","attempts":0,"at":"…",...}}
+# {"type":"status","event":{"notificationId":"…","status":"processing","attempts":1,...}}
+# {"type":"status","event":{"notificationId":"…","status":"sent","attempts":1,...}}
+```
+
+Limits:
+- 1000 subscriptions per connection, 100 ids per message, and 10 messages handled per second.
+- Snapshot reads are batched, and at most 4 run at once per instance.
+- A client that falls 256 events behind is closed with `1008`.
+- 10 000 connections per instance; further ones are closed with `1013`. On shutdown, connections are closed with `1001`; the
+client reconnects, subscribes again and gets fresh snapshots. Metrics: `notifier_ws_connections`,
+`notifier_ws_messages_total{type}`, `notifier_ws_disconnects_total{reason}`.
+
 ### Observability (Phase 7)
 See [ADR-0009](docs/adr/0009-observability.md) for the design.
 
@@ -120,7 +154,7 @@ See [ADR-0009](docs/adr/0009-observability.md) for the design.
   | How big is the backlog? | `notifier_notifications{status}`, `notifier_notifications_due`, `notifier_oldest_due_age_seconds` (PostgreSQL), `notifier_kafka_consumer_lag{group,topic}` (Kafka), `notifier_worker_buffered_records` |
   | Are deliveries succeeding? | `notifier_delivery_outcomes_total{channel,outcome}` (sent, retrying, failed, released, skipped, ...), `notifier_provider_requests_total{channel,class}`, `notifier_dead_letters_total` |
   | How fast? | `notifier_delivery_latency_seconds` (first due → sent, across retries), `notifier_queue_wait_seconds` (due → picked), `notifier_provider_request_duration_seconds`, `notifier_http_request_duration_seconds{route}` |
-  | Is something degraded? | `notifier_circuit_breaker_state{channel}` (0 closed, 1 half-open, 2 open), `notifier_reaper_recovered_total{reason}`, `notifier_worker_db_retries_total`, `notifier_dispatch_errors_total` |
+  | Is something degraded? | `notifier_circuit_breaker_state{channel}` (0 closed, 1 half-open, 2 open), `notifier_reaper_recovered_total{reason}`, `notifier_worker_db_retries_total`, `notifier_dispatch_errors_total`, `notifier_status_events_total{result}` (failed, dropped) |
 
   ```promql
   sum by (channel) (rate(notifier_provider_requests_total{class="delivered"}[1m]))          # sends/s
@@ -155,6 +189,8 @@ See [ADR-0009](docs/adr/0009-observability.md) for the design.
 | [0007](docs/adr/0007-technology-stack.md) | Go 1.26, chi, pgx, goose, franz-go, go-redis, OpenTelemetry, testcontainers |
 | [0008](docs/adr/0008-scalability-and-deployment-topology.md) | Scaling model per component, single PG primary + HA/replica/partitioning, nginx scaling demo |
 | [0009](docs/adr/0009-observability.md) | Prometheus metrics per role, queue depth sampling, `traceparent` stored with the row and carried in Kafka headers, trace ids in logs |
+| [0010](docs/adr/0010-templates.md) | Stored templates, `{{name}}` substitution only, rendered and validated at creation |
+| [0011](docs/adr/0011-status-events-and-websocket.md) | Best-effort status events after each commit; every API instance reads all events and serves WebSocket subscriptions by notification or batch id |
 
 ## Data model
 Schema: [`migrations/`](migrations) (goose, forward-only, embedded in the binary and applied by
@@ -162,9 +198,10 @@ Schema: [`migrations/`](migrations) (goose, forward-only, embedded in the binary
 
 | Table | Purpose |
 |-------|---------|
-| `notifications` | One row per message: content, status, attempts, `next_attempt_at` (drives dispatch, scheduling and retries), lease, provider result, and the creating request's `correlation_id` and `trace_parent` ([ADR-0009](docs/adr/0009-observability.md)). Also the dispatch outbox ([ADR-0003](docs/adr/0003-dispatch-without-separate-outbox.md)) |
+| `notifications` | One row per message: content, status, attempts, `next_attempt_at` (drives dispatch, scheduling and retries), lease, provider result, the creating request's `correlation_id` and `trace_parent` ([ADR-0009](docs/adr/0009-observability.md)), and the `template_id`/`template_version` its content was rendered from. Also the dispatch outbox ([ADR-0003](docs/adr/0003-dispatch-without-separate-outbox.md)) |
 | `notification_status_history` | Append-only audit trail: one row per transition (from, to, attempt, reason) |
 | `batches` | One row per batch request; status counts are aggregated from its notifications |
+| `templates` | Message templates with `{{variable}}` placeholders; `version` goes up on every update ([ADR-0010](docs/adr/0010-templates.md)) |
 | `idempotency_keys` | `Idempotency-Key` → request hash + created resource, with a TTL ([ADR-0004](docs/adr/0004-idempotency.md)) |
 
 - **Daily partitions** of `notifications` and its history, created days ahead and dropped after
@@ -240,6 +277,12 @@ linted in CI). With the stack running, browse it at **http://localhost:8080/docs
 | `POST /v1/notifications/{id}/retry` | Replay a `failed` notification | `202` |
 | `GET /v1/notifications` | Filter by `status`, `channel`, `batchId`, `createdFrom`/`createdTo`; cursor pagination | `200` |
 | `GET /v1/batches/{id}` | Batch with per-status counts | `200` |
+| `POST /v1/templates` | Create a template with `{{variable}}` placeholders | `201` |
+| `GET /v1/templates` | List templates, filter by `channel`; cursor pagination | `200` |
+| `GET /v1/templates/{id}` | Template with its variables and version | `200` |
+| `PUT /v1/templates/{id}` | Replace name and body (`version` + 1; channel fixed) | `200` |
+| `DELETE /v1/templates/{id}` | Delete; notifications created from it are unaffected | `204` |
+| `GET /v1/ws` | WebSocket: live status of notifications and batches | `101` |
 
 ```bash
 # Create a high-priority OTP; repeating it with the same key returns the same notification
@@ -275,10 +318,53 @@ curl -XPOST localhost:8080/v1/notifications -H 'Content-Type: application/json' 
 | `email` | bare address (`user@example.com`, ≤ 254 bytes) | ≤ 64 KiB |
 | `push` | device token, 8–4096 printable ASCII chars | ≤ 4 KiB (APNs/FCM payload limit) |
 
-`scheduledAt` (optional) may be at most `MAX_SCHEDULE_AHEAD` (7 days) ahead; a past time means
-"as soon as possible", so idempotent retries keep working after the schedule passes. Unknown
-JSON fields are rejected. Status codes: `400` malformed request, `404` unknown id, `409`
-`invalid_state` or `idempotency_key_reused` (for batch items, `details` names the item), `413`
+**Scheduled delivery (B-2):** set `scheduledAt` to deliver later.
+
+```bash
+curl -XPOST localhost:8080/v1/notifications -H 'Content-Type: application/json' \
+  -d '{"recipient":"user@example.com","channel":"email","content":"Your trial ends tomorrow",
+       "scheduledAt":"2026-11-22T09:00:00+03:00"}'
+# 202 {"status":"pending","scheduledAt":"2026-11-22T06:00:00Z","nextAttemptAt":"2026-11-22T06:00:00Z",...}
+```
+
+How it works:
+- The notification is stored as `pending` with `next_attempt_at = scheduledAt`, so it needs no
+  scheduler of its own.
+- The dispatcher's fallback poll (`DISPATCH_POLL_INTERVAL`, 500 ms) publishes it once it is due;
+  from then on it follows the normal priority and rate-limit path.
+- It can be cancelled until a worker claims it.
+- `scheduledAt` may be at most `MAX_SCHEDULE_AHEAD` (7 days) ahead, which keeps it inside the
+  data retention.
+- A time in the past means "as soon as possible", so idempotent retries keep working after the
+  scheduled time has passed.
+
+**Templates (B-3):** store the text once and send it with per-recipient variables
+([ADR-0010](docs/adr/0010-templates.md)).
+
+```bash
+curl -XPOST localhost:8080/v1/templates -H 'Content-Type: application/json' \
+  -d '{"name":"order_shipped","channel":"sms","body":"Hi {{name}}, order {{order_id}} has shipped."}'
+# 201 {"id":"<templateId>","variables":["name","order_id"],"version":1,...}
+
+curl -XPOST localhost:8080/v1/notifications -H 'Content-Type: application/json' \
+  -d '{"recipient":"+905551234567","templateId":"<templateId>","variables":{"name":"Ayşe","order_id":"A-42"}}'
+# 202 {"channel":"sms","content":"Hi Ayşe, order A-42 has shipped.","templateId":"<templateId>","templateVersion":1,...}
+```
+
+How templates behave:
+- Placeholders are `{{ name }}` only: no logic, no functions.
+- The text is rendered when the notification is created and must meet the channel's limits like
+  any other content. A missing or unused variable is a `variables.<name>` violation.
+- `channel` may be omitted and is taken from the template.
+- Editing a template bumps its `version` and never changes notifications that were already
+  accepted.
+- Batch items can mix templates and plain content.
+- The `Idempotency-Key` hash covers `templateId` and `variables`, so a retry after a template
+  edit still replays the original notification.
+
+Unknown JSON fields are rejected. Status codes: `400` malformed request, `404` unknown id, `409`
+`invalid_state`, `idempotency_key_reused` (for batch items, `details` names the item) or
+`already_exists` (template name), `413`
 body over 256 KiB (10 MiB for batches), `415` non-JSON body, `422` validation, `503` timeout.
 SMS segment counting follows carrier packing (an escape sequence or surrogate pair is never split
 across segments).
@@ -355,10 +441,19 @@ and are skipped by `make test-short`:
   delivered exactly once, a 503 is retried, a cancelled row is never sent, the rate holds, and a
   lost record is recovered by the reaper. A 400 fails at once, a provider stuck on 503 exhausts
   the attempts with growing backoff, both reach `notifications.dlq`, and during a provider outage
-  the breaker stops the calls without burning attempts. One notification retried once is followed
+  the breaker stops the calls without burning attempts. A consumer of `notification.events`
+  sees every transition of a delivered and of a retried notification, in order of `at`.
+  A WebSocket client subscribed to a batch through a hub reading the real topic gets the
+  snapshot, then a `sent` event for every item. One notification retried once is followed
   through a single trace: two dispatches under the stored request span, each delivery under its
   dispatch, and the `traceparent` reaching the provider on both calls.
+  A scheduled notification reaches the provider at its `scheduledAt` (not before, and within the
+  poll interval after it), one cancelled before its time is never sent, and one scheduled in the
+  past goes out at once.
 
+The WebSocket hub (`internal/ws`) is tested over real connections: snapshots, routing by
+notification and batch id, protocol errors, limits, slow consumers, shutdown, the origin check
+and binary frames.
 The worker engine (scheduler, watermarks, backpressure, rebalance, shutdown, outcome policy,
 circuit breaker, claim retry during a database outage) is unit-tested with fakes, without Kafka,
 including the metrics it records and the span tree of a delivery.

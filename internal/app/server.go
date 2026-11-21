@@ -27,6 +27,9 @@ const (
 	pathLiveness  = "/healthz"
 	pathReadiness = "/readyz"
 	pathMetrics   = "/metrics"
+	// pathWebSocket is the API's status stream (B-4). Its connections last for hours, so it gets
+	// no request span or HTTP metrics; the stream has metrics of its own.
+	pathWebSocket = "/v1/ws"
 )
 
 // baseRouter returns a router with the shared middleware chain and the health and metrics
@@ -41,8 +44,8 @@ func baseRouter(logger *slog.Logger, instance string, checks []health.Check, reg
 	r.Use(
 		httpx.CorrelationID,
 		httpx.InstanceID(instance),
-		telemetry.HTTPMiddleware(pathLiveness, pathReadiness, pathMetrics),
-		m.Middleware,
+		telemetry.HTTPMiddleware(pathLiveness, pathReadiness, pathMetrics, pathWebSocket),
+		m.Middleware(pathWebSocket),
 		httpx.RequestLogger(logger, pathLiveness, pathReadiness, pathMetrics),
 		httpx.Recoverer(logger),
 	)

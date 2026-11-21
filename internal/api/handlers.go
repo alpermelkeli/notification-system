@@ -28,14 +28,42 @@ func (h *Handler) createNotification(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, rerr)
 		return
 	}
-	in, vs := h.validateCreate("", req, h.opts.Now())
+	var ik *storage.IdempotencyKey
+	if key != nil {
+		ik = &storage.IdempotencyKey{Key: *key, RequestHash: requestHash(canonicalOf(req))}
+		if req.TemplateID != nil {
+			// A template may have changed or gone since the original request; replay without
+			// rendering it again (ADR-0010).
+			match, err := h.store.FindIdempotencyKey(r.Context(), *ik)
+			if err == nil && match.Found && match.Batch {
+				err = domain.ErrIdempotencyKeyReused
+			}
+			if err != nil {
+				h.writeError(w, r, err)
+				return
+			}
+			if match.Found {
+				n, err := h.store.GetNotification(r.Context(), match.ID)
+				if err != nil {
+					h.writeError(w, r, err)
+					return
+				}
+				h.writeCreated(w, n, false)
+				return
+			}
+		}
+	}
+	templates, err := h.loadTemplates(r.Context(), req)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	in, vs := h.validateCreate("", req, h.opts.Now(), templates)
 	if len(vs) > 0 {
 		h.writeError(w, r, validationFailed(vs))
 		return
 	}
-	if key != nil {
-		in.IdempotencyKey = &storage.IdempotencyKey{Key: *key, RequestHash: requestHash(canonicalOf(in))}
-	}
+	in.IdempotencyKey = ik
 
 	n, created, err := h.store.CreateNotification(r.Context(), in, origin(r.Context()))
 	if err != nil {
@@ -44,7 +72,13 @@ func (h *Handler) createNotification(w http.ResponseWriter, r *http.Request) {
 	}
 	if created {
 		h.opts.Metrics.Created(n.Channel, n.Priority, 1)
+		h.opts.Events.Publish(r.Context(), n)
 	}
+	h.writeCreated(w, n, created)
+}
+
+// writeCreated answers a create, or its idempotent replay when created is false.
+func (h *Handler) writeCreated(w http.ResponseWriter, n domain.Notification, created bool) {
 	w.Header().Set("Location", "/v1/notifications/"+n.ID.String())
 	if !created {
 		w.Header().Set(headerIdempotentReplay, "true")
@@ -71,14 +105,37 @@ func (h *Handler) createBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	reqs := make([]createRequest, len(req.Notifications))
+	canon := make([]canonical, len(req.Notifications))
+	templated := false
+	for i, item := range req.Notifications {
+		reqs[i] = item.createRequest
+		canon[i] = canonicalOf(item.createRequest)
+		if item.IdempotencyKey != nil {
+			canon[i].Key = *item.IdempotencyKey
+		}
+		templated = templated || item.TemplateID != nil
+	}
+	var batchKey *storage.IdempotencyKey
+	if key != nil {
+		batchKey = &storage.IdempotencyKey{Key: *key, RequestHash: requestHash(canon)}
+		if templated && h.replayBatch(w, r, *batchKey, req.Notifications) {
+			return
+		}
+	}
+	templates, err := h.loadTemplates(r.Context(), reqs...)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+
 	now := h.opts.Now()
 	in := storage.NewBatch{Items: make([]storage.NewNotification, len(req.Notifications))}
-	canon := make([]canonical, len(req.Notifications))
 	seenKeys := make(map[string]int)
 	var vs []violation
 	for i, item := range req.Notifications {
 		prefix := fmt.Sprintf("notifications[%d].", i)
-		n, itemVs := h.validateCreate(prefix, item.createRequest, now)
+		n, itemVs := h.validateCreate(prefix, item.createRequest, now, templates)
 		vs = append(vs, itemVs...)
 		if item.IdempotencyKey != nil {
 			k := *item.IdempotencyKey
@@ -93,22 +150,18 @@ func (h *Handler) createBatch(w http.ResponseWriter, r *http.Request) {
 				vs = append(vs, violation{Field: prefix + "idempotencyKey", Message: "must differ from the Idempotency-Key header"})
 			default:
 				seenKeys[k] = i
-				n.IdempotencyKey = &storage.IdempotencyKey{Key: k, RequestHash: requestHash(canonicalOf(n))}
+				c := canon[i]
+				c.Key = "" // an item's own hash never included its key
+				n.IdempotencyKey = &storage.IdempotencyKey{Key: k, RequestHash: requestHash(c)}
 			}
 		}
 		in.Items[i] = n
-		canon[i] = canonicalOf(n)
-		if item.IdempotencyKey != nil {
-			canon[i].Key = *item.IdempotencyKey
-		}
 	}
 	if len(vs) > 0 {
 		h.writeError(w, r, validationFailed(vs))
 		return
 	}
-	if key != nil {
-		in.IdempotencyKey = &storage.IdempotencyKey{Key: *key, RequestHash: requestHash(canon)}
-	}
+	in.IdempotencyKey = batchKey
 
 	res, err := h.store.CreateBatch(r.Context(), in, origin(r.Context()))
 	if err != nil {
@@ -119,6 +172,7 @@ func (h *Handler) createBatch(w http.ResponseWriter, r *http.Request) {
 		for _, it := range res.Items {
 			if !it.Duplicate {
 				h.opts.Metrics.Created(it.Notification.Channel, it.Notification.Priority, 1)
+				h.opts.Events.Publish(r.Context(), it.Notification)
 			}
 		}
 	}
@@ -127,6 +181,38 @@ func (h *Handler) createBatch(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(headerIdempotentReplay, "true")
 	}
 	httpx.WriteJSON(w, http.StatusAccepted, toBatchCreatedJSON(res))
+}
+
+// replayBatch answers a batch whose Idempotency-Key matches an earlier request, without
+// rendering its templates again (ADR-0010). It reports whether it answered.
+func (h *Handler) replayBatch(w http.ResponseWriter, r *http.Request, key storage.IdempotencyKey, items []batchItemRequest) bool {
+	match, err := h.store.FindIdempotencyKey(r.Context(), key)
+	if err == nil && match.Found && !match.Batch {
+		err = domain.ErrIdempotencyKeyReused
+	}
+	if err != nil {
+		h.writeError(w, r, err)
+		return true
+	}
+	if !match.Found {
+		return false
+	}
+	// Duplicates of the original request are found through the item keys.
+	ns := make([]storage.NewNotification, len(items))
+	for i, it := range items {
+		if it.IdempotencyKey != nil {
+			ns[i].IdempotencyKey = &storage.IdempotencyKey{Key: *it.IdempotencyKey}
+		}
+	}
+	res, err := h.store.ReplayBatch(r.Context(), match.ID, ns)
+	if err != nil {
+		h.writeError(w, r, err)
+		return true
+	}
+	w.Header().Set("Location", "/v1/batches/"+res.Batch.ID.String())
+	w.Header().Set(headerIdempotentReplay, "true")
+	httpx.WriteJSON(w, http.StatusAccepted, toBatchCreatedJSON(res))
+	return true
 }
 
 // getNotification handles GET /v1/notifications/{id} (FR-1.3).
@@ -149,6 +235,9 @@ func (h *Handler) getHistory(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) cancelNotification(w http.ResponseWriter, r *http.Request) {
 	h.withID(w, r, func(ctx context.Context, id uuid.UUID) (any, error) {
 		n, err := h.store.Cancel(ctx, id)
+		if err == nil {
+			h.opts.Events.Publish(ctx, n)
+		}
 		return toNotificationJSON(n), err
 	}, http.StatusOK)
 }
@@ -157,6 +246,9 @@ func (h *Handler) cancelNotification(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) retryNotification(w http.ResponseWriter, r *http.Request) {
 	h.withID(w, r, func(ctx context.Context, id uuid.UUID) (any, error) {
 		n, err := h.store.Replay(ctx, id)
+		if err == nil {
+			h.opts.Events.Publish(ctx, n)
+		}
 		return toNotificationJSON(n), err
 	}, http.StatusAccepted)
 }
@@ -263,9 +355,17 @@ func parseListFilter(r *http.Request) (storage.ListFilter, *requestError) {
 	return f, nil
 }
 
+// maxViolations bounds the violations listed in one response, so a request with thousands of
+// bad fields does not get an equally large answer.
+const maxViolations = 100
+
 func validationFailed(vs []violation) *requestError {
-	return &requestError{status: http.StatusUnprocessableEntity, code: "validation_failed",
-		message: "request validation failed", violations: vs}
+	msg := "request validation failed"
+	if len(vs) > maxViolations {
+		msg = fmt.Sprintf("request validation failed; the first %d of %d violations are listed", maxViolations, len(vs))
+		vs = vs[:maxViolations]
+	}
+	return &requestError{status: http.StatusUnprocessableEntity, code: "validation_failed", message: msg, violations: vs}
 }
 
 // writeError maps an error to the error envelope. Only this function knows HTTP status codes
@@ -294,6 +394,8 @@ func (h *Handler) writeError(w http.ResponseWriter, r *http.Request, err error) 
 			violation{Field: fmt.Sprintf("notifications[%d].idempotencyKey", ie.Index), Message: "already used with different content"})
 	case errors.Is(err, domain.ErrIdempotencyKeyReused):
 		httpx.WriteError(w, http.StatusConflict, "idempotency_key_reused", err.Error())
+	case errors.Is(err, domain.ErrAlreadyExists):
+		httpx.WriteError(w, http.StatusConflict, "already_exists", err.Error())
 	case errors.Is(err, context.DeadlineExceeded):
 		h.logger.WarnContext(r.Context(), "request timed out", "method", r.Method, "path", r.URL.Path, "err", err)
 		httpx.WriteError(w, http.StatusServiceUnavailable, "timeout", "the request timed out; it is safe to retry with the same Idempotency-Key")

@@ -1,5 +1,6 @@
 # Redocly CLI lint config for api/openapi.yaml (run in CI). Individual accepted exceptions
-# (the health probes have no 4xx responses) are listed in .redocly.lint-ignore.yaml.
+# (the health probes have no 4xx responses, the WebSocket upgrade answers 101) are listed in
+# .redocly.lint-ignore.yaml.
 extends:
   - recommended
 rules:

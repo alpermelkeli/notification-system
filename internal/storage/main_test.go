@@ -53,7 +53,7 @@ func newTestStore(t *testing.T) *Store {
 	}
 	ctx := context.Background()
 	if _, err := testPool.Exec(ctx,
-		`TRUNCATE notifications, notification_status_history, batches, idempotency_keys`); err != nil {
+		`TRUNCATE notifications, notification_status_history, batches, idempotency_keys, templates`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	s := New(testPool, Options{})

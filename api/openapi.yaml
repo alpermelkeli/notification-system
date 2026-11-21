@@ -42,6 +42,10 @@ tags:
     description: Create, inspect, cancel and replay individual notifications.
   - name: batches
     description: Create up to 1000 notifications at once and follow their progress.
+  - name: templates
+    description: Message templates with `{{variable}}` placeholders, rendered when a notification is created.
+  - name: live
+    description: Real-time status updates over WebSocket.
   - name: operations
     description: Liveness and readiness probes.
 paths:
@@ -50,7 +54,10 @@ paths:
       tags: [notifications]
       operationId: createNotification
       summary: Create a notification
-      description: Stores the notification as `pending` and returns immediately (FR-1.1).
+      description: |
+        Stores the notification as `pending` and returns immediately (FR-1.1). The content is
+        either given as `content` or rendered from a template (`templateId` and `variables`); a
+        rendered text must meet the same channel limits.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -65,6 +72,9 @@ paths:
               scheduled:
                 summary: Scheduled email
                 value: { recipient: user@example.com, channel: email, content: 'Your weekly summary', scheduledAt: '2026-11-22T09:00:00Z' }
+              template:
+                summary: From a template
+                value: { recipient: '+905551234567', templateId: 01a1fd17-4a0b-7869-8fa8-a36f9d5fb75a, variables: { order_id: A-42 } }
       responses:
         '202':
           description: Accepted (or replayed, see `Idempotent-Replayed`).
@@ -239,6 +249,156 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '500': { $ref: '#/components/responses/Internal' }
         '503': { $ref: '#/components/responses/Timeout' }
+  /v1/templates:
+    post:
+      tags: [templates]
+      operationId: createTemplate
+      summary: Create a template
+      description: |
+        Placeholders are `{{ name }}`, where a name is a letter or `_` followed by letters, digits
+        or `_`; at most 50 distinct variables. The body as written must meet the channel's content
+        limits. Names are unique.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TemplateRequest' }
+            example: { name: order_shipped, channel: sms, body: 'Your order {{order_id}} has shipped.' }
+      responses:
+        '201':
+          description: Created.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Template' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/AlreadyExists' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '503': { $ref: '#/components/responses/Timeout' }
+    get:
+      tags: [templates]
+      operationId: listTemplates
+      summary: List templates
+      description: Newest first, paginated with an opaque cursor like the notification list.
+      parameters:
+        - { name: channel, in: query, schema: { $ref: '#/components/schemas/Channel' } }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: One page of templates.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TemplateList' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '503': { $ref: '#/components/responses/Timeout' }
+  /v1/templates/{id}:
+    get:
+      tags: [templates]
+      operationId: getTemplate
+      summary: Get a template
+      parameters: [{ $ref: '#/components/parameters/TemplateID' }]
+      responses:
+        '200':
+          description: The template.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Template' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '503': { $ref: '#/components/responses/Timeout' }
+    put:
+      tags: [templates]
+      operationId: updateTemplate
+      summary: Replace a template's name and body
+      description: |
+        Increments `version`. The channel cannot change. Notifications already created from the
+        template keep the content they were rendered with.
+      parameters: [{ $ref: '#/components/parameters/TemplateID' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TemplateRequest' }
+      responses:
+        '200':
+          description: The updated template.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Template' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/AlreadyExists' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '503': { $ref: '#/components/responses/Timeout' }
+    delete:
+      tags: [templates]
+      operationId: deleteTemplate
+      summary: Delete a template
+      description: Notifications created from it are not affected.
+      parameters: [{ $ref: '#/components/parameters/TemplateID' }]
+      responses:
+        '204':
+          description: Deleted.
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '503': { $ref: '#/components/responses/Timeout' }
+  /v1/ws:
+    get:
+      tags: [live]
+      operationId: statusStream
+      summary: Live status updates (WebSocket)
+      description: |
+        Upgrade to a WebSocket and follow notifications and batches as they change (B-4). Messages
+        are JSON text frames. A live demo runs at `/ws-demo`.
+
+        **Client → server**
+        - `{"type":"subscribe","notificationIds":["…"],"batchIds":["…"]}`: 1–100 ids per message, at
+          most 1000 per connection (a batch counts as one).
+        - `{"type":"unsubscribe","notificationIds":["…"],"batchIds":["…"]}`
+
+        **Server → client**
+        - `{"type":"subscribed","notificationIds":[…],"batchIds":[…]}`: the full set after every
+          subscribe or unsubscribe.
+        - `{"type":"status","event":StatusEvent,"snapshot":true}`: right after a subscribe, the
+          current status of each new notification id.
+        - `{"type":"batch","batch":{"id","createdAt","total","statusCounts"}}`: right after a
+          subscribe, the counts of each new batch id.
+        - `{"type":"status","event":StatusEvent}`: every later status change of a followed
+          notification, or of any notification of a followed batch.
+        - `{"type":"error","code","message","id"}`: codes `bad_request`, `invalid_id`, `not_found`
+          (the id is not kept), `too_many_subscriptions`, `snapshot_failed`, `rate_limited` (at most
+          10 messages per second are handled). The connection stays open.
+
+        Updates are best effort and may arrive out of order: keep the event with the latest `at`
+        per notification, and read the REST API when in doubt. On reconnect, subscribe again and
+        the snapshots fill the gap.
+
+        Close codes: `1001` server shutting down (reconnect), `1003` binary frame, `1008` client too
+        slow (more than 256 events behind), `1009` message over 64 KiB, `1013` instance full (try
+        again). Browsers must connect from the API's own origin. Failed upgrades (403, 426) are
+        answered in plain text by the WebSocket library, not with the error envelope.
+      responses:
+        '101':
+          description: Switching to the WebSocket protocol. Messages follow the description above; events use the StatusEvent schema.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StatusEvent' }
+        '403':
+          description: A browser connected from another origin (plain text).
+        '404': { $ref: '#/components/responses/NotFound' }
+        '426':
+          description: The request was not a WebSocket upgrade (plain text).
   /healthz:
     get:
       tags: [operations]
@@ -279,6 +439,11 @@ components:
       in: path
       required: true
       schema: { type: string, format: uuid }
+    TemplateID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
   headers:
     Location:
       description: URL of the created resource.
@@ -305,19 +470,39 @@ components:
       unevaluatedProperties: false
     NotificationFields:
       type: object
-      required: [recipient, channel, content]
+      required: [recipient]
+      description: Give either `channel` and `content`, or `templateId` (with `variables`).
+      oneOf:
+        - required: [channel, content]
+        - required: [templateId]
       properties:
         recipient:
           type: string
           description: |
             `sms`: E.164 phone number (`+905551234567`). `email`: a bare address. `push`: a device
             token (8–4096 printable ASCII characters).
-        channel: { $ref: '#/components/schemas/Channel' }
+        channel:
+          allOf: [{ $ref: '#/components/schemas/Channel' }]
+          description: Optional with `templateId` (the template's channel is used); if given, it must match it.
         content:
           type: string
           description: |
             `sms`: at most 10 segments (1530 GSM-7 characters, or 670 when the text needs UCS-2,
-            e.g. because of `ş`/`ı`). `email`: at most 64 KiB. `push`: at most 4 KiB.
+            e.g. because of `ş`/`ı`). `email`: at most 64 KiB. `push`: at most 4 KiB. Must be
+            omitted with `templateId`.
+        templateId:
+          type: string
+          format: uuid
+          description: Render the content from this template (B-3). The rendered text must meet the limits above.
+        variables:
+          type: object
+          maxProperties: 50
+          additionalProperties: { type: string }
+          description: |
+            Values for the template's placeholders. Every placeholder needs a value and every value
+            must belong to a placeholder (`variables.<name>` violations otherwise). Values are
+            inserted as they are, never expanded.
+          example: { order_id: A-42 }
         priority:
           allOf: [{ $ref: '#/components/schemas/Priority' }]
           default: normal
@@ -368,6 +553,8 @@ components:
         providerMessageId: { type: string }
         lastError: { type: string }
         correlationId: { type: string }
+        templateId: { type: string, format: uuid, description: The template the content was rendered from. }
+        templateVersion: { type: integer, minimum: 1, description: The template version the content was rendered from. }
         createdAt: { type: string, format: date-time }
         updatedAt: { type: string, format: date-time }
     NotificationList:
@@ -423,6 +610,57 @@ components:
         items:
           type: array
           items: { $ref: '#/components/schemas/BatchItemResult' }
+    TemplateRequest:
+      type: object
+      additionalProperties: false
+      required: [name, channel, body]
+      properties:
+        name:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9_.-]{0,99}$'
+        channel: { $ref: '#/components/schemas/Channel' }
+        body:
+          type: string
+          description: Text with `{{ name }}` placeholders; every `{{` must open a well-formed placeholder.
+    Template:
+      type: object
+      required: [id, name, channel, body, variables, version, createdAt, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        channel: { $ref: '#/components/schemas/Channel' }
+        body: { type: string }
+        variables:
+          type: array
+          items: { type: string }
+          description: The placeholders of the body, in order of first use.
+        version: { type: integer, minimum: 1, description: Starts at 1 and goes up on every update. }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    TemplateList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Template' }
+        nextCursor: { type: string }
+    StatusEvent:
+      type: object
+      description: |
+        One status change (ADR-0011). `at` is the database time of the transition; keep the latest
+        per notification. Never carries the recipient or the content.
+      required: [notificationId, channel, priority, status, attempts, at]
+      properties:
+        notificationId: { type: string, format: uuid }
+        batchId: { type: string, format: uuid }
+        channel: { $ref: '#/components/schemas/Channel' }
+        priority: { $ref: '#/components/schemas/Priority' }
+        status: { $ref: '#/components/schemas/Status' }
+        attempts: { type: integer, minimum: 0 }
+        nextAttemptAt: { type: string, format: date-time, description: 'Set while `pending` or `retrying`.' }
+        lastError: { type: string, description: 'Set when `retrying` or `failed`.' }
+        at: { type: string, format: date-time }
     FieldViolation:
       type: object
       required: [field, message]
@@ -446,6 +684,7 @@ components:
                 - method_not_allowed
                 - invalid_state
                 - idempotency_key_reused
+                - already_exists
                 - payload_too_large
                 - unsupported_media_type
                 - timeout
@@ -502,6 +741,11 @@ components:
       description: |
         The Idempotency-Key (or, in a batch, an item's `idempotencyKey`) was already used with a
         different request. For an item, `details` names it (`notifications[i].idempotencyKey`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    AlreadyExists:
+      description: A template with this name already exists.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }

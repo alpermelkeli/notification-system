@@ -28,21 +28,21 @@ type dispatchResult struct {
 	err error
 }
 
-func (f *fakeRelayStore) DispatchDue(ctx context.Context, limit int, publish storage.PublishFunc) (int, error) {
+func (f *fakeRelayStore) DispatchDue(ctx context.Context, limit int, publish storage.PublishFunc) ([]domain.Notification, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, time.Now())
 	if len(f.results) == 0 {
-		return 0, nil
+		return nil, nil
 	}
 	r := f.results[0]
 	f.results = f.results[1:]
 	if r.n > 0 {
 		if _, err := publish(ctx, make([]domain.Notification, r.n)); err != nil {
-			return 0, err
+			return nil, err
 		}
 	}
-	return min(r.n, limit), r.err
+	return make([]domain.Notification, min(r.n, limit)), r.err
 }
 
 func (f *fakeRelayStore) ListenDue(ctx context.Context, notify func()) error {

@@ -11,6 +11,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
+	"github.com/alpermelkeli/notification-system/internal/domain"
 )
 
 const (
@@ -114,4 +116,32 @@ func (s *Store) claimKeys(ctx context.Context, tx pgx.Tx, claims []keyClaim) (ma
 		return nil, errKeyRace
 	}
 	return prior, nil
+}
+
+// KeyMatch is the resource a live Idempotency-Key created with the same request.
+type KeyMatch struct {
+	Found bool
+	// Batch reports that the key created a batch rather than a notification.
+	Batch bool
+	ID    uuid.UUID
+}
+
+// FindIdempotencyKey looks up a live key without claiming it. A key used for a request with a
+// different hash returns domain.ErrIdempotencyKeyReused. The API checks keys this way before
+// work whose outcome can change over time, such as rendering a template that may have been edited
+// or deleted since the original request (ADR-0010); the create itself still claims the key.
+func (s *Store) FindIdempotencyKey(ctx context.Context, k IdempotencyKey) (KeyMatch, error) {
+	var p priorKey
+	err := s.pool.QueryRow(ctx, `
+		SELECT request_hash, resource_type, resource_id FROM idempotency_keys
+		 WHERE key = $1 AND expires_at > now()`, k.Key).Scan(&p.requestHash, &p.resourceType, &p.resourceID)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return KeyMatch{}, nil
+	case err != nil:
+		return KeyMatch{}, fmt.Errorf("find idempotency key: %w", err)
+	case !bytes.Equal(p.requestHash, k.RequestHash[:]):
+		return KeyMatch{}, domain.ErrIdempotencyKeyReused
+	}
+	return KeyMatch{Found: true, Batch: p.resourceType == resourceBatch, ID: p.resourceID}, nil
 }

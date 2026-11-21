@@ -18,7 +18,7 @@ func TestHTTPMiddlewareLabelsByRoutePattern(t *testing.T) {
 	reg := NewRegistry()
 	m := NewHTTP(reg)
 	r := chi.NewRouter()
-	r.Use(m.Middleware)
+	r.Use(m.Middleware())
 	r.Get("/v1/notifications/{id}", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
 	r.Post("/v1/notifications", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusAccepted) })
 
@@ -62,7 +62,7 @@ func TestNilMetricSetsAreNoops(t *testing.T) {
 		p *Dispatch
 	)
 	next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
-	if h.Middleware(next) == nil {
+	if h.Middleware()(next) == nil {
 		t.Fatal("nil middleware")
 	}
 	h.Created(domain.ChannelSMS, domain.PriorityHigh, 1)
