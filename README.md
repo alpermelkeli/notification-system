@@ -52,6 +52,39 @@ docker compose up --build
 | [0005](docs/adr/0005-delivery-retry-and-failure-handling.md) | Status lifecycle, failure classification, backoff + jitter, DLQ, circuit breaker |
 | [0006](docs/adr/0006-rate-limiting-and-priority-scheduling.md) | Redis GCRA per channel/provider, 429 fleet cool-down, capped-aging priority scheduler |
 | [0007](docs/adr/0007-technology-stack.md) | Go 1.25, chi, pgx, goose, franz-go, go-redis, OpenTelemetry, testcontainers |
+| [0008](docs/adr/0008-scalability-and-deployment-topology.md) | Scaling model per component, single PG primary + HA/replica/partitioning, nginx scaling demo |
+
+## Scalability & capacity
+
+![Deployment](docs/architecture/deployment.png)
+
+**The throughput ceiling is the provider quota:** 3 channels × 100 msg/s = 300 msg/s ≈ 26 M/day.
+Adding replicas or database capacity cannot raise it, so scaling serves **burst absorption**
+(API), **resilience** (every tier) and **provider-latency concurrency** (workers). The full
+back-of-the-envelope math is in [`docs/capacity-planning.md`](docs/capacity-planning.md).
+
+| At the ceiling | Value |
+|----------------|-------|
+| PostgreSQL writes | ~2.4 k/s (8 per notification), single primary is enough |
+| PostgreSQL storage | ~2 KB/notification → ~52 GB/day, daily partitions + 30-day retention |
+| Kafka | ~1.5 k msg/s (work + events), 3 brokers RF=3 |
+| Redis | ~600 ops/s |
+| Burst drain | 2 M SMS ≈ 5.6 h at 100 msg/s, so the backlog stays durable in Kafka and priority matters |
+
+| Component | Scales by | Autoscaling signal |
+|-----------|-----------|--------------------|
+| API | horizontal behind LB (stateless) | CPU / RPS |
+| Dispatcher | horizontal (`SKIP LOCKED`), 2 for HA | none |
+| Workers | consumer group per channel | Kafka consumer lag (max = partitions) |
+| PostgreSQL | vertical + sync standby + read replica + partitioning | none (no sharding needed) |
+
+Scaling demo (local):
+```bash
+docker compose up --build --scale api=3 --scale worker=3
+```
+nginx (`lb`, port 8080) spreads requests across API replicas, and Kafka splits partitions across
+worker replicas, while each channel still sends at most 100 msg/s. See
+[ADR-0008](docs/adr/0008-scalability-and-deployment-topology.md).
 
 **Delivery guarantee:** at-least-once with deduplication at every hop. The only remaining
 duplicate window is a worker crash after the provider accepted a request but before the outcome
@@ -73,5 +106,6 @@ _`make test` — coming in Phase 2._
 | [`docs/plan.md`](docs/plan.md) | Delivery plan & open questions |
 | [`docs/conventions.md`](docs/conventions.md) | Engineering conventions |
 | [`docs/adr/`](docs/adr/) | Architecture Decision Records |
-| [`docs/architecture/`](docs/architecture/) | Architecture diagram (Excalidraw source + PNG) |
+| [`docs/architecture/`](docs/architecture/) | Architecture and deployment diagrams (Excalidraw source + PNG) |
+| [`docs/capacity-planning.md`](docs/capacity-planning.md) | Back-of-the-envelope capacity math |
 | [`.claude/agents/`](.claude/agents/) | Claude Code subagents used for parallel development |

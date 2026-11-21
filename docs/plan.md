@@ -5,15 +5,15 @@ Living document. Update phase status as work lands. Time budget ≈ 12h of focus
 | Phase | Scope | Status |
 |-------|-------|--------|
 | 0 | Repo bootstrap: README, CLAUDE.md, docs, Claude subagents | done |
-| 1 | Architecture decisions (ADRs 0001–0007) + architecture diagram | done |
-| 2 | Skeleton: Go module, layout, config, logging, health, docker-compose (postgres, kafka, redis, mock provider), Makefile, CI | next |
-| 3 | Domain + persistence: model, state machine, migrations, repository | |
+| 1 | Architecture decisions (ADRs 0001–0008), capacity planning, architecture + deployment diagrams | done |
+| 2 | Skeleton: Go module, layout, config, logging, health, docker-compose (postgres, kafka, redis, nginx lb, mock provider), Makefile, CI | next |
+| 3 | Domain + persistence: model, state machine, migrations (daily partitions, partial index, fillfactor, idempotency_keys), repository | |
 | 4 | API: create / batch / get / cancel / list + validation + OpenAPI | |
 | 5 | Processing engine: dispatcher, Kafka topics, workers, capped-aging scheduler, rate limiter, provider client | |
 | 6 | Delivery & retry: backoff, classification, DLQ, circuit breaker | |
 | 7 | Observability: metrics endpoint, correlation IDs, tracing | |
 | 8 | Bonus: scheduling, templates, WebSocket | |
-| 9 | Hardening: integration/e2e tests, load sanity check, README polish, final review | |
+| 9 | Hardening: integration/e2e tests, load test vs capacity-planning numbers, `--scale` demo, README polish, final review | |
 
 ## Resolved decisions (Phase 1)
 | Question | Decision | ADR |
@@ -25,3 +25,4 @@ Living document. Update phase status as work lands. Time budget ≈ 12h of focus
 | Retry / DLQ | Out-of-band backoff + jitter, classification, DLQ topic, circuit breaker | [0005](adr/0005-delivery-retry-and-failure-handling.md) |
 | Rate limit & priority | Redis GCRA per channel/provider, 429 cool-down, capped-aging scheduler | [0006](adr/0006-rate-limiting-and-priority-scheduling.md) |
 | Stack & deployment | Go 1.25, chi, pgx, goose; one binary: api / dispatcher / worker / migrate | [0007](adr/0007-technology-stack.md) |
+| Scaling & topology | Per-component scaling model, single PG primary + HA/replica/partitions, nginx + `--scale` demo | [0008](adr/0008-scalability-and-deployment-topology.md) |

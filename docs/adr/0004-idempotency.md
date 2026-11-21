@@ -17,8 +17,11 @@ hop idempotent and to make the remaining window explicit.
 **1. API (create / batch)**
 - Optional `Idempotency-Key` header on `POST /v1/notifications` and
   `POST /v1/notifications/batch`. Batch items may additionally carry their own `idempotencyKey`.
-- The key is stored with a SHA-256 hash of the canonicalised request (`request_hash`) and
-  protected by a unique index. The insert uses `ON CONFLICT DO NOTHING`, then reads back:
+- The key is stored with a SHA-256 hash of the canonicalised request (`request_hash`) in a
+  dedicated, non-partitioned `idempotency_keys` table (key as primary key → notification or
+  batch id). It is kept separate because `notifications` is partitioned by `created_at`
+  (ADR-0008), and a partitioned table cannot enforce a unique index that excludes the
+  partition key. The key row and the notification rows are inserted in the same transaction. The insert uses `ON CONFLICT DO NOTHING`, then reads back:
   - same key and same hash → return the original resource (`200` / `202` with the same body),
   - same key and different hash → `409 idempotency_key_reused`.
 - Concurrent requests with the same key resolve through the unique index; no locks are needed.
@@ -45,5 +48,6 @@ was reaped cannot overwrite a newer outcome.
 - ⚠️ **Remaining window (documented as at-least-once):** if a worker crashes after the provider
   accepted the request but before persisting `sent`, the reaper retries it and the provider may
   receive it twice. This is mitigated by the provider idempotency header.
-- ⚠️ Idempotency keys are kept indefinitely in this scope. In production, add a TTL cleanup
-  (e.g. 24–72 h) and scope keys per API client or tenant.
+- ⚠️ Idempotency keys expire after a TTL (default 72 h, removed by a periodic cleanup). A
+  client retry after the TTL creates a new notification, which is the standard trade-off. In
+  production, also scope keys per API client or tenant.

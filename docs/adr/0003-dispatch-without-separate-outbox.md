@@ -26,7 +26,7 @@ notifications when a schedule (B-2) or retry backoff (FR-3.1) becomes due.
 **Dispatcher loop** (any number of instances can run concurrently):
 ```sql
 BEGIN;
-SELECT id, channel, priority, attempts, next_attempt_at, correlation_id FROM notifications
+SELECT id, created_at, channel, priority, attempts, next_attempt_at, correlation_id FROM notifications
  WHERE status IN ('pending','retrying') AND next_attempt_at <= now()
  ORDER BY next_attempt_at          -- FIFO: priority is enforced only by the worker scheduler
  LIMIT 500

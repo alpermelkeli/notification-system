@@ -29,7 +29,8 @@ library and small, well-maintained libraries over frameworks.
 
 **Deployment shape:** a single binary, `notifier`, with subcommands `api`, `dispatcher`,
 `worker` and `migrate`. docker-compose runs postgres, kafka, redis, the migrate and
-topic-init jobs, api, dispatcher, worker, jaeger and a mock provider (ADR-0006).
+topic-init jobs, an nginx load balancer in front of api (ADR-0008), api, dispatcher, worker,
+jaeger and a mock provider (ADR-0006). Ids are UUIDv7 (`google/uuid`).
 
 ## Consequences
 - ✅ A small, mainstream dependency set that reviewers will recognise.

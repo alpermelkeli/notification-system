@@ -41,7 +41,8 @@ event stream for status consumers (B-4). Kafka has no per-message priority.
   by an init job in docker-compose.
 - **Partition counts size throughput and parallelism; they do not implement priority.**
   Priority is enforced by the worker scheduler (ADR-0006).
-- **Work messages are claim-checks:** `{id, channel, priority, attempt, due_at}` plus headers
+- **Work messages are claim-checks:** `{id, created_at, channel, priority, attempt, due_at}`
+  (`created_at` enables partition pruning, ADR-0008) plus headers
   `correlation_id` and `traceparent`. The content is loaded from PostgreSQL inside the claim
   `UPDATE ... RETURNING`, so the payload never diverges from the source of truth.
 - **Producer:** idempotent producer, `acks=all`.
