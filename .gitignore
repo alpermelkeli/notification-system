@@ -1,0 +1,25 @@
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Go
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+coverage.*
+vendor/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Assessment brief (confidential, kept locally only)
+docs/assesment.pdf
+
+# Claude Code local settings
+.claude/settings.local.json
