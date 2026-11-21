@@ -219,7 +219,12 @@ func startEngine(t *testing.T, store *storage.Store, providerURL string, workers
 		t.Fatal(err)
 	}
 	t.Cleanup(producer.Close)
-	evts := events.NewPublisher(producer, nil, quiet)
+	eventClient, err := kgo.NewClient(append(events.ProducerOptions(), kgo.SeedBrokers(kafkaAddr))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(eventClient.Close)
+	evts := events.NewPublisher(eventClient, nil, quiet)
 	relay := dispatcher.NewRelay(store, dispatcher.NewPublisher(producer, nil).Publish, quiet,
 		dispatcher.RelayOptions{PollInterval: 50 * time.Millisecond, Events: evts})
 	dead := queue.NewDeadLetters(producer, dispatcher.PublishTimeout)

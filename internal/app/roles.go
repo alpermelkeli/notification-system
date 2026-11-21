@@ -70,12 +70,11 @@ func RunAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 
 	// Status events only (ADR-0011). Kafka is not part of readiness: without it creates and
 	// cancels still work and only live updates pause.
-	producer, err := platform.NewKafkaClient(cfg.KafkaBrokers,
-		append(dispatcher.ProducerOptions(), kgo.ClientID("api-"+cfg.InstanceID))...)
+	eventClient, err := newEventClient(cfg, "api")
 	if err != nil {
 		return err
 	}
-	defer closeProducer(ctx, producer, logger)
+	defer closeProducer(ctx, eventClient, logger)
 
 	// The WebSocket hub reads every status event, without a consumer group (ADR-0011).
 	consumer, err := platform.NewKafkaClient(cfg.KafkaBrokers,
@@ -91,7 +90,7 @@ func RunAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	hub := ws.NewHub(metrics.NewWebSocket(reg), logger)
 	api.New(store, logger, api.Options{
 		MaxScheduleAhead: cfg.MaxScheduleAhead, RequestTimeout: cfg.RequestTimeout, Metrics: httpMetrics,
-		Events:    events.NewPublisher(producer, metrics.NewEvents(reg), logger),
+		Events:    events.NewPublisher(eventClient, metrics.NewEvents(reg), logger),
 		WebSocket: ws.NewHandler(hub, store, logger),
 	}).Routes(router)
 
@@ -129,11 +128,16 @@ func RunDispatcher(ctx context.Context, cfg config.Config, logger *slog.Logger) 
 	if err != nil {
 		return err
 	}
-	defer closeProducer(ctx, kafka, logger)
+	defer kafka.Close()
+	eventClient, err := newEventClient(cfg, "dispatcher")
+	if err != nil {
+		return err
+	}
+	defer closeProducer(ctx, eventClient, logger)
 
 	reg := metrics.NewRegistry()
 	m := metrics.NewDispatch(reg)
-	evts := events.NewPublisher(kafka, metrics.NewEvents(reg), logger)
+	evts := events.NewPublisher(eventClient, metrics.NewEvents(reg), logger)
 	store := storage.New(pool, storage.Options{IdempotencyTTL: cfg.IdempotencyTTL})
 	relay := dispatcher.NewRelay(store, dispatcher.NewPublisher(kafka, m).Publish, logger, dispatcher.RelayOptions{
 		BatchSize: cfg.Dispatcher.BatchSize, PollInterval: cfg.Dispatcher.PollInterval, Metrics: m, Events: evts,
@@ -190,14 +194,19 @@ func RunWorker(ctx context.Context, cfg config.Config, logger *slog.Logger) erro
 	if err != nil {
 		return err
 	}
-	// Dead letters and status events go through their own producer: the consumers' clients are
-	// per channel and leave their group on shutdown.
+	// Dead letters go through their own producer: the consumers' clients are per channel and leave
+	// their group on shutdown.
 	producer, err := platform.NewKafkaClient(cfg.KafkaBrokers,
-		append(dispatcher.ProducerOptions(), kgo.ClientID("worker-producer-"+cfg.InstanceID))...)
+		append(dispatcher.ProducerOptions(), kgo.ClientID("worker-dlq-"+cfg.InstanceID))...)
 	if err != nil {
 		return err
 	}
-	defer closeProducer(ctx, producer, logger)
+	defer producer.Close()
+	eventClient, err := newEventClient(cfg, "worker")
+	if err != nil {
+		return err
+	}
+	defer closeProducer(ctx, eventClient, logger)
 
 	reg := metrics.NewRegistry()
 	store := storage.New(pool, storage.Options{IdempotencyTTL: cfg.IdempotencyTTL})
@@ -211,7 +220,7 @@ func RunWorker(ctx context.Context, cfg config.Config, logger *slog.Logger) erro
 		},
 		Breaker: worker.BreakerOptions(cfg.Worker.Breaker),
 		Metrics: metrics.NewDelivery(reg),
-		Events:  events.NewPublisher(producer, metrics.NewEvents(reg), logger),
+		Events:  events.NewPublisher(eventClient, metrics.NewEvents(reg), logger),
 	}
 
 	var wg sync.WaitGroup
@@ -271,11 +280,18 @@ func runMaintenance(ctx context.Context, store *storage.Store, cfg config.Config
 	}
 }
 
-// producerFlushTimeout bounds how long shutdown waits for buffered records, mostly status
-// events, before closing a producing client.
+// newEventClient returns the role's status event producer. It is separate from every other
+// producer, so event records can never hold up work records or dead letters (ADR-0011).
+func newEventClient(cfg config.Config, role string) (*kgo.Client, error) {
+	return platform.NewKafkaClient(cfg.KafkaBrokers,
+		append(events.ProducerOptions(), kgo.ClientID(role+"-events-"+cfg.InstanceID))...)
+}
+
+// producerFlushTimeout bounds how long shutdown waits for buffered status events before closing
+// their client.
 const producerFlushTimeout = 5 * time.Second
 
-// closeProducer sends the records still buffered in cl, within producerFlushTimeout, and closes
+// closeProducer sends the events still buffered in cl, within producerFlushTimeout, and closes
 // it, so the last transitions before a shutdown still reach WebSocket clients. ctx is the role's
 // context, which is usually cancelled by then; the flush gets its own deadline.
 func closeProducer(ctx context.Context, cl *kgo.Client, logger *slog.Logger) {
