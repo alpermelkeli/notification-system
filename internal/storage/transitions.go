@@ -429,3 +429,30 @@ func notifyDue(ctx context.Context, q querier) error {
 	}
 	return nil
 }
+
+// ListenDue holds one pool connection that LISTENs on NotifyChannelDue and calls notify for every
+// notification received, until ctx ends or the connection fails. Callers reconnect by calling it
+// again; the dispatcher's polling fallback covers the gap.
+func (s *Store) ListenDue(ctx context.Context, notify func()) error {
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire listen connection: %w", err)
+	}
+	// The LISTEN must not outlive this call on a connection returned to the pool.
+	defer func() {
+		if _, err := conn.Exec(context.WithoutCancel(ctx), "UNLISTEN *"); err != nil {
+			// Already failing; the pool drops closed connections.
+			_ = conn.Conn().Close(context.WithoutCancel(ctx))
+		}
+		conn.Release()
+	}()
+	if _, err := conn.Exec(ctx, "LISTEN "+pgx.Identifier{NotifyChannelDue}.Sanitize()); err != nil {
+		return fmt.Errorf("listen %s: %w", NotifyChannelDue, err)
+	}
+	for {
+		if _, err := conn.Conn().WaitForNotification(ctx); err != nil {
+			return fmt.Errorf("wait for %s: %w", NotifyChannelDue, err)
+		}
+		notify()
+	}
+}

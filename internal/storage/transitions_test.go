@@ -572,3 +572,37 @@ func TestTruncate(t *testing.T) {
 		t.Error("short strings must be unchanged")
 	}
 }
+
+func TestListenDue(t *testing.T) {
+	s := newTestStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	woke := make(chan struct{}, 10)
+	done := make(chan error, 1)
+	go func() { done <- s.ListenDue(ctx, func() { woke <- struct{}{} }) }()
+
+	// The listener may not be registered yet; keep creating until a wake-up arrives.
+	deadline := time.After(5 * time.Second)
+	for got := false; !got; {
+		create(t, s)
+		select {
+		case <-woke:
+			got = true
+		case <-time.After(100 * time.Millisecond):
+		case <-deadline:
+			t.Fatal("no NOTIFY received for a notification due now")
+		}
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Errorf("ListenDue returned %v after cancel", err)
+	}
+	// The connection went back to the pool without a lingering LISTEN.
+	var listening int
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT count(*) FROM pg_stat_activity WHERE query ILIKE 'LISTEN%' AND state = 'idle'`).Scan(&listening); err != nil {
+		t.Fatal(err)
+	}
+	if listening != 0 {
+		t.Errorf("%d idle connections still show a LISTEN", listening)
+	}
+}
