@@ -6,6 +6,7 @@ import (
 	"runtime/debug"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
 
@@ -123,4 +124,16 @@ func Recoverer(logger *slog.Logger) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// RoutePattern returns the chi route pattern that served r (e.g. /v1/notifications/{id}), or
+// "unmatched". Metrics and span names use it so ids do not explode their cardinality. Call it
+// after the router has served r, when the pattern is complete.
+func RoutePattern(r *http.Request) string {
+	if rctx := chi.RouteContext(r.Context()); rctx != nil {
+		if p := rctx.RoutePattern(); p != "" {
+			return p
+		}
+	}
+	return "unmatched"
 }
