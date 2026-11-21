@@ -82,6 +82,17 @@ type NewBatch struct {
 	IdempotencyKey *IdempotencyKey
 }
 
+// ItemError attributes a batch failure to one item of the request.
+type ItemError struct {
+	Index int
+	Err   error
+}
+
+func (e *ItemError) Error() string { return fmt.Sprintf("item %d: %v", e.Index, e.Err) }
+
+// Unwrap exposes the cause, e.g. domain.ErrIdempotencyKeyReused.
+func (e *ItemError) Unwrap() error { return e.Err }
+
 // BatchItem is one item of a batch result, in request order.
 type BatchItem struct {
 	Notification domain.Notification
@@ -96,7 +107,8 @@ type BatchResult struct {
 	Batch domain.Batch
 	Items []BatchItem
 	// Created is false if the batch-level idempotency key matched an earlier request. Batch
-	// and Items then describe the original batch and the notifications it created.
+	// and Items then reproduce the original result, in request order and with duplicates
+	// marked, showing the notifications' current state.
 	Created bool
 }
 
@@ -121,7 +133,7 @@ func (s *Store) CreateBatch(ctx context.Context, in NewBatch, correlationID stri
 				if !prior.matches(*in.IdempotencyKey, resourceBatch) {
 					return domain.ErrIdempotencyKeyReused
 				}
-				res, err = loadBatch(ctx, tx, prior.resourceID)
+				res, err = loadBatch(ctx, tx, prior.resourceID, in.Items)
 				return err
 			}
 		}
@@ -149,7 +161,7 @@ func (s *Store) CreateBatch(ctx context.Context, in NewBatch, correlationID stri
 			if item.IdempotencyKey != nil {
 				if prior, ok := existing[item.IdempotencyKey.Key]; ok {
 					if !prior.matches(*item.IdempotencyKey, resourceNotification) {
-						return fmt.Errorf("item %d: %w", i, domain.ErrIdempotencyKeyReused)
+						return &ItemError{Index: i, Err: domain.ErrIdempotencyKeyReused}
 					}
 					n, err := getNotification(ctx, tx, prior.resourceID)
 					if err != nil {
@@ -312,8 +324,11 @@ func getBatch(ctx context.Context, q querier, id uuid.UUID) (domain.Batch, error
 	return b, nil
 }
 
-// loadBatch returns an existing batch and the notifications it created, in request order.
-func loadBatch(ctx context.Context, q querier, id uuid.UUID) (BatchResult, error) {
+// loadBatch rebuilds the result of an earlier CreateBatch call for a replay of the same request
+// (same batch key and hash, so items is the same list). Created items are placed by the request
+// index stored in their ids (domain.BatchSeq); the remaining positions were duplicates of
+// earlier requests and are found through their item keys.
+func loadBatch(ctx context.Context, q querier, id uuid.UUID, items []NewNotification) (BatchResult, error) {
 	b, err := getBatch(ctx, q, id)
 	if err != nil {
 		return BatchResult{}, err
@@ -323,13 +338,37 @@ func loadBatch(ctx context.Context, q querier, id uuid.UUID) (BatchResult, error
 	if err != nil {
 		return BatchResult{}, fmt.Errorf("load batch items: %w", err)
 	}
-	ns, err := collectNotifications(rows)
+	created, err := collectNotifications(rows)
 	if err != nil {
 		return BatchResult{}, fmt.Errorf("load batch items: %w", err)
 	}
-	items := make([]BatchItem, len(ns))
-	for i, n := range ns {
-		items[i] = BatchItem{Notification: n}
+
+	res := BatchResult{Batch: b, Items: make([]BatchItem, len(items))}
+	filled := make([]bool, len(items))
+	for _, n := range created {
+		i := domain.BatchSeq(n.ID)
+		if i >= len(items) {
+			return BatchResult{}, fmt.Errorf("load batch items: item index %d outside the %d-item request", i, len(items))
+		}
+		res.Items[i], filled[i] = BatchItem{Notification: n}, true
 	}
-	return BatchResult{Batch: b, Items: items}, nil
+	for i, item := range items {
+		if filled[i] {
+			continue
+		}
+		if item.IdempotencyKey == nil {
+			return BatchResult{}, fmt.Errorf("load batch items: item %d was neither created nor deduplicated", i)
+		}
+		var nid uuid.UUID
+		if err := q.QueryRow(ctx, `SELECT resource_id FROM idempotency_keys WHERE key = $1`,
+			item.IdempotencyKey.Key).Scan(&nid); err != nil {
+			return BatchResult{}, fmt.Errorf("load batch item %d: resolve its idempotency key: %w", i, err)
+		}
+		n, err := getNotification(ctx, q, nid)
+		if err != nil {
+			return BatchResult{}, fmt.Errorf("load batch item %d: %w", i, err)
+		}
+		res.Items[i] = BatchItem{Notification: n, Duplicate: true}
+	}
+	return res, nil
 }

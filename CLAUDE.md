@@ -60,6 +60,8 @@ internal/app/          role wiring (RunAPI, RunDispatcher, RunWorker, RunMigrate
 internal/domain/       channels, priorities, status state machine, UUIDv7 ids, domain errors (no I/O)
 internal/storage/      PostgreSQL repository: create/batch/idempotency, guarded transitions, list, partitions
 migrations/            goose SQL migrations, embedded (forward-only, never edited after merge)
+internal/api/          v1 HTTP handlers, request validation, error mapping, Swagger UI (/docs)
+api/                   openapi.yaml (spec-first contract, Redocly-linted) embedded as package apispec
 internal/config/       env -> typed Config (all errors reported at once)
 internal/logging/      slog JSON logger; correlation ID carried in context.Context
 internal/httpx/        error envelope, JSON helpers, middleware (correlation id, instance id, logging, recovery)
@@ -69,5 +71,4 @@ internal/mockprovider/ mock provider handler
 deploy/                nginx LB config, Kafka topic creation script
 docs/                  requirements, plan, conventions, ADRs, capacity planning, diagrams
 ```
-Packages added by later phases: `internal/api` + `api/openapi.yaml` (Phase 4),
-`internal/dispatcher`, `internal/worker`, `internal/ratelimit`, `internal/provider` (Phases 5–6).
+Packages added by later phases: `internal/dispatcher`, `internal/worker`, `internal/ratelimit`, `internal/provider` (Phases 5–6).

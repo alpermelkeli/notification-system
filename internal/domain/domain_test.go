@@ -131,7 +131,7 @@ func TestNewBatchItemIDKeepsRequestOrder(t *testing.T) {
 	prev := ""
 	for seq := range MaxBatchSeq + 1 {
 		id := NewBatchItemID(at, seq)
-		if !IsV7(id) || !IDTime(id).Equal(at) {
+		if !IsV7(id) || !IDTime(id).Equal(at) || BatchSeq(id) != seq {
 			t.Fatalf("seq %d: %s is not a v7 id at %v", seq, id, at)
 		}
 		if s := id.String(); s <= prev {

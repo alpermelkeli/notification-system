@@ -1,0 +1,7 @@
+# Redocly CLI lint config for api/openapi.yaml (run in CI). Individual accepted exceptions
+# (the health probes have no 4xx responses) are listed in .redocly.lint-ignore.yaml.
+extends:
+  - recommended
+rules:
+  info-license: off              # internal service, not published
+  no-server-example.com: off     # localhost is the docker-compose entry point by design

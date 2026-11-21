@@ -15,11 +15,11 @@ teams and API consumers.
 ### FR-1 Notification Management API
 | ID | Requirement | Status | Where |
 |----|-------------|--------|-------|
-| FR-1.1 | Create notification: recipient, channel, content, priority | [~] | storage: `internal/storage/create.go` (API in Phase 4) |
-| FR-1.2 | Batch create, up to **1000** per request | [~] | storage: `CreateBatch`, one multi-row INSERT (API in Phase 4) |
-| FR-1.3 | Query status by notification ID or batch ID | [~] | storage: `GetNotification`, `GetBatch`, `History` (API in Phase 4) |
-| FR-1.4 | Cancel pending notifications | [~] | storage: `Cancel`, guarded on pending/queued/retrying (API in Phase 4) |
-| FR-1.5 | List with filters (status, channel, date range) + pagination | [~] | storage: `ListNotifications`, keyset on UUIDv7 id (API in Phase 4) |
+| FR-1.1 | Create notification: recipient, channel, content, priority | [x] | `POST /v1/notifications`: `internal/api/handlers.go`, `internal/storage/create.go` |
+| FR-1.2 | Batch create, up to **1000** per request | [x] | `POST /v1/notifications/batch`, one transaction, all-or-nothing validation |
+| FR-1.3 | Query status by notification ID or batch ID | [x] | `GET /v1/notifications/{id}`, `/history`, `GET /v1/batches/{id}` |
+| FR-1.4 | Cancel pending notifications | [x] | `POST /v1/notifications/{id}/cancel`, guarded on pending/queued/retrying |
+| FR-1.5 | List with filters (status, channel, date range) + pagination | [x] | `GET /v1/notifications`: status/channel/batch/date filters, opaque cursor on the UUIDv7 id |
 
 ### FR-2 Processing Engine
 | ID | Requirement | Status | Where |
@@ -27,8 +27,8 @@ teams and API consumers.
 | FR-2.1 | Async processing via queue workers | [ ] | |
 | FR-2.2 | Rate limit: max **100 msg/s per channel** | [ ] | |
 | FR-2.3 | Priority queues: high / normal / low | [ ] | |
-| FR-2.4 | Content validation (char limits, required fields) | [ ] | |
-| FR-2.5 | Idempotency — no duplicate sends | [~] | `internal/storage/idempotency.go`, guarded `Claim` (header handling in Phase 4, provider header in Phase 5) |
+| FR-2.4 | Content validation (char limits, required fields) | [x] | `internal/domain/validate.go` (per-channel rules), `internal/api/request.go` |
+| FR-2.5 | Idempotency — no duplicate sends | [~] | `Idempotency-Key` in `internal/api`, `internal/storage/idempotency.go`, fenced `Claim` (provider header in Phase 5) |
 
 ### FR-3 Delivery & Retry Logic
 Left open by the brief ("thinking and design by candidate"). Our design must be documented in an ADR.
@@ -67,6 +67,6 @@ Left open by the brief ("thinking and design by candidate"). Our design must be 
 | D-1 | Repo with **clean commit history** | [~] |
 | D-2 | README: setup, architecture overview, API examples | [~] |
 | D-3 | `docker-compose up` one-command setup | [~] |
-| D-4 | Swagger / OpenAPI spec | [ ] |
+| D-4 | Swagger / OpenAPI spec | [x] |
 | D-5 | Versioned DB migrations | [x] |
 | D-6 | Test suite runnable with a single command | [x] |
