@@ -19,10 +19,19 @@ const staleToken = 50 * time.Millisecond
 // unavailable. If all fail, the lease expires and the reaper retries the notification.
 var persistRetries = []time.Duration{200 * time.Millisecond, time.Second, 2 * time.Second}
 
-// process delivers one record: guarded claim, provider call, outcome.
-func (w *Worker) process(ctx context.Context, r record) {
+// process delivers one record: guarded claim, provider call, outcome. done reports the send to
+// the circuit breaker that admitted it; it is called exactly once.
+func (w *Worker) process(ctx context.Context, r record, done func(error)) {
 	ctx = withCorrelation(ctx, r)
 	log := w.logger.With("notification_id", r.msg.ID.String(), "priority", string(r.msg.Priority))
+	reported := false
+	report := func(err error) {
+		if !reported {
+			reported = true
+			done(err)
+		}
+	}
+	defer report(errNotAttempted)
 
 	n, err := w.claim(ctx, r)
 	if errors.Is(err, errStale) {
@@ -37,6 +46,14 @@ func (w *Worker) process(ctx context.Context, r record) {
 	lease, _ := n.Lease()
 	log = log.With("attempt", n.Attempts)
 
+	// The breaker admitted this send before the claim. If it opened since (sends in flight
+	// failed), do not add to the provider's trouble: hand the attempt back (ADR-0005).
+	if w.circuit.open() {
+		log.InfoContext(ctx, "circuit breaker opened after the claim; releasing")
+		w.release(ctx, log, lease, w.circuit.timeout, "circuit breaker open")
+		return
+	}
+
 	// The token was granted before the claim. If the claim was slow (e.g. it waited for the
 	// dispatcher's commit), sends whose claims finished together would reach the provider in a
 	// burst above the rate, so take a fresh token (ADR-0006).
@@ -44,12 +61,7 @@ func (w *Worker) process(ctx context.Context, r record) {
 		if err := w.limiter.Wait(ctx, w.channel); err != nil {
 			// No token, no send. Hand the attempt back; it is retried without consuming it.
 			log.WarnContext(ctx, "no rate-limit token after claim; releasing", "err", err)
-			if err := w.persist(ctx, func() error {
-				_, err := w.store.Release(ctx, lease, w.opts.Retry.BaseDelay, "rate limiter unavailable")
-				return err
-			}); err != nil {
-				log.ErrorContext(ctx, "release not persisted; the lease will expire and be retried", "err", err)
-			}
+			w.release(ctx, log, lease, w.opts.Retry.BaseDelay, "rate limiter unavailable")
 			return
 		}
 	}
@@ -61,7 +73,19 @@ func (w *Worker) process(ctx context.Context, r record) {
 		Channel:        n.Channel,
 		Content:        n.Content,
 	})
+	report(sendErr)
 	w.settle(ctx, log, n, lease, res, sendErr)
+}
+
+// release hands a claimed notification back to retrying after delay without consuming the
+// attempt.
+func (w *Worker) release(ctx context.Context, log *slog.Logger, lease domain.Lease, delay time.Duration, reason string) {
+	if err := w.persist(ctx, func() error {
+		_, err := w.store.Release(ctx, lease, delay, reason)
+		return err
+	}); err != nil {
+		log.ErrorContext(ctx, "release not persisted; the lease will expire and be retried", "err", err)
+	}
 }
 
 // settle persists the outcome of a send (ADR-0005, FR-3.1–3.3):

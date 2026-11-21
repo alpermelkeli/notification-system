@@ -1,11 +1,13 @@
 // Package worker consumes one channel's work topics and delivers notifications (ADR-0002,
 // ADR-0006):
 //
-//	Kafka batch fetch → route by topic → priority heaps → capped-aging pick → Redis token →
-//	guarded claim → provider → outcome in PostgreSQL → partition watermark → offset commit
+//	Kafka batch fetch → route by topic → priority heaps → circuit breaker → Redis token →
+//	capped-aging pick → guarded claim → provider → outcome in PostgreSQL (+ dead letter) →
+//	partition watermark → offset commit
 //
 // One Worker serves one channel. Kafka spreads the channel's partitions over all worker replicas
-// in the group workers.{channel}; the Redis limiter keeps the channel's global rate.
+// in the group workers.{channel}; the Redis limiter keeps the channel's global rate. Outcomes follow
+// ADR-0005: classification, backoff with jitter, dead letters and a per-instance circuit breaker.
 package worker
 
 import (
@@ -74,6 +76,8 @@ type Options struct {
 	CommitInterval time.Duration
 	// RevokeTimeout bounds the wait for in-flight sends when partitions are revoked. Default 10s.
 	RevokeTimeout time.Duration
+	// Breaker configures the channel's circuit breaker.
+	Breaker BreakerOptions
 	// Policy is the priority policy. Default DefaultPolicy().
 	Policy *Policy
 	// Now returns the current time. Default time.Now.
@@ -86,6 +90,7 @@ func (o *Options) defaults() {
 	setDefault(&o.LowWater, 25)
 	setDefault(&o.Lease, 30*time.Second)
 	o.Retry = o.Retry.WithDefaults()
+	o.Breaker.defaults()
 	setDefault(&o.CommitInterval, time.Second)
 	setDefault(&o.RevokeTimeout, 10*time.Second)
 	if o.LowWater >= o.HighWater {
@@ -133,6 +138,7 @@ type Worker struct {
 	ready  chan struct{} // signalled when a record is buffered
 
 	tracker  *tracker
+	circuit  *circuit
 	inFlight sync.WaitGroup
 	// commitMu serialises commits with revocations: a periodic commit computed before a revoke
 	// must not reach the broker after the revoke's commit and rewind the partition's offset.
@@ -145,11 +151,12 @@ type Worker struct {
 // New returns a worker for channel c.
 func New(c domain.Channel, store Store, sender Sender, limiter Limiter, logger *slog.Logger, opts Options) *Worker {
 	opts.defaults()
+	logger = logger.With("channel", string(c))
 	return &Worker{
-		channel: c, store: store, sender: sender, limiter: limiter,
-		logger: logger.With("channel", string(c)), opts: opts,
+		channel: c, store: store, sender: sender, limiter: limiter, logger: logger, opts: opts,
 		sched: newScheduler(*opts.Policy), paused: map[domain.Priority]bool{},
 		ready: make(chan struct{}, 1), tracker: newTracker(),
+		circuit: newCircuit("provider-"+string(c), opts.Breaker, logger),
 	}
 }
 
@@ -265,8 +272,11 @@ func (w *Worker) resumeIfDrained(pr domain.Priority) {
 	}
 }
 
-// schedule hands buffered records to senders: it waits for a free sender, then for a rate-limit
-// token, and only then picks, so the pick sees every record that arrived meanwhile (ADR-0006).
+// schedule hands buffered records to senders: it waits for a free sender, then for the circuit
+// breaker to admit a send, then for a rate-limit token, and only then picks, so the pick sees
+// every record that arrived meanwhile (ADR-0006). While the breaker is open nothing is picked:
+// records stay buffered, the full buffers pause fetching, and the watermark holds, so the backlog
+// waits safely in Kafka without burning attempts (ADR-0005).
 func (w *Worker) schedule(ctx context.Context) {
 	slots := make(chan struct{}, w.opts.Concurrency)
 	for w.waitForRecords(ctx) {
@@ -275,7 +285,14 @@ func (w *Worker) schedule(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		}
+		done, err := w.circuit.allow()
+		if err != nil {
+			<-slots
+			sleep(ctx, breakerPoll)
+			continue
+		}
 		if err := w.limiter.Wait(ctx, w.channel); err != nil {
+			done(errNotAttempted)
 			<-slots
 			if ctx.Err() != nil {
 				return
@@ -293,6 +310,7 @@ func (w *Worker) schedule(ctx context.Context) {
 		}
 		w.mu.Unlock()
 		if it == nil { // its partition was revoked while waiting for the token
+			done(errNotAttempted)
 			<-slots
 			continue
 		}
@@ -307,7 +325,7 @@ func (w *Worker) schedule(ctx context.Context) {
 			// lease, so the record is not delivered twice.
 			sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.opts.Lease)
 			defer cancel()
-			w.process(sctx, r)
+			w.process(sctx, r, done)
 			w.tracker.done(r.part, r.kr.Offset, true)
 		}(it.rec)
 	}

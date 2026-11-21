@@ -161,6 +161,7 @@ func RunWorker(ctx context.Context, cfg config.Config, logger *slog.Logger) erro
 		Retry: retry.Policy{
 			BaseDelay: cfg.Retry.BaseDelay, MaxDelay: cfg.Retry.MaxDelay, MaxAttempts: cfg.Retry.MaxAttempts,
 		},
+		Breaker: worker.BreakerOptions(cfg.Worker.Breaker),
 	}
 
 	var wg sync.WaitGroup

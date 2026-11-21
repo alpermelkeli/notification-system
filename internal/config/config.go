@@ -105,10 +105,25 @@ type Worker struct {
 	RateLimits map[domain.Channel]int
 	// RateLimitBurst is the burst allowance of each channel's bucket.
 	RateLimitBurst int
+	// Breaker configures the per-channel circuit breaker of each worker (ADR-0005).
+	Breaker Breaker
 	// AgingRate is the scheduler's aging rate in points per second waited.
 	AgingRate float64
 	// MinShareEvery reserves one pick in this many for non-high traffic (0 disables).
 	MinShareEvery int
+}
+
+// Breaker configures the per-channel circuit breaker (ADR-0005, B-1).
+type Breaker struct {
+	// ConsecutiveFailures opens the breaker after this many retryable failures in a row.
+	ConsecutiveFailures int
+	// FailureRatio opens it when more than this share of at least MinRequests sends in Window
+	// failed.
+	FailureRatio float64
+	MinRequests  int
+	Window       time.Duration
+	// OpenTimeout is how long it stays open before a single probe.
+	OpenTimeout time.Duration
 }
 
 // Load reads the configuration from the process environment.
@@ -172,8 +187,15 @@ func load(lookup lookupFunc) (Config, error) {
 				domain.ChannelPush:  p.integer("RATE_LIMIT_PUSH", 100, 1, 100_000),
 			},
 			RateLimitBurst: p.integer("RATE_LIMIT_BURST", 1, 1, 10_000),
-			AgingRate:      p.float("SCHEDULER_AGING_RATE", 2, 0, 1000),
-			MinShareEvery:  p.integer("SCHEDULER_MIN_SHARE", 10, 0, 1000),
+			Breaker: Breaker{
+				ConsecutiveFailures: p.integer("BREAKER_CONSECUTIVE_FAILURES", 5, 1, 10_000),
+				FailureRatio:        p.float("BREAKER_FAILURE_RATIO", 0.5, 0.01, 0.99),
+				MinRequests:         p.integer("BREAKER_MIN_REQUESTS", 20, 1, 1_000_000),
+				Window:              p.duration("BREAKER_WINDOW", time.Minute),
+				OpenTimeout:         p.duration("BREAKER_OPEN_TIMEOUT", 30*time.Second),
+			},
+			AgingRate:     p.float("SCHEDULER_AGING_RATE", 2, 0, 1000),
+			MinShareEvery: p.integer("SCHEDULER_MIN_SHARE", 10, 0, 1000),
 		},
 	}
 

@@ -63,6 +63,9 @@ func TestLoadEngineDefaults(t *testing.T) {
 	if cfg.Retry != (Retry{BaseDelay: 5 * time.Second, MaxDelay: 5 * time.Minute, MaxAttempts: 5}) {
 		t.Errorf("retry defaults = %+v", cfg.Retry)
 	}
+	if w.Breaker != (Breaker{ConsecutiveFailures: 5, FailureRatio: 0.5, MinRequests: 20, Window: time.Minute, OpenTimeout: 30 * time.Second}) {
+		t.Errorf("breaker defaults = %+v", w.Breaker)
+	}
 	for _, c := range domain.Channels {
 		if w.RateLimits[c] != 100 {
 			t.Errorf("rate limit of %s = %d, want 100", c, w.RateLimits[c])
@@ -98,15 +101,16 @@ func TestLoadEngineOverrides(t *testing.T) {
 
 func TestLoadRejectsInvalidEngineSettings(t *testing.T) {
 	_, err := load(env(map[string]string{
-		"WORKER_CHANNELS":      "sms,fax",
-		"PROVIDER_URL":         "webhook.site/abc",
-		"SCHEDULER_AGING_RATE": "fast",
-		"RATE_LIMIT_SMS":       "0",
+		"WORKER_CHANNELS":       "sms,fax",
+		"PROVIDER_URL":          "webhook.site/abc",
+		"SCHEDULER_AGING_RATE":  "fast",
+		"RATE_LIMIT_SMS":        "0",
+		"BREAKER_FAILURE_RATIO": "1.5",
 	}))
 	if err == nil {
 		t.Fatal("expected an error")
 	}
-	for _, key := range []string{"WORKER_CHANNELS", "PROVIDER_URL", "SCHEDULER_AGING_RATE", "RATE_LIMIT_SMS"} {
+	for _, key := range []string{"WORKER_CHANNELS", "PROVIDER_URL", "SCHEDULER_AGING_RATE", "RATE_LIMIT_SMS", "BREAKER_FAILURE_RATIO"} {
 		if !strings.Contains(err.Error(), key) {
 			t.Errorf("error does not mention %s: %v", key, err)
 		}

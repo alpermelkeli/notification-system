@@ -100,6 +100,10 @@ curl localhost:8081/stats        # accepted/rejected per channel + rate in the l
   after at least its `Retry-After` and pauses the whole fleet. Any other `4xx` is permanent. A
   permanent failure, or a failure of the last of `MAX_ATTEMPTS` attempts, moves the notification to
   `failed` and publishes a dead letter to `notifications.dlq`.
+- **Circuit breaker** (per channel and worker instance): opens after 5 retryable failures in a row,
+  or more than 50% of at least 20 sends in a minute. While open the worker picks nothing: records
+  stay in its buffers and in Kafka, fetching pauses, and no attempts are burned. After 30 s one
+  probe is let through; its success closes the breaker. `4xx` and `429` answers do not count.
 
 ### Design decisions
 | ADR | Decision |
@@ -278,6 +282,9 @@ stop the process with a message listing every problem. Copy [`.env.example`](.en
 | `RETRY_BASE_DELAY` | `5s` | worker | Backoff ceiling of the first retry; it doubles per attempt and the delay is jittered between half the ceiling and the ceiling |
 | `RETRY_MAX_DELAY` | `5m` | worker | Cap of the backoff ceiling; must not be shorter than `RETRY_BASE_DELAY` |
 | `MAX_ATTEMPTS` | `5` | worker, dispatcher | Attempt budget; the last failure (or an expired lease on the last attempt) marks the notification `failed` |
+| `BREAKER_CONSECUTIVE_FAILURES` | `5` | worker | Retryable failures in a row that open a channel's circuit breaker |
+| `BREAKER_FAILURE_RATIO` / `BREAKER_MIN_REQUESTS` / `BREAKER_WINDOW` | `0.5` / `20` / `1m` | worker | Also open it when more than this share of at least this many sends in the rolling window failed |
+| `BREAKER_OPEN_TIMEOUT` | `30s` | worker | How long the breaker stays open before one probe; notifications released while open are retried after it |
 | `SCHEDULER_AGING_RATE` | `2` | worker | Priority points gained per second waited (capped per priority, [ADR-0006](docs/adr/0006-rate-limiting-and-priority-scheduling.md)) |
 | `SCHEDULER_MIN_SHARE` | `10` | worker | Every Nth send goes to `normal`/`low` under a `high` flood (0 disables) |
 | `MOCK_ADDR` | `:8081` | mockprovider | Listen address |
