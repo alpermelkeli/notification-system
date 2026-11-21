@@ -66,7 +66,10 @@ state:
  "at": "2026-11-21T15:04:05.123456Z"}
 ```
 
-`at` is the row's `updated_at`, the database time of the transition. Events never carry the
+`at` is the row's `updated_at`, set with `clock_timestamp()` when the row changes, not with the
+transaction's start time; the row lock orders one notification's changes, so their `at` follows
+the same order (on one primary whose clock does not step back). The history row of the change
+gets the same time, so `GET /v1/notifications/{id}/history` and the events agree. Events never carry the
 recipient or the content. `lastError` is cut after the provider's status code, because the
 response body that follows may echo the recipient; the REST API shows the full error.
 
@@ -119,9 +122,9 @@ response body that follows may echo the recipient; the REST API shows the full e
   instance costs its clients only a reconnect.
 - ✅ The delivery path is unchanged: publishing events cannot slow or fail a send, a claim or a
   create.
-- ⚠️ Events are at most once and are not totally ordered. They come from different processes,
-  so `processing` can arrive before `queued`. Clients order by `at`, and the API stays the
-  source of truth.
+- ⚠️ Events are at most once and may arrive out of order: they come from different processes,
+  so `processing` can arrive before `queued`. Clients order a notification's events by `at`,
+  which follows the order of its changes, and the API stays the source of truth.
 - ⚠️ Every API instance reads the whole event stream. At millions of events per hour, that is
   about 1–2 MB/s per instance, which is fine. Much larger fleets would partition the clients or
   put a fan-out tier, such as Redis pub/sub keyed by id, between Kafka and the sockets.

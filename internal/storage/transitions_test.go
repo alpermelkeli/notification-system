@@ -174,7 +174,7 @@ func TestDispatchOrderAndLimit(t *testing.T) {
 		t.Fatalf("queued %d, err=%v", len(queued), err)
 	}
 	for _, q := range queued {
-		if q.Status != domain.StatusQueued || q.QueuedAt == nil || !q.UpdatedAt.Equal(*q.QueuedAt) {
+		if q.Status != domain.StatusQueued || q.QueuedAt == nil || q.QueuedAt.After(q.UpdatedAt) {
 			t.Errorf("returned row is not queued: %+v", q)
 		}
 	}
@@ -721,5 +721,47 @@ func TestClaimIsIdempotentPerToken(t *testing.T) {
 	}
 	if claims != 1 {
 		t.Errorf("%d claimed history entries, want 1", claims)
+	}
+}
+
+// TestTransitionTimeIsTheTimeOfTheChange: updated_at, the "at" of status events, is when the row
+// changed, not when its transaction started. The relay's transaction starts before it publishes;
+// a transition committed by someone else meanwhile must not end up later than the relay's
+// "queued" (ADR-0011).
+func TestTransitionTimeIsTheTimeOfTheChange(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	n := create(t, s)
+	var mid time.Time
+	queued, err := s.DispatchDue(ctx, 10, func(ctx context.Context, ns []domain.Notification) ([]KafkaPosition, error) {
+		// Read the database clock on another connection, as a concurrent transaction would see it.
+		if err := testPool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&mid); err != nil {
+			return nil, err
+		}
+		return positions(ns), nil
+	})
+	if err != nil || len(queued) != 1 || queued[0].ID != n.ID {
+		t.Fatalf("dispatch: %+v, %v", queued, err)
+	}
+	if !queued[0].UpdatedAt.After(mid) {
+		t.Errorf("queued at %v, before a moment %v inside its own transaction", queued[0].UpdatedAt, mid)
+	}
+	// The history entry carries the same time as the row, and so as the event.
+	hist, err := s.History(ctx, n.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last := hist[len(hist)-1]; last.To != domain.StatusQueued || !last.At.Equal(queued[0].UpdatedAt) {
+		t.Errorf("history entry %+v, want queued at %v", last, queued[0].UpdatedAt)
+	}
+	// Every guarded transition does the same.
+	l := claim(t, s, n, time.Minute)
+	sent, err := s.MarkSent(ctx, l, "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hist, _ = s.History(ctx, n.ID)
+	if last := hist[len(hist)-1]; last.To != domain.StatusSent || !last.At.Equal(sent.UpdatedAt) {
+		t.Errorf("history entry %+v, want sent at %v", last, sent.UpdatedAt)
 	}
 }
