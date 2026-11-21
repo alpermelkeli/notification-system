@@ -109,10 +109,12 @@ terminal failures visible and replayable (B-1).
     than the lease without being reaped and sent again. Measured in compose before this change:
     10 of 1000 were sent twice during a 15 s outage.
   - A write retried after an ambiguous failure that the lease guard then rejects is checked
-    against the row: if the row already holds the outcome, it counts as written, so the dead
-    letter of a `failed` row is not skipped.
+    against the row: if the row holds this outcome (same status, attempt and `last_error`, so not
+    the reaper's), it counts as written, and the dead letter of a `failed` row is not skipped.
+  - `LEASE_DURATION` must be at least `PROVIDER_TIMEOUT` + 15 s to fit this budget.
 - *Idempotent claim.* The worker generates the lease token once per record. A claim retried after
-  a lost answer gets its own claim back instead of skipping the record as stale. Without that, the
+  a lost answer gets its own claim back, with its lease renewed from that retry so the worker's
+  local lease bound stays conservative, instead of skipping the record as stale. Without that, the
   reaper would later count the attempt, and on the last attempt fail a notification that was never
   sent.
 - *Half-open.* A send admitted while the breaker was closed is released if, after its claim, the

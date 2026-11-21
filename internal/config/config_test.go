@@ -115,9 +115,9 @@ func TestLoadRejectsInvalidEngineSettings(t *testing.T) {
 			t.Errorf("error does not mention %s: %v", key, err)
 		}
 	}
-	if _, err := load(env(map[string]string{"PROVIDER_TIMEOUT": "30s", "LEASE_DURATION": "30s"})); err == nil ||
+	if _, err := load(env(map[string]string{"PROVIDER_TIMEOUT": "10s", "LEASE_DURATION": "24s"})); err == nil ||
 		!strings.Contains(err.Error(), "LEASE_DURATION") {
-		t.Errorf("a lease shorter than the provider timeout + 5s must be rejected: %v", err)
+		t.Errorf("a lease shorter than the provider timeout + 15s must be rejected: %v", err)
 	}
 	if _, err := load(env(map[string]string{"RETRY_BASE_DELAY": "1m", "RETRY_MAX_DELAY": "10s"})); err == nil ||
 		!strings.Contains(err.Error(), "RETRY_MAX_DELAY") {

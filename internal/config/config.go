@@ -200,9 +200,10 @@ func load(lookup lookupFunc) (Config, error) {
 	}
 
 	// A claim must outlive the provider call and the outcome write, or a slow but successful
-	// send is reaped and delivered twice.
-	if cfg.Worker.Lease < cfg.Worker.ProviderTimeout+5*time.Second {
-		p.errs = append(p.errs, fmt.Errorf("LEASE_DURATION (%v) must be at least PROVIDER_TIMEOUT (%v) + 5s",
+	// send is reaped and delivered twice. The worker's lease budget (internal/worker) is up to 5s
+	// for the claim, 2s for a fresh token and 5s reserved for the outcome, plus margin.
+	if cfg.Worker.Lease < cfg.Worker.ProviderTimeout+15*time.Second {
+		p.errs = append(p.errs, fmt.Errorf("LEASE_DURATION (%v) must be at least PROVIDER_TIMEOUT (%v) + 15s",
 			cfg.Worker.Lease, cfg.Worker.ProviderTimeout))
 	}
 

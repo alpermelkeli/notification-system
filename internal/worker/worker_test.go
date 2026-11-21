@@ -745,3 +745,32 @@ func TestHugeRetryAfterIsCapped(t *testing.T) {
 		t.Errorf("outcome %q, want the delay capped at one minute", got)
 	}
 }
+
+func TestIsOurOutcome(t *testing.T) {
+	reaper, ours := "lease expired on the last attempt", "permanent: provider returned 400"
+	row := func(st domain.Status, attempts int, last string) domain.Notification {
+		n := domain.Notification{Status: st, Attempts: attempts}
+		if last != "" {
+			n.LastError = &last
+		}
+		return n
+	}
+	cases := []struct {
+		name string
+		got  domain.Notification
+		want bool
+	}{
+		{"our failed", row(domain.StatusFailed, 3, ours), true},
+		{"reaper's failed", row(domain.StatusFailed, 3, reaper), false},
+		{"other attempt", row(domain.StatusFailed, 4, ours), false},
+		{"other status", row(domain.StatusRetrying, 3, ours), false},
+	}
+	for _, c := range cases {
+		if got := isOurOutcome(c.got, 3, domain.StatusFailed, ours); got != c.want {
+			t.Errorf("%s: %v, want %v", c.name, got, c.want)
+		}
+	}
+	if !isOurOutcome(row(domain.StatusSent, 2, ""), 2, domain.StatusSent, "") {
+		t.Error("a sent row with our attempt is ours")
+	}
+}

@@ -160,8 +160,8 @@ func (s *Store) Replay(ctx context.Context, id uuid.UUID) (domain.Notification, 
 // Claim moves a queued notification to processing for a worker, increments attempts and issues
 // a lease fenced by token (ADR-0004). The worker generates a fresh token for each record, which
 // makes the claim idempotent: if a claim committed but its result was lost (a timeout or a
-// connection reset after the commit), retrying it with the same token returns the claim instead
-// of reporting the row as already taken. The returned row carries the content to deliver and its
+// connection reset after the commit), retrying it with the same token returns the claim, with its
+// lease renewed from now, instead of reporting the row as already taken. The returned row carries the content to deliver and its
 // Lease(), which every outcome call must present. A *domain.TransitionError or
 // domain.ErrNotFound means the Kafka record is stale (cancelled, claimed by someone else or
 // finished) and must be skipped.
@@ -175,14 +175,19 @@ func (s *Store) Claim(ctx context.Context, id uuid.UUID, createdAt time.Time, le
 	})
 	var te *domain.TransitionError
 	if errors.As(err, &te) && te.Current == domain.StatusProcessing {
-		// Ours already, from an earlier try whose answer was lost?
-		row, getErr := scanNotification(s.pool.QueryRow(ctx,
-			`SELECT `+columns("")+` FROM notifications WHERE id = $1 AND created_at = $2`, id, createdAt))
-		if getErr != nil {
-			return domain.Notification{}, fmt.Errorf("re-read claimed row: %w", getErr)
-		}
-		if row.Status == domain.StatusProcessing && row.LeaseToken != nil && *row.LeaseToken == token {
+		// Ours already, from an earlier try whose answer was lost? Then renew the lease from now:
+		// the caller measures the lease from the start of this try, so the earlier start must not
+		// count.
+		row, renewErr := scanNotification(s.pool.QueryRow(ctx, `
+			UPDATE notifications n
+			   SET lease_until = now() + make_interval(secs => $3), updated_at = now()
+			 WHERE id = $1 AND created_at = $2 AND status = 'processing' AND lease_token = $4
+			RETURNING `+columns("n"), id, createdAt, lease.Seconds(), token))
+		switch {
+		case renewErr == nil:
 			return row, nil
+		case !errors.Is(renewErr, pgx.ErrNoRows):
+			return domain.Notification{}, fmt.Errorf("renew recovered claim: %w", renewErr)
 		}
 	}
 	return n, err

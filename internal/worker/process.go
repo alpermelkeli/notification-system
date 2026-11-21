@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -29,7 +30,8 @@ const (
 // Time budget of a claimed send, measured from the start of the claim, which is no later than
 // the database's lease start:
 //   - the send must finish outcomeReserve before the lease ends, so the outcome can be written
-//     while the lease still fences it (config requires LEASE_DURATION >= PROVIDER_TIMEOUT + 5s);
+//     while the lease still fences it (config requires LEASE_DURATION >= PROVIDER_TIMEOUT + 15s,
+//     which covers claimTimeout, tokenWaitMax and outcomeReserve);
 //   - a fresh token after a slow claim is waited for at most tokenWaitMax: a long fleet
 //     cool-down must not eat the lease, so the attempt is handed back instead;
 //   - outcome writes are retried while PostgreSQL is unavailable until the lease ends, each try
@@ -152,11 +154,12 @@ func (w *Worker) settle(ctx context.Context, log *slog.Logger, c claimed, res pr
 	class := provider.Classify(sendErr)
 	var (
 		target domain.Status
+		cause  string // last_error written with the outcome, empty for sent
 		write  func(context.Context) (domain.Notification, error)
 	)
-	fail := func(cause string) {
-		target = domain.StatusFailed
-		write = func(ctx context.Context) (domain.Notification, error) { return w.store.MarkFailed(ctx, c.lease, cause) }
+	fail := func(why string) {
+		target, cause = domain.StatusFailed, why
+		write = func(ctx context.Context) (domain.Notification, error) { return w.store.MarkFailed(ctx, c.lease, why) }
 	}
 	switch {
 	case class == provider.ClassDelivered:
@@ -178,7 +181,7 @@ func (w *Worker) settle(ctx context.Context, log *slog.Logger, c claimed, res pr
 		log.ErrorContext(ctx, "delivery failed; attempts exhausted", "err", sendErr, "class", class.String())
 	default:
 		delay := w.opts.Retry.Delay(n.Attempts)
-		cause := class.String() + ": " + sendErr.Error()
+		cause = class.String() + ": " + sendErr.Error()
 		target = domain.StatusRetrying
 		write = func(ctx context.Context) (domain.Notification, error) {
 			return w.store.MarkRetrying(ctx, c.lease, delay, cause)
@@ -194,8 +197,11 @@ func (w *Worker) settle(ctx context.Context, log *slog.Logger, c claimed, res pr
 	})
 	if err != nil && ambiguous && isGuardError(err) {
 		// An earlier try may have committed before its answer was lost; then the guard rejects
-		// the retry. Check whether the row already holds this outcome.
-		if got, gerr := w.store.GetNotification(ctx, n.ID); gerr == nil && got.Status == target && got.Attempts == n.Attempts {
+		// the retry. Check whether the row holds this outcome, and not the reaper's.
+		gctx, cancel := context.WithTimeout(ctx, writeTimeout)
+		got, gerr := w.store.GetNotification(gctx, n.ID)
+		cancel()
+		if gerr == nil && isOurOutcome(got, n.Attempts, target, cause) {
 			row, err = got, nil
 		}
 	}
@@ -216,6 +222,20 @@ func (w *Worker) settle(ctx context.Context, log *slog.Logger, c claimed, res pr
 			log.WarnContext(ctx, "dead letter not published", "err", err)
 		}
 	}
+}
+
+// isOurOutcome reports whether got is the outcome this worker wrote for its attempt. The reaper
+// can leave the same status and attempt count (e.g. failed on the last attempt), but with its own
+// last_error; a sent row can only come from the lease holder.
+func isOurOutcome(got domain.Notification, attempt int, target domain.Status, cause string) bool {
+	if got.Status != target || got.Attempts != attempt {
+		return false
+	}
+	if target == domain.StatusSent {
+		return true
+	}
+	// last_error is stored truncated, so compare as a prefix.
+	return got.LastError != nil && *got.LastError != "" && strings.HasPrefix(cause, *got.LastError)
 }
 
 func isGuardError(err error) bool {

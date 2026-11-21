@@ -679,7 +679,8 @@ func TestClaimDuringDispatchWaitsForTheCommit(t *testing.T) {
 }
 
 // TestClaimIsIdempotentPerToken: a claim retried with the same token after its answer was lost
-// gets the claim back, without counting a second attempt; another token is rejected.
+// gets the claim back with a renewed lease, without counting a second attempt; another token is
+// rejected.
 func TestClaimIsIdempotentPerToken(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -694,7 +695,7 @@ func TestClaimIsIdempotentPerToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("retry with the same token: %v", err)
 	}
-	if again.Attempts != 1 || *again.LeaseToken != token || !again.LeaseUntil.Equal(*first.LeaseUntil) {
+	if again.Attempts != 1 || *again.LeaseToken != token || again.LeaseUntil.Before(*first.LeaseUntil) {
 		t.Errorf("retried claim = attempts %d token %v lease %v", again.Attempts, again.LeaseToken, again.LeaseUntil)
 	}
 	if _, err := s.Claim(ctx, n.ID, n.CreatedAt, time.Minute, uuid.New()); !errors.Is(err, domain.ErrInvalidTransition) {
