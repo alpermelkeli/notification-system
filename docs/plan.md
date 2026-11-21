@@ -12,8 +12,8 @@ Living document. Update phase status as work lands. Time budget ≈ 12h of focus
 | 5 | Processing engine: dispatcher, Kafka topics, workers, capped-aging scheduler, rate limiter, provider client | done |
 | 6 | Delivery & retry: backoff, classification, DLQ, circuit breaker | done |
 | 7 | Observability: metrics endpoint, correlation IDs, tracing | done |
-| 8 | Bonus: scheduling, templates, WebSocket | in progress |
-| 9 | Hardening: integration/e2e tests, load test vs capacity-planning numbers, `--scale` demo, README polish, final review | |
+| 8 | Bonus: scheduling, templates, WebSocket | done |
+| 9 | Hardening: integration/e2e tests, load test vs capacity-planning numbers, `--scale` demo, README polish, final review | next |
 
 ## Resolved decisions (Phase 1)
 | Question | Decision | ADR |
@@ -42,11 +42,16 @@ Living document. Update phase status as work lands. Time budget ≈ 12h of focus
 | Status events and WebSocket (B-4) | Rows published best-effort to `notification.events` after each commit; every API instance reads all events without a group and fans them out to `/v1/ws` subscribers of notification and batch ids, with a snapshot on subscribe; `coder/websocket` | [0011](adr/0011-status-events-and-websocket.md) |
 | Readiness of multi-channel workers | `/readyz` checks every channel's Kafka client (`kafka-sms`, `kafka-email`, `kafka-push`) | [0009](adr/0009-observability.md) |
 
-## Phase 8 starting point
-Scheduled delivery (B-2) already works through `scheduledAt` and `next_attempt_at`; Phase 8 adds
-its tests and docs. Templates (B-3) and WebSocket status updates (B-4, fed by
-`notification.events`) are new. New code paths should record metrics and spans the way the worker
-does (ADR-0009).
+## Phase 9 starting point
+Phase 8 left these follow-ups from its review, none blocking:
+- Status events order by `updated_at = now()`, the transaction start. A relay transaction that
+  began before a concurrent transition committed can stamp `queued` earlier than it. Using
+  `clock_timestamp()` in the guarded transitions would make `at` reflect commit order more
+  closely (ADR-0011).
+- Browsers may only open `/v1/ws` from the API's own origin. Behind a TLS proxy that rewrites
+  `Host`, an `OriginPatterns` setting (env, README, `.env.example`) would be needed.
+- Item keys of a batch sent without a batch key are checked after template validation, so their
+  retry fails if the template changed incompatibly (ADR-0010).
 
 ## Open questions
 | Phase | Question | Notes |
