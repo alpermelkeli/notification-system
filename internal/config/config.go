@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -36,6 +37,16 @@ type Config struct {
 	RedisAddr string
 	// RedisPassword is optional.
 	RedisPassword string
+
+	// IdempotencyTTL is how long an Idempotency-Key is remembered (ADR-0004).
+	IdempotencyTTL time.Duration
+	// RetentionDays is how many days of notifications are kept before their daily partitions are
+	// dropped (ADR-0008).
+	RetentionDays int
+	// PartitionPremakeDays is how many daily partitions are kept ready ahead of today.
+	PartitionPremakeDays int
+	// MaintenanceInterval is how often the dispatcher runs partition and key maintenance.
+	MaintenanceInterval time.Duration
 }
 
 // Load reads the configuration from the process environment.
@@ -67,6 +78,17 @@ func load(lookup lookupFunc) (Config, error) {
 		KafkaBrokers:  p.list("KAFKA_BROKERS", []string{"localhost:9092"}),
 		RedisAddr:     p.str("REDIS_ADDR", "localhost:6379"),
 		RedisPassword: p.str("REDIS_PASSWORD", ""),
+
+		IdempotencyTTL:       p.duration("IDEMPOTENCY_TTL", 72*time.Hour),
+		RetentionDays:        p.integer("RETENTION_DAYS", 30, 1, 3650),
+		PartitionPremakeDays: p.integer("PARTITION_PREMAKE_DAYS", 7, 1, 90),
+		MaintenanceInterval:  p.duration("MAINTENANCE_INTERVAL", time.Hour),
+	}
+
+	// A live idempotency key must never point at a notification whose partition was dropped.
+	if cfg.IdempotencyTTL > time.Duration(cfg.RetentionDays)*24*time.Hour {
+		p.errs = append(p.errs, fmt.Errorf("IDEMPOTENCY_TTL (%v) must not exceed RETENTION_DAYS (%d days)",
+			cfg.IdempotencyTTL, cfg.RetentionDays))
 	}
 
 	if err := errors.Join(p.errs...); err != nil {
@@ -119,6 +141,19 @@ func (p *parser) duration(key string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+func (p *parser) integer(key string, def, minV, maxV int) int {
+	v, ok := p.raw(key)
+	if !ok {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < minV || n > maxV {
+		p.errs = append(p.errs, fmt.Errorf("%s: %q is not an integer in [%d, %d]", key, v, minV, maxV))
+		return def
+	}
+	return n
 }
 
 func (p *parser) list(key string, def []string) []string {
