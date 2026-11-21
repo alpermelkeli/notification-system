@@ -32,7 +32,7 @@ import (
 
 // Store is the persistence a worker needs. *storage.Store implements it.
 type Store interface {
-	Claim(ctx context.Context, id uuid.UUID, createdAt time.Time, lease time.Duration) (domain.Notification, error)
+	Claim(ctx context.Context, id uuid.UUID, createdAt time.Time, lease time.Duration, token uuid.UUID) (domain.Notification, error)
 	MarkSent(ctx context.Context, l domain.Lease, providerMessageID string) (domain.Notification, error)
 	MarkRetrying(ctx context.Context, l domain.Lease, delay time.Duration, cause string) (domain.Notification, error)
 	MarkFailed(ctx context.Context, l domain.Lease, cause string) (domain.Notification, error)

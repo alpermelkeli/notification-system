@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/alpermelkeli/notification-system/internal/domain"
 	"github.com/alpermelkeli/notification-system/internal/provider"
 	"github.com/alpermelkeli/notification-system/internal/ratelimit"
@@ -197,11 +199,12 @@ var errAbandoned = errors.New("claim abandoned")
 // on shutdown or revoke; the record then stays below the watermark.
 func (w *Worker) claimWithRetry(ctx context.Context, log *slog.Logger, r record) (domain.Notification, error) {
 	backoff := claimBackoffMin
+	token := uuid.New() // the same token on every try makes a retried claim idempotent
 	for try := 1; ; try++ {
 		// Each try runs to completion even on shutdown: abandoning a claim that committed would
 		// leave the row processing until its lease expires.
 		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claimTimeout)
-		n, err := w.claim(cctx, r)
+		n, err := w.claim(cctx, r, token)
 		cancel()
 		if err == nil || !storage.IsTransient(err) {
 			if err == nil && try > 1 {
@@ -226,8 +229,8 @@ func (w *Worker) claimWithRetry(ctx context.Context, log *slog.Logger, r record)
 // claim claims the record's notification. If the dispatcher has not committed the row as queued
 // yet, the claim waits on its row lock (storage.apply), so an early record is not skipped. It
 // returns errStale when the record must be skipped.
-func (w *Worker) claim(ctx context.Context, r record) (domain.Notification, error) {
-	n, err := w.store.Claim(ctx, r.msg.ID, r.msg.CreatedAt, w.opts.Lease)
+func (w *Worker) claim(ctx context.Context, r record, token uuid.UUID) (domain.Notification, error) {
+	n, err := w.store.Claim(ctx, r.msg.ID, r.msg.CreatedAt, w.opts.Lease, token)
 	var te *domain.TransitionError
 	if errors.As(err, &te) || errors.Is(err, domain.ErrNotFound) {
 		// Cancelled, already claimed or finished, or a duplicate publish (ADR-0004).

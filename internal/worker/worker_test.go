@@ -27,12 +27,14 @@ var discard = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 // fakeStore keeps notifications in memory with the same guards as the real store.
 type fakeStore struct {
-	mu         sync.Mutex
-	rows       map[uuid.UUID]*domain.Notification
-	outcomes   map[uuid.UUID]string // "sent", "retrying 5s", "failed"
-	causes     map[uuid.UUID]string // last_error of retrying and failed outcomes
-	claimErr   error
-	claimDelay time.Duration
+	mu       sync.Mutex
+	rows     map[uuid.UUID]*domain.Notification
+	outcomes map[uuid.UUID]string // "sent", "retrying 5s", "failed"
+	causes   map[uuid.UUID]string // last_error of retrying and failed outcomes
+	claimErr error
+	// claimErrAfterCommit is returned once by a claim that did take effect (answer lost).
+	claimErrAfterCommit error
+	claimDelay          time.Duration
 }
 
 func newFakeStore() *fakeStore {
@@ -58,7 +60,7 @@ func (f *fakeStore) outcome(id uuid.UUID) string {
 	return f.outcomes[id]
 }
 
-func (f *fakeStore) Claim(_ context.Context, id uuid.UUID, _ time.Time, _ time.Duration) (domain.Notification, error) {
+func (f *fakeStore) Claim(_ context.Context, id uuid.UUID, _ time.Time, _ time.Duration, token uuid.UUID) (domain.Notification, error) {
 	f.mu.Lock()
 	delay := f.claimDelay
 	f.mu.Unlock()
@@ -72,11 +74,18 @@ func (f *fakeStore) Claim(_ context.Context, id uuid.UUID, _ time.Time, _ time.D
 	if !ok {
 		return domain.Notification{}, domain.ErrNotFound
 	}
+	if n.Status == domain.StatusProcessing && n.LeaseToken != nil && *n.LeaseToken == token {
+		return *n, nil // idempotent retry, like the real store
+	}
 	if n.Status != domain.StatusQueued {
 		return domain.Notification{}, &domain.TransitionError{Current: n.Status, Target: domain.StatusProcessing}
 	}
-	tok := uuid.New()
-	n.Status, n.Attempts, n.LeaseToken = domain.StatusProcessing, n.Attempts+1, &tok
+	n.Status, n.Attempts, n.LeaseToken = domain.StatusProcessing, n.Attempts+1, &token
+	if f.claimErrAfterCommit != nil {
+		err := f.claimErrAfterCommit
+		f.claimErrAfterCommit = nil
+		return domain.Notification{}, err
+	}
 	return *n, nil
 }
 
@@ -470,6 +479,21 @@ func TestClaimRetriedWhileDatabaseUnavailable(t *testing.T) {
 	eventually(t, "delivered after recovery", func() bool { return h.committedAt(normalTopic, 0) == 1 })
 	if got := h.store.outcome(n.ID); got != "sent m" {
 		t.Errorf("outcome %q", got)
+	}
+}
+
+// TestClaimWhoseAnswerWasLostIsRecovered: a claim that committed but reported a transient error
+// is retried with the same token and gets the claim back, instead of being skipped as stale.
+func TestClaimWhoseAnswerWasLostIsRecovered(t *testing.T) {
+	h := newHarness(t, nil, Options{})
+	h.store.mu.Lock()
+	h.store.claimErrAfterCommit = dbDown
+	h.store.mu.Unlock()
+	n := h.store.add(domain.PriorityNormal, domain.StatusQueued, 0)
+	h.feed(t, n, 0)
+	eventually(t, "committed", func() bool { return h.committedAt(normalTopic, 0) == 1 })
+	if got := h.store.outcome(n.ID); got != "sent m" {
+		t.Errorf("outcome %q, want the claim recovered and sent", got)
 	}
 }
 

@@ -51,7 +51,7 @@ func create(t *testing.T, s *Store) domain.Notification {
 // claim claims n and returns its lease.
 func claim(t *testing.T, s *Store, n domain.Notification, lease time.Duration) domain.Lease {
 	t.Helper()
-	c, err := s.Claim(context.Background(), n.ID, n.CreatedAt, lease)
+	c, err := s.Claim(context.Background(), n.ID, n.CreatedAt, lease, uuid.New())
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestDeliveryLifecycle(t *testing.T) {
 		t.Fatalf("after dispatch: status=%s queued_at=%v", got.Status, got.QueuedAt)
 	}
 
-	claimed, err := s.Claim(ctx, n.ID, n.CreatedAt, time.Minute)
+	claimed, err := s.Claim(ctx, n.ID, n.CreatedAt, time.Minute, uuid.New())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +246,7 @@ func TestConcurrentClaimsHaveOneWinner(t *testing.T) {
 	)
 	for range 8 {
 		wg.Go(func() {
-			_, err := s.Claim(context.Background(), n.ID, n.CreatedAt, time.Minute)
+			_, err := s.Claim(context.Background(), n.ID, n.CreatedAt, time.Minute, uuid.New())
 			switch {
 			case err == nil:
 				winners.Add(1)
@@ -279,7 +279,7 @@ func TestCancel(t *testing.T) {
 	if _, err := s.Cancel(ctx, queued.ID); err != nil {
 		t.Fatalf("cancel queued: %v", err)
 	}
-	if _, err := s.Claim(ctx, queued.ID, queued.CreatedAt, time.Minute); !errors.Is(err, domain.ErrInvalidTransition) {
+	if _, err := s.Claim(ctx, queued.ID, queued.CreatedAt, time.Minute, uuid.New()); !errors.Is(err, domain.ErrInvalidTransition) {
 		t.Fatalf("claim after cancel: err = %v, want ErrInvalidTransition", err)
 	}
 
@@ -584,7 +584,7 @@ func TestCancelDuringDispatchWaitsAndWins(t *testing.T) {
 	if err := <-cancelled; err != nil {
 		t.Fatalf("cancel after dispatch: %v", err)
 	}
-	if _, err := s.Claim(ctx, n.ID, n.CreatedAt, time.Minute); !errors.Is(err, domain.ErrInvalidTransition) {
+	if _, err := s.Claim(ctx, n.ID, n.CreatedAt, time.Minute, uuid.New()); !errors.Is(err, domain.ErrInvalidTransition) {
 		t.Errorf("claim after cancel: err = %v", err)
 	}
 	hist, err := s.History(ctx, n.ID)
@@ -655,7 +655,7 @@ func TestClaimDuringDispatchWaitsForTheCommit(t *testing.T) {
 	claimed := make(chan error, 1)
 	if _, err := s.DispatchDue(ctx, 10, func(_ context.Context, ns []domain.Notification) ([]KafkaPosition, error) {
 		// The record is in Kafka now; a fast worker claims it before the dispatcher commits.
-		go func() { _, err := s.Claim(ctx, n.ID, n.CreatedAt, time.Minute); claimed <- err }()
+		go func() { _, err := s.Claim(ctx, n.ID, n.CreatedAt, time.Minute, uuid.New()); claimed <- err }()
 		select {
 		case err := <-claimed:
 			return nil, fmt.Errorf("claim did not wait for the dispatcher's commit: %w", err)
@@ -675,5 +675,42 @@ func TestClaimDuringDispatchWaitsForTheCommit(t *testing.T) {
 	hist, _ := s.History(ctx, n.ID)
 	if len(hist) != 3 || *hist[2].From != domain.StatusQueued || hist[2].To != domain.StatusProcessing {
 		t.Errorf("history = %+v", hist)
+	}
+}
+
+// TestClaimIsIdempotentPerToken: a claim retried with the same token after its answer was lost
+// gets the claim back, without counting a second attempt; another token is rejected.
+func TestClaimIsIdempotentPerToken(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	n := create(t, s)
+	dispatchAll(t, s)
+	token := uuid.New()
+	first, err := s.Claim(ctx, n.ID, n.CreatedAt, time.Minute, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := s.Claim(ctx, n.ID, n.CreatedAt, time.Minute, token)
+	if err != nil {
+		t.Fatalf("retry with the same token: %v", err)
+	}
+	if again.Attempts != 1 || *again.LeaseToken != token || !again.LeaseUntil.Equal(*first.LeaseUntil) {
+		t.Errorf("retried claim = attempts %d token %v lease %v", again.Attempts, again.LeaseToken, again.LeaseUntil)
+	}
+	if _, err := s.Claim(ctx, n.ID, n.CreatedAt, time.Minute, uuid.New()); !errors.Is(err, domain.ErrInvalidTransition) {
+		t.Errorf("claim with another token: err = %v, want ErrInvalidTransition", err)
+	}
+	hist, err := s.History(ctx, n.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := 0
+	for _, h := range hist {
+		if h.Reason == "claimed" {
+			claims++
+		}
+	}
+	if claims != 1 {
+		t.Errorf("%d claimed history entries, want 1", claims)
 	}
 }
