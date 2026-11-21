@@ -193,7 +193,9 @@ func (r *Reaper) Run(ctx context.Context) {
 			return
 		}
 		if err != nil {
-			r.logger.Error("reaper run failed", "err", err)
+			// Every step is retried on the next run; right after start-up the group coordinator
+			// is often not available yet.
+			r.logger.Warn("reaper run incomplete; retrying next run", "err", err)
 		}
 		if rep != (ReapReport{}) {
 			r.logger.Warn("reaper recovered notifications",
