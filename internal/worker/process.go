@@ -363,26 +363,26 @@ func (w *Worker) claimWithRetry(ctx context.Context, log *slog.Logger, r record)
 		}
 		// Each try runs to completion even on shutdown: abandoning a claim that committed would
 		// leave the row processing until its lease expires.
-		start := time.Now()
+		tryStart := time.Now()
 		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claimTimeout)
-		n, err := w.claim(cctx, r, token)
+		got, cerr := w.claim(cctx, r, token)
 		cancel()
-		if err == nil || !storage.IsTransient(err) {
-			if err == nil && try > 1 {
+		if cerr == nil || !storage.IsTransient(cerr) {
+			if cerr == nil && try > 1 {
 				log.InfoContext(ctx, "claim succeeded after database errors", "tries", try)
 			}
-			return n, start, err
+			return got, tryStart, cerr
 		}
 		switch {
 		case try == 1:
-			log.WarnContext(ctx, "database unavailable; retrying the claim", "err", err)
+			log.WarnContext(ctx, "database unavailable; retrying the claim", "err", cerr)
 		case try%30 == 0: // about every two minutes at the maximum backoff
-			log.ErrorContext(ctx, "database still unavailable; the claim keeps waiting", "err", err, "tries", try)
+			log.ErrorContext(ctx, "database still unavailable; the claim keeps waiting", "err", cerr, "tries", try)
 		}
 		// Wait in short steps, so a revoke does not wait out a long backoff.
 		for waited := time.Duration(0); waited < backoff; waited += claimBackoffMin {
 			if ctx.Err() != nil || w.tracker.gone(r.part) {
-				return domain.Notification{}, time.Time{}, errors.Join(errAbandoned, err)
+				return domain.Notification{}, time.Time{}, errors.Join(errAbandoned, cerr)
 			}
 			sleep(ctx, claimBackoffMin)
 		}
