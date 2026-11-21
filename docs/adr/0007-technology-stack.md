@@ -17,9 +17,9 @@ library and small, well-maintained libraries over frameworks.
 | Migrations | `pressly/goose/v3` (SQL files) | Versioned SQL, embeddable, runs as a compose job |
 | Kafka | Apache Kafka 4.x (KRaft, single node locally) + `twmb/franz-go` | ADR-0002 |
 | Redis | Redis 7 + `redis/go-redis/v9` + `go-redis/redis_rate/v10` | ADR-0006 |
-| Validation | `go-playground/validator/v10` + custom channel rules | Declarative struct validation |
+| Validation | Hand-written rules in `internal/domain` (amended, see below) | Channel-specific rules with per-field messages |
 | Circuit breaker | `sony/gobreaker/v2` | Small and proven |
-| API contract | Spec-first `api/openapi.yaml`, served with Swagger UI | The contract is reviewed before code |
+| API contract | Spec-first `api/openapi.yaml`, served with Swagger UI, linted with Redocly CLI in CI | The contract is reviewed before code |
 | Logging | `log/slog` (JSON) | Standard library, structured, carries `correlation_id` |
 | Metrics | `prometheus/client_golang` at `/metrics` | Industry standard; queue depth, rates, latency histograms |
 | Tracing | OpenTelemetry SDK → OTLP → Jaeger | B-5; trace context propagated via Kafka headers |
@@ -35,6 +35,13 @@ jaeger and a mock provider (ADR-0006). Ids are UUIDv7 (`google/uuid`).
 **Amendment (2026-11-21, Phase 2):** the language row originally said Go 1.25. Bootstrapping the
 module showed that the current releases of franz-go, go-redis and client_golang require Go 1.26,
 so the target moved to 1.26 instead of pinning older library versions.
+
+**Amendment (2026-11-21, Phase 4):** `go-playground/validator` was dropped before it was ever
+added. Almost every rule is channel-specific (E.164 vs. email address vs. device token, SMS
+segment counting with GSM-7/UCS-2 detection), which struct tags cannot express, and the API needs
+violations as `field` paths such as `notifications[3].content`. Plain Go functions in
+`internal/domain` do both with one dependency fewer. Swagger UI is loaded from a pinned CDN
+build (`swagger-ui-dist@5.17.14`) rather than embedded, so it adds no Go dependency.
 
 ## Consequences
 - ✅ A small, mainstream dependency set that reviewers will recognise.
