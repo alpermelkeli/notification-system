@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Notification Pipeline</title>
+  <meta name="description" content="Watch notifications travel through the delivery pipeline and run scenarios against it.">
+  <link rel="icon" href="data:,">
+  <link rel="preload" href="/playground/assets/fonts/inter-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/playground/assets/style.css">
+  <script src="/playground/assets/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="intro">
+    <h1>Notification pipeline</h1>
+    <p>Everything sent from this page goes through the real system running on this machine: the API, PostgreSQL, Kafka, the workers, the rate limiter and the mock provider.</p>
+  </div>
+  <dl class="readout">
+    <div><dt>Live updates</dt><dd id="conn" data-state="connecting">Connecting</dd></div>
+    <div><dt>Running</dt><dd id="instances">Waiting for metrics</dd></div>
+    <div><dt>Accepted</dt><dd><span id="created-rate" class="num">0</span> per second</dd></div>
+    <div><dt>Delivered</dt><dd><span id="delivered-rate" class="num">0</span> per second</dd></div>
+  </dl>
+</header>
+
+<main class="layout">
+  <section class="map-panel" aria-label="Pipeline map">
+    <figure class="map">
+      <p id="now" class="now" aria-live="polite"><span class="now-step" id="now-step"></span><span id="now-text">Follow a notification to see each step here as it happens.</span></p>
+      <div class="map-scroll">
+        <svg id="map" viewBox="0 0 1100 560" role="group"
+             aria-label="Pipeline map: a notification goes from the API into PostgreSQL, the dispatcher publishes it to its channel's Kafka topic, a worker takes a rate-limit token and calls the provider. Provider errors drop to the failure track, which loops back to PostgreSQL for a retry or ends at the dead letters."></svg>
+      </div>
+      <figcaption>
+        Each dot is one notification, colored by channel. It moves when the system reports a new status.
+        Point at a station to see what it does; select a dot to follow its steps.
+      </figcaption>
+    </figure>
+
+    <div class="below-map">
+      <section class="steps" aria-labelledby="steps-title">
+        <div class="steps-head">
+          <h2 id="steps-title">Step by step</h2>
+          <label class="follow">
+            <span>Following</span>
+            <select id="follow-select" aria-label="Notification to follow">
+              <option value="">Nothing yet</option>
+            </select>
+          </label>
+        </div>
+        <div id="selected-summary" class="selected-summary" hidden></div>
+        <ol id="steps" class="step-list"></ol>
+        <p id="steps-empty" class="empty">Send a notification or run a scenario. Its journey appears here, one step per status change, with the time each step happened.</p>
+      </section>
+
+      <aside class="station-info" aria-live="polite" aria-labelledby="station-title">
+        <h2 id="station-title">Stations</h2>
+        <div id="station-body">
+          <p class="empty">Point at or select a station on the map to see its role.</p>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <aside class="side" aria-label="Try it">
+    <section class="send" aria-labelledby="send-title">
+      <h2 id="send-title">Send a notification</h2>
+      <form id="send-form" novalidate>
+        <div class="field-row">
+          <label>Channel
+            <select name="channel" id="send-channel">
+              <option value="sms">SMS</option>
+              <option value="email">Email</option>
+              <option value="push">Push</option>
+            </select>
+          </label>
+          <label>Priority
+            <select name="priority">
+              <option value="high">High</option>
+              <option value="normal" selected>Normal</option>
+              <option value="low">Low</option>
+            </select>
+          </label>
+        </div>
+        <label>Recipient
+          <input name="recipient" id="send-recipient" value="+905551234567" autocomplete="off" spellcheck="false">
+        </label>
+        <label>Message
+          <textarea name="content" rows="2">Your order has shipped.</textarea>
+        </label>
+        <button type="submit" class="primary">Send notification</button>
+        <p id="send-result" class="form-result" role="status"></p>
+      </form>
+    </section>
+
+    <section class="scenarios" aria-labelledby="scenarios-title">
+      <h2 id="scenarios-title">Scenarios</h2>
+      <p class="hint">Each one runs against the live system and checks the result. One runs at a time.</p>
+      <div id="faults-banner" class="faults-banner" hidden>
+        <p id="faults-text"></p>
+        <button type="button" id="faults-reset" class="quiet">Restore the provider</button>
+      </div>
+      <ul id="scenario-list" class="scenario-list"></ul>
+    </section>
+  </aside>
+</main>
+
+<footer class="foot">
+  <a href="/docs">API reference</a>
+  <a href="http://localhost:16686" rel="noreferrer">Traces (Jaeger)</a>
+  <a href="http://localhost:9091" rel="noreferrer">Metrics (Prometheus)</a>
+</footer>
+</body>
+</html>

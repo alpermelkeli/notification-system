@@ -61,6 +61,9 @@ type Config struct {
 	// own origin is always allowed (B-4, ADR-0011).
 	WSAllowedOrigins []string
 
+	// Demo configures the playground (role: api). Off by default.
+	Demo Demo
+
 	// Retry is the delivery retry policy (ADR-0005): the worker's backoff, and the attempt budget
 	// that both the worker and the dispatcher's reaper enforce.
 	Retry Retry
@@ -70,6 +73,20 @@ type Config struct {
 	Worker Worker
 	// Tracing configures OpenTelemetry tracing (B-5, ADR-0009).
 	Tracing Tracing
+}
+
+// Demo configures the playground page (/playground): a live diagram of the pipeline with
+// scenarios that run against the system (ADR-0011). It is meant for local demos: anyone who can
+// open it can create load and, with ProviderAdminURL, make the mock provider fail.
+type Demo struct {
+	// Enabled serves /playground and its JSON endpoints.
+	Enabled bool
+	// PrometheusURL is the Prometheus server the playground's live counters are read from;
+	// empty hides them.
+	PrometheusURL string
+	// ProviderAdminURL is the mock provider's base URL; with it the failure scenarios can
+	// change its fault rates. Empty disables them.
+	ProviderAdminURL string
 }
 
 // Tracing configures span export over OTLP/HTTP.
@@ -182,6 +199,11 @@ func load(lookup lookupFunc) (Config, error) {
 		RequestTimeout:       p.duration("REQUEST_TIMEOUT", 10*time.Second),
 		WSAllowedOrigins:     p.originPatterns("WS_ALLOWED_ORIGINS"),
 
+		Demo: Demo{
+			Enabled:          p.boolean("DEMO_ENABLED", false),
+			PrometheusURL:    p.optionalURL("DEMO_PROMETHEUS_URL"),
+			ProviderAdminURL: p.optionalURL("DEMO_PROVIDER_ADMIN_URL"),
+		},
 		Retry: Retry{
 			BaseDelay:   p.duration("RETRY_BASE_DELAY", 5*time.Second),
 			MaxDelay:    p.duration("RETRY_MAX_DELAY", 5*time.Minute),
@@ -299,6 +321,19 @@ func (p *parser) duration(key string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+func (p *parser) boolean(key string, def bool) bool {
+	v, ok := p.raw(key)
+	if !ok {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		p.errs = append(p.errs, fmt.Errorf("%s: %q is not a boolean (true or false)", key, v))
+		return def
+	}
+	return b
 }
 
 func (p *parser) integer(key string, def, minV, maxV int) int {

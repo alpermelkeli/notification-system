@@ -360,7 +360,7 @@ paths:
       summary: Live status updates (WebSocket)
       description: |
         Upgrade to a WebSocket and follow notifications and batches as they change (B-4). Messages
-        are JSON text frames. A live demo runs at `/ws-demo`.
+        are JSON text frames. With `DEMO_ENABLED=true`, `/playground` shows them live.
 
         **Client → server**
         - `{"type":"subscribe","notificationIds":["…"],"batchIds":["…"]}`: 1–100 ids per message, at

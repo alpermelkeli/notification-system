@@ -4,7 +4,7 @@ An event-driven, multi-channel notification service written in Go. It accepts no
 requests over HTTP, processes them asynchronously through prioritized queue workers, and delivers
 them via SMS, Email and Push providers with rate limiting, retries and real-time status tracking.
 
-> **Status:** 🚧 Phase 8 done: notifications flow end to end (API → PostgreSQL → dispatcher → Kafka → priority-scheduled workers → Redis rate limiter → provider). Failures are classified and retried with exponential backoff and jitter, terminal failures are dead-lettered, and a per-channel circuit breaker holds the backlog during provider outages. Every role exports Prometheus metrics, and one OpenTelemetry trace follows each notification from the API request to the provider call. Notifications can be scheduled and rendered from templates, and every status change streams to WebSocket clients (try http://localhost:8080/ws-demo). Hardening follows in Phase 9. See [`docs/plan.md`](docs/plan.md).
+> **Status:** 🚧 Phase 8 done: notifications flow end to end (API → PostgreSQL → dispatcher → Kafka → priority-scheduled workers → Redis rate limiter → provider). Failures are classified and retried with exponential backoff and jitter, terminal failures are dead-lettered, and a per-channel circuit breaker holds the backlog during provider outages. Every role exports Prometheus metrics, and one OpenTelemetry trace follows each notification from the API request to the provider call. Notifications can be scheduled and rendered from templates, and every status change streams to WebSocket clients (try the playground at http://localhost:8080/playground). Hardening follows in Phase 9. See [`docs/plan.md`](docs/plan.md).
 
 ## Features (target)
 - **Notification API:** single and batch create (up to 1000), status by ID / batch ID, cancel, filtered + paginated listing
@@ -124,7 +124,7 @@ See [ADR-0011](docs/adr/0011-status-events-and-websocket.md) for the design.
 - **Protocol:** a client opens `GET /v1/ws` and subscribes to notification ids and batch ids. It
   first gets the current state (a snapshot), then every change. Updates may arrive out of order,
   so clients keep the latest `at` per notification.
-- **Demo page:** http://localhost:8080/ws-demo sends a notification and follows it live.
+- **Playground:** http://localhost:8080/playground draws the pipeline, moves each notification along it live and runs scenarios against the system (compose enables it with `DEMO_ENABLED`).
 
 ```bash
 websocat ws://localhost:8080/v1/ws
@@ -392,6 +392,9 @@ stop the process with a message listing every problem. Copy [`.env.example`](.en
 | `MAX_SCHEDULE_AHEAD` | `168h` | api | Latest allowed `scheduledAt`. Must be at least one day shorter than `RETENTION_DAYS` |
 | `REQUEST_TIMEOUT` | `10s` | api | Deadline for each API request; exceeded requests return `503 timeout` |
 | `WS_ALLOWED_ORIGINS` | *(empty)* | api | Extra browser origins allowed to open `/v1/ws`, comma-separated host patterns (`app.example.com`, `*.example.com`) or with a scheme (`https://app.example.com`), matched against the origin's host and non-default port (`*.example.com` excludes `example.com` itself); the API's own origin is always allowed. Set it behind a proxy that rewrites `Host` |
+| `DEMO_ENABLED` | `false` | api | Serve the playground at `/playground`. A local demo: anyone who can open it can create load and change the mock provider's faults. Compose sets `true` |
+| `DEMO_PROMETHEUS_URL` | *(empty)* | api | Prometheus server the playground reads its live counters from; empty hides them. Compose: `http://prometheus:9090` |
+| `DEMO_PROVIDER_ADMIN_URL` | *(empty)* | api | Mock provider base URL for the playground's failure scenarios; empty disables them. Compose: `http://mockprovider:8081` |
 | `RETENTION_DAYS` | `30` | dispatcher | Daily partitions older than this are dropped |
 | `PARTITION_PREMAKE_DAYS` | `7` | migrate, dispatcher | Partitions kept ready ahead of today |
 | `MAINTENANCE_INTERVAL` | `1h` | dispatcher | How often partition and key maintenance runs |
@@ -415,7 +418,7 @@ stop the process with a message listing every problem. Copy [`.env.example`](.en
 | `BREAKER_OPEN_TIMEOUT` | `30s` | worker | How long the breaker stays open before one probe; notifications released while open are retried after it |
 | `SCHEDULER_AGING_RATE` | `2` | worker | Priority points gained per second waited (capped per priority, [ADR-0006](docs/adr/0006-rate-limiting-and-priority-scheduling.md)) |
 | `SCHEDULER_MIN_SHARE` | `10` | worker | Every Nth send goes to `normal`/`low` under a `high` flood (0 disables) |
-| `QUEUE_METRICS_INTERVAL` | `15s` | dispatcher | How often queue depth (PostgreSQL) and consumer lag (Kafka) are sampled for `/metrics` |
+| `QUEUE_METRICS_INTERVAL` | `15s` | dispatcher | How often queue depth (PostgreSQL) and consumer lag (Kafka) are sampled for `/metrics`. Compose sets `5s`, the Prometheus scrape interval, so the playground's backlogs stay fresh |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | _(empty: tracing off)_ | all | Base URL of an OTLP/HTTP collector; spans go to `<url>/v1/traces`. Compose sets `http://jaeger:4318` unless `.env` sets it to empty |
 | `TRACE_SAMPLE_RATIO` | `1` | all | Share of new traces recorded (0–1); spans with a parent follow the parent's decision |
 | `MOCK_ADDR` | `:8081` | mockprovider | Listen address |

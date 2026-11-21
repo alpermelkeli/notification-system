@@ -19,6 +19,7 @@ import (
 	"github.com/alpermelkeli/notification-system/internal/health"
 	"github.com/alpermelkeli/notification-system/internal/metrics"
 	"github.com/alpermelkeli/notification-system/internal/platform"
+	"github.com/alpermelkeli/notification-system/internal/playground"
 	"github.com/alpermelkeli/notification-system/internal/provider"
 	"github.com/alpermelkeli/notification-system/internal/queue"
 	"github.com/alpermelkeli/notification-system/internal/ratelimit"
@@ -93,6 +94,12 @@ func RunAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		Events:    events.NewPublisher(eventClient, metrics.NewEvents(reg), logger),
 		WebSocket: ws.NewHandler(hub, store, logger, ws.HandlerOptions{AllowedOrigins: cfg.WSAllowedOrigins}),
 	}).Routes(router)
+	if cfg.Demo.Enabled {
+		playground.New(logger, playground.Options{
+			PrometheusURL: cfg.Demo.PrometheusURL, ProviderAdminURL: cfg.Demo.ProviderAdminURL,
+		}).Routes(router)
+		logger.Info("playground enabled", "path", playground.PathPage)
+	}
 
 	var wg sync.WaitGroup
 	defer wg.Wait() // the consumer loop uses the client, which an earlier defer closes

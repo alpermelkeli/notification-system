@@ -60,7 +60,7 @@ internal/app/          role wiring (RunAPI, RunDispatcher, RunWorker, RunMigrate
 internal/domain/       channels, priorities, status state machine, templates, UUIDv7 ids, domain errors (no I/O)
 internal/storage/      PostgreSQL repository: create/batch/idempotency, guarded transitions, list, partitions
 migrations/            goose SQL migrations, embedded (forward-only, never edited after merge)
-internal/api/          v1 HTTP handlers, templates, request validation, error mapping, Swagger UI (/docs), /ws-demo
+internal/api/          v1 HTTP handlers, templates, request validation, error mapping, Swagger UI (/docs)
 api/                   openapi.yaml (spec-first contract, Redocly-linted) embedded as package apispec
 internal/config/       env -> typed Config (all errors reported at once)
 internal/logging/      slog JSON logger; correlation ID carried in context.Context, trace/span ids added from it
@@ -68,6 +68,7 @@ internal/metrics/      Prometheus metric sets per role (HTTP/API, dispatch + que
 internal/telemetry/    OpenTelemetry setup, HTTP server spans, traceparent in rows and Kafka headers
 internal/events/       best-effort status event publisher (notification.events)
 internal/ws/           WebSocket hub: reads all status events, serves /v1/ws subscriptions with snapshots
+internal/playground/   /playground demo page (embedded HTML/JS/SVG), Prometheus summary, mock provider fault proxy
 internal/httpx/        error envelope, JSON helpers, middleware (correlation id, instance id, logging, recovery)
 internal/health/       /healthz (liveness) and /readyz (concurrent dependency checks)
 internal/platform/     lazy PostgreSQL / Kafka / Redis clients + readiness checks

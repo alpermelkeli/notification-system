@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -103,10 +102,4 @@ func TestWebSocketRouteAndDemoPage(t *testing.T) {
 		t.Error("the WebSocket handler was not mounted")
 	}
 
-	res := s.do(t, http.MethodGet, "/ws-demo", "").wantStatus(http.StatusOK)
-	csp := res.Header().Get("Content-Security-Policy")
-	if !strings.Contains(csp, "script-src 'sha256-") || !strings.Contains(csp, "connect-src 'self'") ||
-		!strings.Contains(res.Body.String(), "/v1/ws") {
-		t.Errorf("demo page: CSP %q", csp)
-	}
 }

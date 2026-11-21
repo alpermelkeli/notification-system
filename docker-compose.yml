@@ -3,7 +3,7 @@
 #   docker compose up --build
 #   docker compose up --build --scale api=3 --scale worker=3   # scaling demo (ADR-0008)
 #
-# Host ports: 8080 API (via lb); bound to 127.0.0.1 only: 8081 mock provider, 5432 PostgreSQL,
+# Host ports: 8080 API and playground (via lb); bound to 127.0.0.1 only: 8081 mock provider, 5432 PostgreSQL,
 # 9092 Kafka, 6379 Redis, 16686 Jaeger UI, 4318 Jaeger OTLP, 9091 Prometheus UI. Stop local PostgreSQL/Redis installs
 # first if they use these ports.
 
@@ -32,6 +32,13 @@ x-app: &app
     # Spans go to Jaeger (B-5). If Jaeger is down, spans are dropped; delivery is unaffected.
     OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT-http://jaeger:4318}
     TRACE_SAMPLE_RATIO: ${TRACE_SAMPLE_RATIO:-1}
+    # The playground (http://localhost:8080/playground) is a local demo: it reads the counters
+    # from Prometheus and can make the mock provider fail. Never enable it in production.
+    DEMO_ENABLED: ${DEMO_ENABLED:-true}
+    DEMO_PROMETHEUS_URL: http://prometheus:9090
+    DEMO_PROVIDER_ADMIN_URL: http://mockprovider:8081
+    # Sample queue depth as often as Prometheus scrapes, so the playground's backlogs stay fresh.
+    QUEUE_METRICS_INTERVAL: ${QUEUE_METRICS_INTERVAL:-5s}
 
 services:
   # ---------------------------------------------------------------- infrastructure
