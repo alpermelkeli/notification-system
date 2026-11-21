@@ -4,7 +4,7 @@ An event-driven, multi-channel notification service written in Go. It accepts no
 requests over HTTP, processes them asynchronously through prioritized queue workers, and delivers
 them via SMS, Email and Push providers with rate limiting, retries and real-time status tracking.
 
-> **Status:** 🚧 Bootstrapping — architecture decisions in progress. See [`docs/plan.md`](docs/plan.md).
+> **Status:** 🚧 Architecture decided (see [ADRs](docs/adr/)); implementation starting. See [`docs/plan.md`](docs/plan.md).
 
 ## Features (target)
 - **Notification API:** single and batch create (up to 1000), status by ID / batch ID, cancel, filtered + paginated listing
@@ -21,8 +21,41 @@ docker compose up --build
 ```
 
 ## Architecture
-_To be documented after the architecture decisions are accepted._
-See [`docs/adr/`](docs/adr/) for Architecture Decision Records.
+
+![Architecture](docs/architecture/architecture.png)
+
+> Editable source: [`docs/architecture/architecture.excalidraw`](docs/architecture/architecture.excalidraw) (open with [excalidraw.com](https://excalidraw.com)).
+
+**PostgreSQL decides *when*, Kafka moves *what*, workers deliver at ≤ 100 msg/s per channel.**
+
+1. **API** validates the request, enforces `Idempotency-Key`, inserts the notification
+   (`status=pending`) and returns `202 Accepted`. It never talks to Kafka directly.
+2. **Dispatcher** claims due rows (`FOR UPDATE SKIP LOCKED`, FIFO by `next_attempt_at`), publishes
+   them to Kafka and marks them `queued`. The same mechanism handles new, scheduled and retrying
+   notifications.
+3. **Kafka** carries claim-check messages on 9 work topics (`notifications.{channel}.{priority}`),
+   plus `notifications.dlq` and `notification.events`.
+4. **Channel workers** (one consumer group per channel) buffer records per priority and pick the
+   next one with a **capped-aging scheduler**. `high` is never overtaken, while `normal`/`low` age
+   and get a guaranteed minimum share. Each send takes a token from the shared **Redis** rate
+   limiter, passes a per-channel circuit breaker, and the outcome is written back with a guarded
+   status transition.
+5. **Status events** stream to `notification.events` for WebSocket clients.
+
+### Design decisions
+| ADR | Decision |
+|-----|----------|
+| [0001](docs/adr/0001-architecture-overview.md) | PostgreSQL as source of truth + Kafka as delivery backbone |
+| [0002](docs/adr/0002-kafka-topology-and-consumer-model.md) | Channel × priority topics, classic consumer groups, `franz-go` |
+| [0003](docs/adr/0003-dispatch-without-separate-outbox.md) | The notifications table is the outbox; FIFO dispatcher + reaper |
+| [0004](docs/adr/0004-idempotency.md) | Idempotency-Key at the API, guarded claim at the worker, provider idempotency header |
+| [0005](docs/adr/0005-delivery-retry-and-failure-handling.md) | Status lifecycle, failure classification, backoff + jitter, DLQ, circuit breaker |
+| [0006](docs/adr/0006-rate-limiting-and-priority-scheduling.md) | Redis GCRA per channel/provider, 429 fleet cool-down, capped-aging priority scheduler |
+| [0007](docs/adr/0007-technology-stack.md) | Go 1.25, chi, pgx, goose, franz-go, go-redis, OpenTelemetry, testcontainers |
+
+**Delivery guarantee:** at-least-once with deduplication at every hop. The only remaining
+duplicate window is a worker crash after the provider accepted a request but before the outcome
+was persisted (see ADR-0004).
 
 ## API
 _OpenAPI spec and examples coming in Phase 4._
@@ -40,4 +73,5 @@ _`make test` — coming in Phase 2._
 | [`docs/plan.md`](docs/plan.md) | Delivery plan & open questions |
 | [`docs/conventions.md`](docs/conventions.md) | Engineering conventions |
 | [`docs/adr/`](docs/adr/) | Architecture Decision Records |
+| [`docs/architecture/`](docs/architecture/) | Architecture diagram (Excalidraw source + PNG) |
 | [`.claude/agents/`](.claude/agents/) | Claude Code subagents used for parallel development |
