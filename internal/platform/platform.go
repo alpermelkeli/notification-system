@@ -46,9 +46,9 @@ func NewKafkaClient(brokers []string, opts ...kgo.Opt) (*kgo.Client, error) {
 	return cl, nil
 }
 
-// KafkaCheck pings a broker.
-func KafkaCheck(cl *kgo.Client) health.Check {
-	return health.Check{Name: "kafka", Probe: cl.Ping}
+// KafkaCheck pings a broker through cl. A process with several clients names each check.
+func KafkaCheck(name string, cl *kgo.Client) health.Check {
+	return health.Check{Name: name, Probe: cl.Ping}
 }
 
 // NewRedisClient creates a go-redis client.

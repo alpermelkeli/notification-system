@@ -110,7 +110,7 @@ func RunDispatcher(ctx context.Context, cfg config.Config, logger *slog.Logger) 
 	wg.Go(func() { reaper.Run(ctx) })
 	wg.Go(func() { runMaintenance(ctx, store, cfg, logger) })
 
-	checks := []health.Check{platform.PostgresCheck(pool), platform.KafkaCheck(kafka)}
+	checks := []health.Check{platform.PostgresCheck(pool), platform.KafkaCheck("kafka", kafka)}
 	return serveAdmin(ctx, cfg, logger, checks)
 }
 
@@ -177,9 +177,8 @@ func RunWorker(ctx context.Context, cfg config.Config, logger *slog.Logger) erro
 		if err != nil {
 			return err
 		}
-		if len(checks) == 2 {
-			checks = append(checks, platform.KafkaCheck(cl))
-		}
+		// Every channel's consumer has its own client, so readiness checks each of them.
+		checks = append(checks, platform.KafkaCheck("kafka-"+string(c), cl))
 		wg.Go(func() {
 			w.Run(ctx, cl)
 			cl.CloseAllowingRebalance() // leaves the group after in-flight sends are persisted and committed
