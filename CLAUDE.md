@@ -57,20 +57,22 @@ make down / clean  # stop / stop and delete volumes
 cmd/notifier/          single binary; subcommands api | dispatcher | worker | migrate | healthcheck | version
 cmd/mockprovider/      local fake of webhook.site (fault injection, /stats)
 internal/app/          role wiring (RunAPI, RunDispatcher, RunWorker, RunMigrate), shared router, graceful HTTP server
-internal/domain/       channels, priorities, status state machine, UUIDv7 ids, domain errors (no I/O)
+internal/domain/       channels, priorities, status state machine, templates, UUIDv7 ids, domain errors (no I/O)
 internal/storage/      PostgreSQL repository: create/batch/idempotency, guarded transitions, list, partitions
 migrations/            goose SQL migrations, embedded (forward-only, never edited after merge)
-internal/api/          v1 HTTP handlers, request validation, error mapping, Swagger UI (/docs)
+internal/api/          v1 HTTP handlers, templates, request validation, error mapping, Swagger UI (/docs), /ws-demo
 api/                   openapi.yaml (spec-first contract, Redocly-linted) embedded as package apispec
 internal/config/       env -> typed Config (all errors reported at once)
 internal/logging/      slog JSON logger; correlation ID carried in context.Context, trace/span ids added from it
 internal/metrics/      Prometheus metric sets per role (HTTP/API, dispatch + queue depth, delivery)
 internal/telemetry/    OpenTelemetry setup, HTTP server spans, traceparent in rows and Kafka headers
+internal/events/       best-effort status event publisher (notification.events)
+internal/ws/           WebSocket hub: reads all status events, serves /v1/ws subscriptions with snapshots
 internal/httpx/        error envelope, JSON helpers, middleware (correlation id, instance id, logging, recovery)
 internal/health/       /healthz (liveness) and /readyz (concurrent dependency checks)
 internal/platform/     lazy PostgreSQL / Kafka / Redis clients + readiness checks
 internal/mockprovider/ mock provider handler
-internal/queue/        Kafka contract: topic/group names, claim-check work message, dead letters
+internal/queue/        Kafka contract: topic/group names, claim-check work message, dead letters, status events
 internal/dispatcher/   relay (PG -> Kafka, NOTIFY + poll), publisher, reaper (leases, offset rule, age fallback)
 internal/worker/       per-channel consumer: priority heaps, capped-aging scheduler, watermarks, circuit breaker, claim/send/outcome
 internal/retry/        backoff with equal jitter and the attempt budget (ADR-0005)

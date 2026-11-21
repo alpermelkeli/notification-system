@@ -25,6 +25,7 @@ import (
 	"github.com/alpermelkeli/notification-system/internal/retry"
 	"github.com/alpermelkeli/notification-system/internal/storage"
 	"github.com/alpermelkeli/notification-system/internal/worker"
+	"github.com/alpermelkeli/notification-system/internal/ws"
 	"github.com/alpermelkeli/notification-system/migrations"
 )
 
@@ -76,13 +77,39 @@ func RunAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	}
 	defer closeProducer(ctx, producer, logger)
 
+	// The WebSocket hub reads every status event, without a consumer group (ADR-0011).
+	consumer, err := platform.NewKafkaClient(cfg.KafkaBrokers,
+		append(ws.ConsumerOptions(), kgo.ClientID("api-events-"+cfg.InstanceID))...)
+	if err != nil {
+		return err
+	}
+	defer consumer.Close()
+
 	reg := metrics.NewRegistry()
 	router, httpMetrics := baseRouter(logger, cfg.InstanceID, []health.Check{platform.PostgresCheck(pool)}, reg)
 	store := storage.New(pool, storage.Options{IdempotencyTTL: cfg.IdempotencyTTL})
+	hub := ws.NewHub(metrics.NewWebSocket(reg), logger)
 	api.New(store, logger, api.Options{
 		MaxScheduleAhead: cfg.MaxScheduleAhead, RequestTimeout: cfg.RequestTimeout, Metrics: httpMetrics,
-		Events: events.NewPublisher(producer, metrics.NewEvents(reg), logger),
+		Events:    events.NewPublisher(producer, metrics.NewEvents(reg), logger),
+		WebSocket: ws.NewHandler(hub, store, logger),
 	}).Routes(router)
+
+	var wg sync.WaitGroup
+	defer wg.Wait() // the consumer loop uses the client, which an earlier defer closes
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	wg.Go(func() { hub.Consume(ctx, consumer) })
+	// http.Server.Shutdown does not track upgraded connections: close them as soon as the
+	// shutdown starts, and wait for their handlers before the pool closes.
+	wg.Go(func() { <-ctx.Done(); hub.Shutdown() })
+	defer func() {
+		wctx, wcancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.ShutdownTimeout)
+		defer wcancel()
+		if err := hub.Wait(wctx); err != nil {
+			logger.Warn("websocket connections still open at shutdown", "err", err)
+		}
+	}()
 
 	return serveHTTP(ctx, logger, cfg.HTTPAddr, router, cfg.ShutdownTimeout)
 }

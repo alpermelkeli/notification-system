@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -75,5 +76,37 @@ func TestAPIPublishesItsTransitions(t *testing.T) {
 	s.do(t, http.MethodPost, "/v1/notifications/"+failed.String()+"/retry", "").wantStatus(http.StatusAccepted)
 	if got := evts.statuses(); len(got) != 5 || got[4] != domain.StatusPending {
 		t.Errorf("replay published %v", got)
+	}
+}
+
+func TestWebSocketRouteAndDemoPage(t *testing.T) {
+	s := newServer(t) // no WebSocket handler configured
+	if e := s.do(t, http.MethodGet, "/v1/ws", "").wantStatus(http.StatusNotFound).errorBody(); e.Code != "not_found" {
+		t.Errorf("code %q", e.Code)
+	}
+
+	called := false
+	r := chi.NewRouter()
+	New(newFakeStore(), slog.New(slog.NewTextHandler(io.Discard, nil)), Options{
+		RequestTimeout: time.Millisecond,
+		WebSocket: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			called = true
+			// Upgraded connections live for hours: the request deadline must not apply.
+			if _, ok := r.Context().Deadline(); ok {
+				t.Error("the WebSocket route has a request deadline")
+			}
+			w.WriteHeader(http.StatusSwitchingProtocols)
+		}),
+	}).Routes(r)
+	(&testServer{h: r}).do(t, http.MethodGet, "/v1/ws", "").wantStatus(http.StatusSwitchingProtocols)
+	if !called {
+		t.Error("the WebSocket handler was not mounted")
+	}
+
+	res := s.do(t, http.MethodGet, "/ws-demo", "").wantStatus(http.StatusOK)
+	csp := res.Header().Get("Content-Security-Policy")
+	if !strings.Contains(csp, "script-src 'sha256-") || !strings.Contains(csp, "connect-src 'self'") ||
+		!strings.Contains(res.Body.String(), "/v1/ws") {
+		t.Errorf("demo page: CSP %q", csp)
 	}
 }

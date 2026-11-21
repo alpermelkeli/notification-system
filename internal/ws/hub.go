@@ -232,9 +232,19 @@ func (h *Hub) Consume(ctx context.Context, cl *kgo.Client) {
 		if ctx.Err() != nil {
 			return
 		}
-		if errs := fetches.Errors(); len(errs) > 0 && time.Since(lastWarn) > 30*time.Second {
-			lastWarn = time.Now()
-			h.logger.Warn("reading status events failed; live updates are delayed", "err", errs[0].Err, "topic", errs[0].Topic)
+		if errs := fetches.Errors(); len(errs) > 0 {
+			if time.Since(lastWarn) > 30*time.Second {
+				lastWarn = time.Now()
+				h.logger.Warn("reading status events failed; live updates are delayed", "err", errs[0].Err, "topic", errs[0].Topic)
+			}
+			if fetches.NumRecords() == 0 {
+				// Do not spin while the brokers are unreachable.
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Second):
+				}
+			}
 		}
 		fetches.EachRecord(func(r *kgo.Record) {
 			h.metrics.Received()

@@ -16,6 +16,7 @@ import (
 
 	apispec "github.com/alpermelkeli/notification-system/api"
 	"github.com/alpermelkeli/notification-system/internal/domain"
+	"github.com/alpermelkeli/notification-system/internal/httpx"
 	"github.com/alpermelkeli/notification-system/internal/logging"
 	"github.com/alpermelkeli/notification-system/internal/metrics"
 	"github.com/alpermelkeli/notification-system/internal/storage"
@@ -63,6 +64,9 @@ type Options struct {
 	// Events receives every notification the API creates, cancels or replays (ADR-0011).
 	// Optional.
 	Events EventPublisher
+	// WebSocket serves GET /v1/ws, the live status stream (B-4). Without it the route answers
+	// 404.
+	WebSocket http.Handler
 	// Now returns the current time. Default time.Now.
 	Now func() time.Time
 }
@@ -108,20 +112,12 @@ func New(store Store, logger *slog.Logger, opts Options) *Handler {
 // Routes mounts the API and its documentation on r.
 func (h *Handler) Routes(r chi.Router) {
 	r.Route("/v1", func(r chi.Router) {
-		r.Use(h.deadline)
-		r.Post("/notifications", h.createNotification)
-		r.Get("/notifications", h.listNotifications)
-		r.Post("/notifications/batch", h.createBatch)
-		r.Get("/notifications/{id}", h.getNotification)
-		r.Get("/notifications/{id}/history", h.getHistory)
-		r.Post("/notifications/{id}/cancel", h.cancelNotification)
-		r.Post("/notifications/{id}/retry", h.retryNotification)
-		r.Get("/batches/{id}", h.getBatch)
-		r.Post("/templates", h.createTemplate)
-		r.Get("/templates", h.listTemplates)
-		r.Get("/templates/{id}", h.getTemplate)
-		r.Put("/templates/{id}", h.updateTemplate)
-		r.Delete("/templates/{id}", h.deleteTemplate)
+		// A WebSocket connection lasts for hours, so it gets no request deadline.
+		r.Method(http.MethodGet, "/ws", h.websocket())
+		r.Group(func(r chi.Router) {
+			r.Use(h.deadline)
+			h.v1Routes(r)
+		})
 	})
 	r.Get("/openapi.yaml", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/yaml")
@@ -131,6 +127,37 @@ func (h *Handler) Routes(r chi.Router) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Content-Security-Policy", docsCSP)
 		_, _ = w.Write([]byte(swaggerUI))
+	})
+	r.Get("/ws-demo", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Content-Security-Policy", demoCSP)
+		_, _ = w.Write([]byte(demoPage))
+	})
+}
+
+// v1Routes mounts the request/response endpoints of /v1.
+func (h *Handler) v1Routes(r chi.Router) {
+	r.Post("/notifications", h.createNotification)
+	r.Get("/notifications", h.listNotifications)
+	r.Post("/notifications/batch", h.createBatch)
+	r.Get("/notifications/{id}", h.getNotification)
+	r.Get("/notifications/{id}/history", h.getHistory)
+	r.Post("/notifications/{id}/cancel", h.cancelNotification)
+	r.Post("/notifications/{id}/retry", h.retryNotification)
+	r.Get("/batches/{id}", h.getBatch)
+	r.Post("/templates", h.createTemplate)
+	r.Get("/templates", h.listTemplates)
+	r.Get("/templates/{id}", h.getTemplate)
+	r.Put("/templates/{id}", h.updateTemplate)
+	r.Delete("/templates/{id}", h.deleteTemplate)
+}
+
+func (h *Handler) websocket() http.Handler {
+	if h.opts.WebSocket != nil {
+		return h.opts.WebSocket
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		httpx.WriteError(w, http.StatusNotFound, "not_found", "resource not found")
 	})
 }
 

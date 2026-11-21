@@ -55,9 +55,9 @@ Left open by the brief ("thinking and design by candidate"). Our design must be 
 | ID | Feature | Status |
 |----|---------|--------|
 | B-1 | Failure handling (circuit breaker, DLQ, replay) | [x] |
-| B-2 | Scheduled notifications (future delivery) | [ ] |
-| B-3 | Template system with variable substitution | [ ] |
-| B-4 | WebSocket real-time status updates | [ ] |
+| B-2 | Scheduled notifications (future delivery) | [x] |
+| B-3 | Template system with variable substitution | [x] |
+| B-4 | WebSocket real-time status updates | [x] |
 | B-5 | Distributed tracing | [x] |
 | B-6 | GitHub Actions CI/CD (test + lint) | [x] |
 

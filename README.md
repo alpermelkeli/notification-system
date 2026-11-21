@@ -4,14 +4,14 @@ An event-driven, multi-channel notification service written in Go. It accepts no
 requests over HTTP, processes them asynchronously through prioritized queue workers, and delivers
 them via SMS, Email and Push providers with rate limiting, retries and real-time status tracking.
 
-> **Status:** 🚧 Phase 7 done: notifications flow end to end (API → PostgreSQL → dispatcher → Kafka → priority-scheduled workers → Redis rate limiter → provider). Failures are classified and retried with exponential backoff and jitter, terminal failures are dead-lettered, and a per-channel circuit breaker holds the backlog during provider outages. Every role exports Prometheus metrics (queue depth, outcome rates, latency), and one OpenTelemetry trace follows each notification from the API request to the provider call, retries included. Bonus features follow in Phase 8. See [`docs/plan.md`](docs/plan.md).
+> **Status:** 🚧 Phase 8 done: notifications flow end to end (API → PostgreSQL → dispatcher → Kafka → priority-scheduled workers → Redis rate limiter → provider). Failures are classified and retried with exponential backoff and jitter, terminal failures are dead-lettered, and a per-channel circuit breaker holds the backlog during provider outages. Every role exports Prometheus metrics, and one OpenTelemetry trace follows each notification from the API request to the provider call. Notifications can be scheduled and rendered from templates, and every status change streams to WebSocket clients (try http://localhost:8080/ws-demo). Hardening follows in Phase 9. See [`docs/plan.md`](docs/plan.md).
 
 ## Features (target)
 - **Notification API:** single and batch create (up to 1000), status by ID / batch ID, cancel, filtered + paginated listing
 - **Processing engine:** async workers, high / normal / low priority queues, 100 msg/s per channel rate limit, content validation, idempotency
 - **Delivery & retry:** exponential backoff with jitter, failure classification, dead-letter handling
 - **Observability:** Prometheus metrics (queue depth, success/failure rates, latency), structured logs with correlation and trace IDs, health checks, OpenTelemetry traces in Jaeger
-- **Bonus:** scheduled notifications, templates, WebSocket status updates, distributed tracing, CI/CD
+- **Bonus:** scheduled notifications, `{{variable}}` templates, WebSocket status updates, distributed tracing, CI/CD
 
 ## Quick start
 Requirements: Docker with Compose v2. Go 1.26+ only for local development.
@@ -111,6 +111,34 @@ curl localhost:8081/stats        # accepted/rejected per channel + rate in the l
   or more than 50% of at least 20 sends in a minute. While open the worker picks nothing: records
   stay in its buffers and in Kafka, fetching pauses, and no attempts are burned. After 30 s one
   probe is let through; its success closes the breaker. `4xx` and `429` answers do not count.
+
+### Live status updates (Phase 8)
+See [ADR-0011](docs/adr/0011-status-events-and-websocket.md) for the design.
+
+- **Events:** the API, the dispatcher (relay and reaper) and the workers publish every row they
+  change to `notification.events` right after the commit. Publishing never waits; a lost event
+  only delays an update, and `notifier_status_events_total{result}` counts the failures.
+- **Hub:** each API instance reads every partition from the end without a consumer group, so any
+  instance can serve any client and the load balancer needs no sticky sessions.
+- **Protocol:** a client opens `GET /v1/ws` and subscribes to notification ids and batch ids. It
+  first gets the current state (a snapshot), then every change. Updates may arrive out of order,
+  so clients keep the latest `at` per notification.
+- **Demo page:** http://localhost:8080/ws-demo sends a notification and follows it live.
+
+```bash
+websocat ws://localhost:8080/v1/ws
+{"type":"subscribe","batchIds":["<batchId>"]}
+# {"type":"subscribed","notificationIds":[],"batchIds":["<batchId>"]}
+# {"type":"batch","batch":{"id":"<batchId>","total":2,"statusCounts":{"pending":2},...}}
+# {"type":"status","event":{"notificationId":"…","batchId":"<batchId>","status":"queued","attempts":0,"at":"…",...}}
+# {"type":"status","event":{"notificationId":"…","status":"processing","attempts":1,...}}
+# {"type":"status","event":{"notificationId":"…","status":"sent","attempts":1,...}}
+```
+
+Limits: 1000 subscriptions per connection (100 ids per message), and a client that falls 256
+messages behind is closed with `1008`. On shutdown, connections are closed with `1001`; the
+client reconnects, subscribes again and gets fresh snapshots. Metrics: `notifier_ws_connections`,
+`notifier_ws_messages_total{type}`, `notifier_ws_disconnects_total{reason}`.
 
 ### Observability (Phase 7)
 See [ADR-0009](docs/adr/0009-observability.md) for the design.
@@ -251,6 +279,7 @@ linted in CI). With the stack running, browse it at **http://localhost:8080/docs
 | `GET /v1/templates/{id}` | Template with its variables and version | `200` |
 | `PUT /v1/templates/{id}` | Replace name and body (`version` + 1; channel fixed) | `200` |
 | `DELETE /v1/templates/{id}` | Delete; notifications created from it are unaffected | `204` |
+| `GET /v1/ws` | WebSocket: live status of notifications and batches | `101` |
 
 ```bash
 # Create a high-priority OTP; repeating it with the same key returns the same notification
@@ -410,13 +439,18 @@ and are skipped by `make test-short`:
   lost record is recovered by the reaper. A 400 fails at once, a provider stuck on 503 exhausts
   the attempts with growing backoff, both reach `notifications.dlq`, and during a provider outage
   the breaker stops the calls without burning attempts. A consumer of `notification.events`
-  sees every transition of a delivered and of a retried notification, in order of `at`. One notification retried once is followed
+  sees every transition of a delivered and of a retried notification, in order of `at`.
+  A WebSocket client subscribed to a batch through a hub reading the real topic gets the
+  snapshot, then a `sent` event for every item. One notification retried once is followed
   through a single trace: two dispatches under the stored request span, each delivery under its
   dispatch, and the `traceparent` reaching the provider on both calls.
   A scheduled notification reaches the provider at its `scheduledAt` (not before, and within the
   poll interval after it), one cancelled before its time is never sent, and one scheduled in the
   past goes out at once.
 
+The WebSocket hub (`internal/ws`) is tested over real connections: snapshots, routing by
+notification and batch id, protocol errors, limits, slow consumers, shutdown, the origin check
+and binary frames.
 The worker engine (scheduler, watermarks, backpressure, rebalance, shutdown, outcome policy,
 circuit breaker, claim retry during a database outage) is unit-tested with fakes, without Kafka,
 including the metrics it records and the span tree of a delivery.
