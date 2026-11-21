@@ -33,7 +33,10 @@ x-app: &app
     OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT-http://jaeger:4318}
     TRACE_SAMPLE_RATIO: ${TRACE_SAMPLE_RATIO:-1}
     # The playground (http://localhost:8080/playground) is a local demo: it reads the counters
-    # from Prometheus and can make the mock provider fail. Never enable it in production.
+    # from Prometheus and can make the mock provider fail. Port 8080 is published on every
+    # interface, so on a shared network anyone who can reach it can do the same (the API has no
+    # authentication either). Set DEMO_ENABLED=false in .env to turn it off. Never enable it in
+    # production.
     DEMO_ENABLED: ${DEMO_ENABLED:-true}
     DEMO_PROMETHEUS_URL: http://prometheus:9090
     DEMO_PROVIDER_ADMIN_URL: http://mockprovider:8081

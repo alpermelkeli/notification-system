@@ -54,9 +54,9 @@ stop the process with a message listing every problem. Copy [`.env.example`](../
 | `MAX_SCHEDULE_AHEAD` | `168h` | api | Latest allowed `scheduledAt`. Must be at least one day shorter than `RETENTION_DAYS` |
 | `REQUEST_TIMEOUT` | `10s` | api | Deadline for each API request; exceeded requests return `503 timeout` |
 | `WS_ALLOWED_ORIGINS` | *(empty)* | api | Extra browser origins allowed to open `/v1/ws`, comma-separated host patterns (`app.example.com`, `*.example.com`) or with a scheme (`https://app.example.com`), matched against the origin's host and non-default port (`*.example.com` excludes `example.com` itself); the API's own origin is always allowed. Set it behind a proxy that rewrites `Host` |
-| `DEMO_ENABLED` | `false` | api | Serve the playground at `/playground`. A local demo: anyone who can open it can create load and change the mock provider's faults. Compose sets `true` |
+| `DEMO_ENABLED` | `false` | api | Serve the playground at `/playground`. A local demo: anyone who can open it (compose publishes port 8080 on every interface) can create load and change the mock provider's faults. Compose sets `true`; `DEMO_ENABLED=false` in `.env` turns it off |
 | `DEMO_PROMETHEUS_URL` | *(empty)* | api | Prometheus server the playground reads its live counters from; empty hides them. Compose: `http://prometheus:9090` |
-| `DEMO_PROVIDER_ADMIN_URL` | *(empty)* | api | Mock provider base URL for the playground's failure scenarios; empty disables them. Compose: `http://mockprovider:8081` |
+| `DEMO_PROVIDER_ADMIN_URL` | *(empty)* | api | Mock provider base URL for the playground's failure scenarios; empty disables them. They are also off when `PROVIDER_URL` is on another host (for example webhook.site), because the faults would not affect delivery. The scenarios always leave the faults at 0. Compose: `http://mockprovider:8081` |
 | `RETENTION_DAYS` | `30` | dispatcher | Daily partitions older than this are dropped |
 | `PARTITION_PREMAKE_DAYS` | `7` | migrate, dispatcher | Partitions kept ready ahead of today |
 | `MAINTENANCE_INTERVAL` | `1h` | dispatcher | How often partition and key maintenance runs |

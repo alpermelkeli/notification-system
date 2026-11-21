@@ -27,6 +27,7 @@ a burst of 1000, priorities, scheduling, templates, retries, a provider outage, 
 
 By default the workers deliver to a local mock of webhook.site. To use the real one, set it to
 answer `202`, put `PROVIDER_URL=https://webhook.site/<your-uuid>` in a `.env` file and restart.
+The playground's failure scenarios then turn off, since they work by making the mock fail.
 
 ## What it does
 

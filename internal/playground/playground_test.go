@@ -125,7 +125,7 @@ func TestStats(t *testing.T) {
 	defer prom.Close()
 	r := newRouter(Options{PrometheusURL: prom.URL + "/"})
 
-	rec := get(t, r, http.MethodGet, pathStats, "")
+	rec := get(t, r, http.MethodGet, PathStats, "")
 	var st Stats
 	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &st) != nil {
 		t.Fatalf("stats: %d %s", rec.Code, rec.Body.String())
@@ -142,7 +142,7 @@ func TestStats(t *testing.T) {
 
 	// A second request within the cache TTL reuses the answers.
 	before := calls.Load()
-	get(t, r, http.MethodGet, pathStats, "")
+	get(t, r, http.MethodGet, PathStats, "")
 	if calls.Load() != before {
 		t.Errorf("stats were queried again within %v", statsCacheTTL)
 	}
@@ -164,7 +164,7 @@ func TestStatsCacheExpires(t *testing.T) {
 }
 
 func TestStatsWithoutPrometheus(t *testing.T) {
-	rec := get(t, newRouter(Options{}), http.MethodGet, pathStats, "")
+	rec := get(t, newRouter(Options{}), http.MethodGet, PathStats, "")
 	var st Stats
 	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &st) != nil || st.Available ||
 		!strings.Contains(st.Error, "DEMO_PROMETHEUS_URL") {
@@ -175,7 +175,7 @@ func TestStatsWithoutPrometheus(t *testing.T) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer down.Close()
-	rec = get(t, newRouter(Options{PrometheusURL: down.URL}), http.MethodGet, pathStats, "")
+	rec = get(t, newRouter(Options{PrometheusURL: down.URL}), http.MethodGet, PathStats, "")
 	st = Stats{}
 	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &st) != nil || st.Available ||
 		!strings.Contains(st.Error, "503") {
@@ -193,6 +193,14 @@ func TestFaultsProxy(t *testing.T) {
 		gotMethod = r.Method
 		b, _ := io.ReadAll(r.Body)
 		gotBody = string(b)
+		if strings.Contains(gotBody, "teapot") {
+			w.WriteHeader(http.StatusTeapot)
+			return
+		}
+		if strings.Contains(gotBody, "big") {
+			_, _ = io.WriteString(w, strings.Repeat("x", maxFaultsBody+1))
+			return
+		}
 		if strings.Contains(gotBody, "2") {
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = io.WriteString(w, `{"error":"failureRate must be between 0 and 1"}`)
@@ -203,28 +211,36 @@ func TestFaultsProxy(t *testing.T) {
 	defer upstream.Close()
 	r := newRouter(Options{ProviderAdminURL: upstream.URL + "/"})
 
-	if rec := get(t, r, http.MethodGet, pathFaults, ""); rec.Code != http.StatusOK || gotMethod != http.MethodGet ||
+	if rec := get(t, r, http.MethodGet, PathFaults, ""); rec.Code != http.StatusOK || gotMethod != http.MethodGet ||
 		!strings.Contains(rec.Body.String(), `"failureRate":1`) {
 		t.Errorf("GET: %d %s", rec.Code, rec.Body.String())
 	}
 	body := `{"failureRate":1,"rateLimitRate":0,"permanentRate":0}`
-	if rec := get(t, r, http.MethodPut, pathFaults, body); rec.Code != http.StatusOK || gotMethod != http.MethodPut || gotBody != body {
+	if rec := get(t, r, http.MethodPut, PathFaults, body); rec.Code != http.StatusOK || gotMethod != http.MethodPut || gotBody != body {
 		t.Errorf("PUT: %d %s (forwarded %s %q)", rec.Code, rec.Body.String(), gotMethod, gotBody)
 	}
-	rec := get(t, r, http.MethodPut, pathFaults, `{"failureRate":2,"rateLimitRate":0,"permanentRate":0}`)
+	rec := get(t, r, http.MethodPut, PathFaults, `{"failureRate":2,"rateLimitRate":0,"permanentRate":0}`)
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid_faults") ||
-		!strings.Contains(rec.Body.String(), "between 0 and 1") {
+		!strings.Contains(rec.Body.String(), "between 0 and 1") || strings.Contains(rec.Body.String(), `{\"error`) {
 		t.Errorf("rejected PUT: %d %s", rec.Code, rec.Body.String())
 	}
-	if rec := get(t, r, http.MethodPut, pathFaults, strings.Repeat("x", maxFaultsBody+1)); rec.Code != http.StatusRequestEntityTooLarge {
+	// Upstream answers other than 200 and 400 are not the client's fault, and never 502 or 503,
+	// which nginx would count against the API replica.
+	for _, body := range []string{"teapot", "big"} {
+		if rec := get(t, r, http.MethodPut, PathFaults, body); rec.Code != http.StatusInternalServerError ||
+			!strings.Contains(rec.Body.String(), "provider_error") {
+			t.Errorf("upstream %s: %d %s", body, rec.Code, rec.Body.String())
+		}
+	}
+	if rec := get(t, r, http.MethodPut, PathFaults, strings.Repeat("x", maxFaultsBody+1)); rec.Code != http.StatusRequestEntityTooLarge {
 		t.Errorf("oversized PUT: %d", rec.Code)
 	}
 
-	if rec := get(t, newRouter(Options{}), http.MethodGet, pathFaults, ""); rec.Code != http.StatusNotFound {
+	if rec := get(t, newRouter(Options{}), http.MethodGet, PathFaults, ""); rec.Code != http.StatusNotFound {
 		t.Errorf("unconfigured: %d, want 404", rec.Code)
 	}
 	upstream.Close()
-	if rec := get(t, r, http.MethodGet, pathFaults, ""); rec.Code != http.StatusBadGateway {
-		t.Errorf("mock provider down: %d, want 502", rec.Code)
+	if rec := get(t, r, http.MethodGet, PathFaults, ""); rec.Code != http.StatusGatewayTimeout {
+		t.Errorf("mock provider down: %d, want 504", rec.Code)
 	}
 }

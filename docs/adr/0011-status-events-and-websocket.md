@@ -135,7 +135,14 @@ response body that follows may echo the recipient; the REST API shows the full e
   `/playground/api/stats` runs a fixed set of PromQL queries against `DEMO_PROMETHEUS_URL` and
   caches the summary for a second; `/playground/api/faults` forwards to the mock provider's new
   `GET`/`PUT /admin/faults` at `DEMO_PROVIDER_ADMIN_URL`. They are not part of the public API
-  contract, so they are not in the OpenAPI spec.
+  contract, so they are not in the OpenAPI spec. Upstream failures are answered with 500 or 504,
+  never 502 or 503, which nginx would count against the API replica. The failure scenarios are
+  turned off when `PROVIDER_URL` is not on the mock provider's host, and the page resets the
+  faults to 0 when a scenario ends or the page is closed during one.
+- The page follows a batch through the ids it draws (at most 80), not the batch id: the
+  dispatcher publishes a batch of 1000 within milliseconds, more than the 256 events a
+  connection may queue. It resubscribes only unfinished ids after a reconnect and paces its
+  subscribe messages under the 10 per second limit.
 - The page is plain JavaScript and hand-written SVG embedded with `go:embed`, under a CSP that
   allows only its own files (`'self'`). No JavaScript library is added. Inter and JetBrains Mono
   are vendored as woff2 files with their SIL Open Font License texts; they are fonts, not code,

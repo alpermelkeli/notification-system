@@ -24,8 +24,8 @@ var static embed.FS
 const (
 	PathPage   = "/playground"
 	pathAssets = "/playground/assets/"
-	pathStats  = "/playground/api/stats"
-	pathFaults = "/playground/api/faults"
+	PathStats  = "/playground/api/stats"
+	PathFaults = "/playground/api/faults"
 )
 
 // csp allows only the page's own files: no inline script or style, no third-party origin.
@@ -72,9 +72,9 @@ func New(logger *slog.Logger, opts Options) *Handler {
 func (h *Handler) Routes(r chi.Router) {
 	r.Get(PathPage, h.page)
 	r.Get(pathAssets+"*", h.asset)
-	r.Get(pathStats, h.handleStats)
-	r.Get(pathFaults, h.handleFaults)
-	r.Put(pathFaults, h.handleFaults)
+	r.Get(PathStats, h.handleStats)
+	r.Get(PathFaults, h.handleFaults)
+	r.Put(PathFaults, h.handleFaults)
 }
 
 func (h *Handler) page(w http.ResponseWriter, _ *http.Request) {

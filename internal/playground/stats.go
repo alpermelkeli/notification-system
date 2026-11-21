@@ -77,7 +77,7 @@ func newStatsSource(client *http.Client, baseURL string, now func() time.Time) *
 func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 	st := h.stats.get(r.Context())
 	if st.Error != "" {
-		h.logger.Debug("playground stats unavailable", "err", st.Error)
+		h.logger.DebugContext(r.Context(), "playground stats unavailable", "err", st.Error)
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	httpx.WriteJSON(w, http.StatusOK, st)

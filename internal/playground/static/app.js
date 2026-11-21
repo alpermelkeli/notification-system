@@ -546,10 +546,12 @@ function connect() {
   ws.onopen = () => {
     wsOpen = true;
     setConn("open", "Connected");
-    sendSubscribe([...subs.notificationIds], [...subs.batchIds]);
+    // Finished notifications will not change again; resubscribe only the others.
+    sendSubscribe([...subs.notificationIds].filter((id) => !TERMINAL.has(notes.get(id)?.status)), []);
   };
   ws.onclose = () => {
     wsOpen = false;
+    outbox.length = 0;
     setConn("closed", "Reconnecting");
     setTimeout(connect, 1500);
   };
@@ -557,6 +559,7 @@ function connect() {
     let m;
     try { m = JSON.parse(msg.data); } catch { return; }
     if (m.type === "status" && m.event) applyEvent(m.event);
+    else if (m.type === "error") console.warn(`live updates: ${m.code}: ${m.message}`);
   };
 }
 
@@ -566,15 +569,24 @@ function setConn(state, text) {
   el.textContent = text;
 }
 
-// The server takes at most 100 ids per message and 10 messages per second.
+// The server takes at most 100 ids per message and handles 10 messages per second, so messages
+// leave through a queue paced at one every 120 ms.
+const outbox = [];
+let outboxTimer = null;
 function sendSubscribe(ids, batchIds, type = "subscribe") {
   if (!wsOpen) return;
   const all = [...ids.map((id) => ["notificationIds", id]), ...batchIds.map((id) => ["batchIds", id])];
   for (let i = 0; i < all.length; i += 100) {
     const msg = { type, notificationIds: [], batchIds: [] };
     for (const [kind, id] of all.slice(i, i + 100)) msg[kind].push(id);
-    ws.send(JSON.stringify(msg));
+    outbox.push(JSON.stringify(msg));
   }
+  flushOutbox();
+}
+function flushOutbox() {
+  if (outboxTimer || !outbox.length) return;
+  if (wsOpen) ws.send(outbox.shift());
+  outboxTimer = setTimeout(() => { outboxTimer = null; flushOutbox(); }, 120);
 }
 
 function follow({ ids = [], batchIds = [] }) {
@@ -1048,9 +1060,9 @@ const SCENARIOS = [
       const lowLeft = 400 - (lowCounts.sent || 0);
       ctx.progress(`High priority done. Waiting for the remaining ${lowLeft} low-priority messages.`);
       await waitFor(() => (lowCounts.sent || 0) >= 400, { timeout: 60000, every: 1000, poll: [pollCounts] });
-      return lowLeft > 0
+      return lowLeft >= 100
         ? pass(`All 20 high-priority messages were delivered while ${lowLeft} of the 400 low-priority ones were still waiting.`)
-        : fail("The low-priority batch finished before the high-priority one.");
+        : fail(`Only ${lowLeft} of the 400 low-priority messages were still waiting when the high-priority ones finished.`);
     },
   },
   {
@@ -1071,10 +1083,11 @@ const SCENARIOS = [
       });
       const detail = await refreshNote(json.id);
       const sentAt = Date.parse(detail.sentAt);
-      const early = due - sentAt;
-      return early <= 200
-        ? pass(`Delivered ${fmtDelta(Math.max(0, -early))} after its scheduled time.`)
-        : fail(`Delivered ${fmtDelta(early)} before its scheduled time.`);
+      const late = sentAt - due;
+      if (late < -200) return fail(`Delivered ${fmtDelta(-late)} before its scheduled time.`);
+      return late <= 3000
+        ? pass(`Delivered ${fmtDelta(Math.max(0, late))} after its scheduled time.`)
+        : fail(`Delivered ${fmtDelta(late)} after its scheduled time; the dispatcher polls every 500 ms.`);
     },
   },
   {
@@ -1214,15 +1227,15 @@ const SCENARIOS = [
       select(json.id);
       await waitFor(() => notes.get(json.id).status === "failed", { poll: [json.id], timeout: 30000 });
       await setFaults(NO_FAULTS);
-      const n = notes.get(json.id);
-      ctx.progress(`Failed after ${n.attempts} attempt: a 400 is permanent, so it went to the dead letters. Replaying it now.`);
+      const failedAfter = notes.get(json.id).attempts; // the replay resets the attempts
+      ctx.progress(`Failed after ${failedAfter} attempt: a 400 is permanent, so it went to the dead letters. Replaying it now.`);
       await sleep(2500);
       const r = await api("POST", `/v1/notifications/${json.id}/retry`);
       applyEvent(toEvent(r.json));
       await waitFor(() => notes.get(json.id).status === "sent", { poll: [json.id], timeout: 30000 });
-      return n.attempts === 1
+      return failedAfter === 1
         ? pass("One attempt, no retries, a dead letter, then delivered after the replay.")
-        : fail(`It took ${n.attempts} attempts before failing; a 400 should not be retried.`);
+        : fail(`It took ${failedAfter} attempts before failing; a 400 should not be retried.`);
     },
   },
 ];
@@ -1297,16 +1310,15 @@ async function runScenario(s) {
     },
   };
   const started = Date.now();
-  let before = null;
   let outcome;
   try {
-    if (s.faults) before = await getFaults();
     outcome = await s.run(ctx);
   } catch (err) {
     outcome = fail(err.message);
   } finally {
     if (s.faults) {
-      try { await setFaults(before && !(before.failureRate || before.rateLimitRate || before.permanentRate) ? before : NO_FAULTS); } catch { /* the banner shows it */ }
+      // The playground always leaves the provider healthy (all rates 0), whatever MOCK_* set.
+      try { await setFaults(NO_FAULTS); } catch { /* the banner shows it */ }
     }
     li.classList.remove("running");
     running = null;
@@ -1321,6 +1333,13 @@ async function runScenario(s) {
   result.append(mark, why);
   bar.hidden = true;
 }
+
+// Closing or reloading the page in the middle of a failure scenario must not leave the
+// provider failing for everyone.
+window.addEventListener("pagehide", () => {
+  if (!running || !running.faults) return;
+  fetch("/playground/api/faults", { method: "PUT", keepalive: true, headers: { "Content-Type": "application/json" }, body: JSON.stringify(NO_FAULTS) });
+});
 
 // ------------------------------------------------------------------ start
 drawMap();

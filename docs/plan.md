@@ -43,8 +43,8 @@ Living document. Update phase status as work lands. Time budget ≈ 12h of focus
 | Readiness of multi-channel workers | `/readyz` checks every channel's Kafka client (`kafka-sms`, `kafka-email`, `kafka-push`) | [0009](adr/0009-observability.md) |
 
 ## Phase 9 progress
-- `/playground` (experiment branch `feat/playground`): live pipeline map, step-by-step narration
-  and ten self-checking scenarios; ADR-0011 amended.
+- `/playground`: live pipeline map, step-by-step narration and ten self-checking scenarios;
+  ADR-0011 amended.
 - README reduced to an overview; details moved to `docs/how-it-works.md`, `docs/api.md`,
   `docs/configuration.md` and `docs/testing.md`.
 
