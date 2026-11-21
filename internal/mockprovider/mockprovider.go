@@ -3,8 +3,8 @@
 // It speaks the provider contract from the assessment brief
 // (POST {to, channel, content} -> 202 {messageId, status, timestamp}) and can inject latency,
 // 5xx failures, permanent 400 rejections and 429 rate limiting, so retries, dead letters, the
-// circuit breaker and the rate limiter can be
-// exercised locally and in load tests without calling the real webhook.site (ADR-0006).
+// circuit breaker and the rate limiter can be exercised locally and in load tests without calling
+// the real webhook.site (ADR-0006).
 package mockprovider
 
 import (

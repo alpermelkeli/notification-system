@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -35,8 +34,8 @@ func IsTransient(err error) bool {
 		connErr *pgconn.ConnectError
 		netErr  net.Error
 	)
+	// context.DeadlineExceeded is a net.Error with Timeout() true; pgconn reports a closed or busy
+	// connection as SafeToRetry.
 	return errors.As(err, &connErr) || errors.As(err, &netErr) || pgconn.Timeout(err) || pgconn.SafeToRetry(err) ||
-		errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
-		// The pool reports a closed connection as plain text.
-		strings.Contains(err.Error(), "conn closed")
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
