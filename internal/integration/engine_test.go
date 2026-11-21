@@ -161,7 +161,7 @@ func startEngine(t *testing.T, store *storage.Store, providerURL string, workers
 	t.Cleanup(producer.Close)
 	relay := dispatcher.NewRelay(store, dispatcher.NewPublisher(producer).Publish, quiet,
 		dispatcher.RelayOptions{PollInterval: 50 * time.Millisecond})
-	reaper := dispatcher.NewReaper(store, dispatcher.NewKafkaOffsets(kadm.NewClient(producer)), quiet,
+	reaper := dispatcher.NewReaper(store, dispatcher.NewKafkaOffsets(kadm.NewClient(producer)), nil, quiet,
 		dispatcher.ReaperOptions{Interval: 200 * time.Millisecond, Grace: 100 * time.Millisecond})
 	wg.Go(func() { relay.Run(ctx) })
 	wg.Go(func() { reaper.Run(ctx) })

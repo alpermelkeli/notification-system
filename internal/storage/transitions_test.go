@@ -337,9 +337,9 @@ func TestReapExpiredLeases(t *testing.T) {
 	claim(t, s, healthy, time.Hour)
 	time.Sleep(20 * time.Millisecond)
 
-	n, err := s.ReapExpiredLeases(ctx, 100)
-	if err != nil || n != 1 {
-		t.Fatalf("reaped %d, err %v; want 1", n, err)
+	res, err := s.ReapExpiredLeases(ctx, 5, 100)
+	if err != nil || res.Retried != 1 || len(res.Failed) != 0 {
+		t.Fatalf("reaped %+v, err %v; want 1 retried", res, err)
 	}
 	got, _ := s.GetNotification(ctx, expired.ID)
 	if got.Status != domain.StatusRetrying || got.Attempts != 1 || got.LeaseUntil != nil {
@@ -354,6 +354,43 @@ func TestReapExpiredLeases(t *testing.T) {
 	}
 }
 
+func TestReapExpiredLeaseOnTheLastAttemptFails(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	n := create(t, s)
+	for range 2 { // attempts 1 and 2 fail and are retried
+		dispatchAll(t, s)
+		if _, err := s.MarkRetrying(ctx, claim(t, s, n, time.Minute), 0, "503"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dispatchAll(t, s)
+	claim(t, s, n, time.Millisecond) // attempt 3 of 3; the worker dies
+	time.Sleep(20 * time.Millisecond)
+
+	res, err := s.ReapExpiredLeases(ctx, 3, 100)
+	if err != nil || res.Retried != 0 || len(res.Failed) != 1 {
+		t.Fatalf("reaped %+v, err %v; want 1 failed", res, err)
+	}
+	failed := res.Failed[0]
+	if failed.ID != n.ID || failed.Status != domain.StatusFailed || failed.Attempts != 3 || failed.LeaseToken != nil ||
+		failed.LastError == nil || *failed.LastError != "lease expired on the last attempt" {
+		t.Errorf("failed row = %+v", failed)
+	}
+	hist, err := s.History(ctx, n.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last := hist[len(hist)-1]; last.From == nil || *last.From != domain.StatusProcessing || last.To != domain.StatusFailed ||
+		last.Attempt != 3 {
+		t.Errorf("last history entry = %+v", last)
+	}
+	// Nothing is dispatched again.
+	if published := dispatchAll(t, s); len(published) != 0 {
+		t.Errorf("a failed row was dispatched again: %d", len(published))
+	}
+}
+
 // TestStaleLeaseCannotOverwriteANewerClaim is the ABA case: worker A stalls past its lease, the
 // row is reaped, re-dispatched and claimed by worker B, so it is processing again. A's late
 // outcome must not apply to B's claim.
@@ -364,8 +401,8 @@ func TestStaleLeaseCannotOverwriteANewerClaim(t *testing.T) {
 	dispatchAll(t, s)
 	leaseA := claim(t, s, n, time.Millisecond)
 	time.Sleep(20 * time.Millisecond)
-	if reaped, err := s.ReapExpiredLeases(ctx, 10); err != nil || reaped != 1 {
-		t.Fatalf("reap: %d, %v", reaped, err)
+	if res, err := s.ReapExpiredLeases(ctx, 5, 10); err != nil || res.Retried != 1 {
+		t.Fatalf("reap: %+v, %v", res, err)
 	}
 	dispatchAll(t, s)
 	leaseB := claim(t, s, n, time.Minute)

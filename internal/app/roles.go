@@ -17,6 +17,7 @@ import (
 	"github.com/alpermelkeli/notification-system/internal/health"
 	"github.com/alpermelkeli/notification-system/internal/platform"
 	"github.com/alpermelkeli/notification-system/internal/provider"
+	"github.com/alpermelkeli/notification-system/internal/queue"
 	"github.com/alpermelkeli/notification-system/internal/ratelimit"
 	"github.com/alpermelkeli/notification-system/internal/storage"
 	"github.com/alpermelkeli/notification-system/internal/worker"
@@ -92,9 +93,10 @@ func RunDispatcher(ctx context.Context, cfg config.Config, logger *slog.Logger) 
 	relay := dispatcher.NewRelay(store, dispatcher.NewPublisher(kafka).Publish, logger, dispatcher.RelayOptions{
 		BatchSize: cfg.Dispatcher.BatchSize, PollInterval: cfg.Dispatcher.PollInterval,
 	})
-	reaper := dispatcher.NewReaper(store, dispatcher.NewKafkaOffsets(kadm.NewClient(kafka)), logger, dispatcher.ReaperOptions{
+	dead := queue.NewDeadLetters(kafka, dispatcher.PublishTimeout)
+	reaper := dispatcher.NewReaper(store, dispatcher.NewKafkaOffsets(kadm.NewClient(kafka)), dead, logger, dispatcher.ReaperOptions{
 		Interval: cfg.Dispatcher.ReaperInterval, Grace: cfg.Dispatcher.ReaperGrace,
-		StuckAfter: cfg.Dispatcher.ReaperStuckAfter,
+		StuckAfter: cfg.Dispatcher.ReaperStuckAfter, MaxAttempts: cfg.Worker.MaxAttempts,
 	})
 
 	var wg sync.WaitGroup

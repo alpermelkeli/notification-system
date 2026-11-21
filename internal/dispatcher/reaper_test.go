@@ -14,7 +14,9 @@ import (
 
 type fakeReaperStore struct {
 	leases, consumed, stuck []int // scripted results, one per call
+	exhausted               [][]domain.Notification
 	leaseErr                error
+	maxAttempts             int
 	committed               []storage.CommittedOffset
 	grace, stuckAfter       time.Duration
 	consumedCalls           int
@@ -29,8 +31,23 @@ func pop(xs *[]int) int {
 	return n
 }
 
-func (f *fakeReaperStore) ReapExpiredLeases(context.Context, int) (int, error) {
-	return pop(&f.leases), f.leaseErr
+func (f *fakeReaperStore) ReapExpiredLeases(_ context.Context, maxAttempts, _ int) (storage.ReapResult, error) {
+	f.maxAttempts = maxAttempts
+	res := storage.ReapResult{Retried: pop(&f.leases)}
+	if len(f.exhausted) > 0 {
+		res.Failed, f.exhausted = f.exhausted[0], f.exhausted[1:]
+	}
+	return res, f.leaseErr
+}
+
+type fakeDeadLetters struct {
+	published []domain.Notification
+	err       error
+}
+
+func (f *fakeDeadLetters) Publish(_ context.Context, ns ...domain.Notification) error {
+	f.published = append(f.published, ns...)
+	return f.err
 }
 
 func (f *fakeReaperStore) RequeueConsumed(_ context.Context, c []storage.CommittedOffset, grace time.Duration, _ int) (int, error) {
@@ -64,7 +81,7 @@ func TestReaperRunOnce(t *testing.T) {
 		},
 		"workers.push": {"notifications.push.normal": {4: 11}},
 	}
-	r := NewReaper(store, offsets, discard, ReaperOptions{Grace: 2 * time.Minute, StuckAfter: 6 * time.Hour})
+	r := NewReaper(store, offsets, nil, discard, ReaperOptions{Grace: 2 * time.Minute, StuckAfter: 6 * time.Hour})
 
 	rep, err := r.RunOnce(context.Background())
 	if err == nil {
@@ -96,7 +113,7 @@ func TestReaperStepsAreIndependentAndDrain(t *testing.T) {
 		leaseErr: errors.New("db hiccup"),
 		stuck:    []int{3, 3, 1}, // limit 3: two full rounds, then a partial one
 	}
-	r := NewReaper(store, fakeOffsets{}, discard, ReaperOptions{Limit: 3, Channels: []domain.Channel{domain.ChannelSMS}})
+	r := NewReaper(store, fakeOffsets{}, nil, discard, ReaperOptions{Limit: 3, Channels: []domain.Channel{domain.ChannelSMS}})
 	rep, err := r.RunOnce(context.Background())
 	if err == nil {
 		t.Error("the lease step error must be reported")
@@ -106,5 +123,28 @@ func TestReaperStepsAreIndependentAndDrain(t *testing.T) {
 	}
 	if store.consumedCalls != 0 {
 		t.Error("RequeueConsumed must not run without committed offsets")
+	}
+}
+
+func TestReaperDeadLettersExhaustedLeases(t *testing.T) {
+	a, b := domain.Notification{ID: domain.NewIDAt(time.Now())}, domain.Notification{ID: domain.NewIDAt(time.Now())}
+	store := &fakeReaperStore{leases: []int{1, 0}, exhausted: [][]domain.Notification{{a}, {b}}}
+	dead := &fakeDeadLetters{err: errors.New("broker down")} // best effort: the run still succeeds
+	r := NewReaper(store, fakeOffsets{}, dead, discard, ReaperOptions{
+		Limit: 2, MaxAttempts: 3, Channels: []domain.Channel{domain.ChannelSMS},
+	})
+	rep, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	// Round 1 changes 2 rows (= Limit), so a second round runs.
+	if rep.ExpiredLeases != 1 || rep.ExhaustedLeases != 2 {
+		t.Errorf("report = %+v", rep)
+	}
+	if store.maxAttempts != 3 {
+		t.Errorf("max attempts passed = %d", store.maxAttempts)
+	}
+	if len(dead.published) != 2 || dead.published[0].ID != a.ID || dead.published[1].ID != b.ID {
+		t.Errorf("dead letters = %+v", dead.published)
 	}
 }

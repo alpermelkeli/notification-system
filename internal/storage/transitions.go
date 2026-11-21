@@ -302,14 +302,27 @@ SELECT id, created_at, prev_status, 'queued', attempts, 'dispatched' FROM upd`,
 	return n, err
 }
 
-// ReapExpiredLeases moves up to limit processing notifications whose lease expired (their worker
-// crashed or stalled) to retrying, due immediately (ADR-0003). The attempt stays counted.
-func (s *Store) ReapExpiredLeases(ctx context.Context, limit int) (int, error) {
-	t := transition{from: []domain.Status{domain.StatusProcessing}, to: domain.StatusRetrying}
-	if err := t.validate(); err != nil {
-		return 0, err
+// ReapResult is what one ReapExpiredLeases call changed.
+type ReapResult struct {
+	// Retried counts rows moved to retrying.
+	Retried int
+	// Failed holds rows moved to failed because their expired claim was their last attempt; the
+	// caller publishes their dead letters.
+	Failed []domain.Notification
+}
+
+// ReapExpiredLeases recovers up to limit processing notifications whose lease expired: their
+// worker crashed or stalled, so the attempt's outcome is unknown and the attempt stays counted
+// (ADR-0003). A row with attempts left goes to retrying, due immediately; a row that has used
+// maxAttempts goes to failed, so an expired lease never buys an attempt beyond the budget
+// (ADR-0005).
+func (s *Store) ReapExpiredLeases(ctx context.Context, maxAttempts, limit int) (ReapResult, error) {
+	for _, to := range []domain.Status{domain.StatusRetrying, domain.StatusFailed} {
+		if err := (transition{from: []domain.Status{domain.StatusProcessing}, to: to}).validate(); err != nil {
+			return ReapResult{}, err
+		}
 	}
-	tag, err := s.pool.Exec(ctx, `
+	rows, err := s.pool.Query(ctx, `
 WITH prev AS (
     SELECT id, created_at, status FROM notifications
      WHERE status = 'processing' AND lease_until < now()
@@ -318,19 +331,36 @@ WITH prev AS (
        FOR UPDATE SKIP LOCKED
 ), upd AS (
     UPDATE notifications n
-       SET status = 'retrying', next_attempt_at = now(), lease_until = NULL, lease_token = NULL,
-           last_error = 'lease expired', updated_at = now()
+       SET status = CASE WHEN n.attempts >= $2 THEN 'failed' ELSE 'retrying' END,
+           next_attempt_at = CASE WHEN n.attempts >= $2 THEN n.next_attempt_at ELSE now() END,
+           last_error = CASE WHEN n.attempts >= $2 THEN 'lease expired on the last attempt'
+                             ELSE 'lease expired' END,
+           lease_until = NULL, lease_token = NULL, updated_at = now()
       FROM prev
      WHERE n.id = prev.id AND n.created_at = prev.created_at
- RETURNING n.id, n.created_at, n.attempts, prev.status AS prev_status
+ RETURNING `+columns("n")+`, prev.status AS prev_status
+), hist AS (
+    INSERT INTO notification_status_history
+           (notification_id, notification_created_at, from_status, to_status, attempt, reason)
+    SELECT id, created_at, prev_status, status, attempts, last_error FROM upd
 )
-INSERT INTO notification_status_history
-       (notification_id, notification_created_at, from_status, to_status, attempt, reason)
-SELECT id, created_at, prev_status, 'retrying', attempts, 'lease expired' FROM upd`, limit)
+SELECT `+columns("")+` FROM upd`, limit, maxAttempts)
 	if err != nil {
-		return 0, fmt.Errorf("reap expired leases: %w", err)
+		return ReapResult{}, fmt.Errorf("reap expired leases: %w", err)
 	}
-	return int(tag.RowsAffected()), nil
+	reaped, err := collectNotifications(rows)
+	if err != nil {
+		return ReapResult{}, fmt.Errorf("reap expired leases: %w", err)
+	}
+	var res ReapResult
+	for _, n := range reaped {
+		if n.Status == domain.StatusFailed {
+			res.Failed = append(res.Failed, n)
+		} else {
+			res.Retried++
+		}
+	}
+	return res, nil
 }
 
 // clearQueued resets the dispatch bookkeeping when a queued row goes back to pending.
