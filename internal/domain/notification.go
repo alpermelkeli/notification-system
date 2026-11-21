@@ -90,7 +90,10 @@ type Notification struct {
 	CorrelationID string
 	// TraceParent is the W3C traceparent of the creating request, or "" (B-5).
 	TraceParent string
-	UpdatedAt   time.Time
+	// TemplateID and TemplateVersion name the template that produced Content, if any (B-3).
+	TemplateID      *uuid.UUID
+	TemplateVersion *int
+	UpdatedAt       time.Time
 }
 
 // Lease identifies one claim of a notification by a worker. Every outcome transition is guarded

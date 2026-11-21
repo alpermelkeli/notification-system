@@ -31,6 +31,8 @@ type NewNotification struct {
 	Content   string
 	// ScheduledAt delays the first delivery attempt (B-2). Nil means as soon as possible.
 	ScheduledAt *time.Time
+	// Template records the template Content was rendered from (B-3). Optional.
+	Template *TemplateRef
 	// IdempotencyKey is optional. In a batch it is the item's own key.
 	IdempotencyKey *IdempotencyKey
 }
@@ -241,20 +243,26 @@ func insertNotifications(ctx context.Context, q querier, ids []uuid.UUID, create
 	channels, priorities := make([]string, n), make([]string, n)
 	recipients, contents := make([]string, n), make([]string, n)
 	scheduled := make([]*time.Time, n)
+	templateIDs, templateVersions := make([]*uuid.UUID, n), make([]*int, n)
 	for i, it := range items {
 		channels[i], priorities[i] = string(it.Channel), string(it.Priority)
 		recipients[i], contents[i], scheduled[i] = it.Recipient, it.Content, it.ScheduledAt
+		if it.Template != nil {
+			id, v := it.Template.ID, it.Template.Version
+			templateIDs[i], templateVersions[i] = &id, &v
+		}
 	}
 
 	rows, err := q.Query(ctx, `
 WITH ins AS (
     INSERT INTO notifications
            (id, created_at, batch_id, channel, priority, recipient, content,
-            next_attempt_at, scheduled_at, correlation_id, trace_parent)
+            next_attempt_at, scheduled_at, correlation_id, trace_parent, template_id, template_version)
     SELECT u.id, $2, $8, u.channel, u.priority, u.recipient, u.content,
-           COALESCE(u.scheduled_at, now()), u.scheduled_at, $9, $10
-      FROM unnest($1::uuid[], $3::text[], $4::text[], $5::text[], $6::text[], $7::timestamptz[])
-           AS u(id, channel, priority, recipient, content, scheduled_at)
+           COALESCE(u.scheduled_at, now()), u.scheduled_at, $9, $10, u.template_id, u.template_version
+      FROM unnest($1::uuid[], $3::text[], $4::text[], $5::text[], $6::text[], $7::timestamptz[],
+                  $11::uuid[], $12::integer[])
+           AS u(id, channel, priority, recipient, content, scheduled_at, template_id, template_version)
  RETURNING `+columns("")+`
 ), hist AS (
     INSERT INTO notification_status_history
@@ -262,7 +270,8 @@ WITH ins AS (
     SELECT id, created_at, NULL, status, attempts, 'created' FROM ins
 )
 SELECT `+columns("")+` FROM ins`,
-		ids, createdAt, channels, priorities, recipients, contents, scheduled, batchID, origin.CorrelationID, origin.TraceParent)
+		ids, createdAt, channels, priorities, recipients, contents, scheduled, batchID, origin.CorrelationID, origin.TraceParent,
+		templateIDs, templateVersions)
 	if err != nil {
 		return nil, fmt.Errorf("insert notifications: %w", err)
 	}

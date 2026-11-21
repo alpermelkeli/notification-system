@@ -44,15 +44,7 @@ type ListPage struct {
 // UUIDv7, so id order is creation order, and every cursor maps to a created_at bound that
 // prunes older partitions.
 func (s *Store) ListNotifications(ctx context.Context, f ListFilter) (ListPage, error) {
-	limit := f.Limit
-	switch {
-	case limit == 0:
-		limit = DefaultListLimit
-	case limit < 1:
-		limit = 1
-	case limit > MaxListLimit:
-		limit = MaxListLimit
-	}
+	limit := clampLimit(f.Limit)
 
 	var (
 		conds []string
@@ -107,6 +99,19 @@ func (s *Store) ListNotifications(ctx context.Context, f ListFilter) (ListPage, 
 		page.Next = &next
 	}
 	return page, nil
+}
+
+// clampLimit applies the page size rules of ListFilter.Limit.
+func clampLimit(limit int) int {
+	switch {
+	case limit == 0:
+		return DefaultListLimit
+	case limit < 1:
+		return 1
+	case limit > MaxListLimit:
+		return MaxListLimit
+	}
+	return limit
 }
 
 func collectNotifications(rows pgx.Rows) ([]domain.Notification, error) {

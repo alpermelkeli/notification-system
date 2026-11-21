@@ -162,9 +162,10 @@ Schema: [`migrations/`](migrations) (goose, forward-only, embedded in the binary
 
 | Table | Purpose |
 |-------|---------|
-| `notifications` | One row per message: content, status, attempts, `next_attempt_at` (drives dispatch, scheduling and retries), lease, provider result, and the creating request's `correlation_id` and `trace_parent` ([ADR-0009](docs/adr/0009-observability.md)). Also the dispatch outbox ([ADR-0003](docs/adr/0003-dispatch-without-separate-outbox.md)) |
+| `notifications` | One row per message: content, status, attempts, `next_attempt_at` (drives dispatch, scheduling and retries), lease, provider result, the creating request's `correlation_id` and `trace_parent` ([ADR-0009](docs/adr/0009-observability.md)), and the `template_id`/`template_version` its content was rendered from. Also the dispatch outbox ([ADR-0003](docs/adr/0003-dispatch-without-separate-outbox.md)) |
 | `notification_status_history` | Append-only audit trail: one row per transition (from, to, attempt, reason) |
 | `batches` | One row per batch request; status counts are aggregated from its notifications |
+| `templates` | Message templates with `{{variable}}` placeholders; `version` goes up on every update ([ADR-0010](docs/adr/0010-templates.md)) |
 | `idempotency_keys` | `Idempotency-Key` → request hash + created resource, with a TTL ([ADR-0004](docs/adr/0004-idempotency.md)) |
 
 - **Daily partitions** of `notifications` and its history, created days ahead and dropped after
