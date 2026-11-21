@@ -4,11 +4,14 @@
 // (POST {to, channel, content} -> 202 {messageId, status, timestamp}) and can inject latency,
 // 5xx failures, permanent 400 rejections and 429 rate limiting, so retries, dead letters, the
 // circuit breaker and the rate limiter can be exercised locally and in load tests without calling
-// the real webhook.site (ADR-0006).
+// the real webhook.site (ADR-0006). The fault rates can be changed at runtime (PUT /admin/faults).
 package mockprovider
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"strconv"
@@ -33,6 +36,33 @@ type Config struct {
 	PermanentFailureRate float64
 	// RetryAfter is the Retry-After value sent with 429 responses.
 	RetryAfter time.Duration
+}
+
+// Faults are the fault injection probabilities. They start from Config and can be changed while
+// the server runs through PUT /admin/faults, so the playground can simulate an outage without a
+// restart.
+type Faults struct {
+	// FailureRate is the probability (0..1) of answering 500.
+	FailureRate float64 `json:"failureRate"`
+	// RateLimitRate is the probability (0..1) of answering 429.
+	RateLimitRate float64 `json:"rateLimitRate"`
+	// PermanentRate is the probability (0..1) of answering 400.
+	PermanentRate float64 `json:"permanentRate"`
+}
+
+// validate checks that each probability is in [0,1] and that they add up to at most 1.
+func (f Faults) validate() error {
+	for name, v := range map[string]float64{
+		"failureRate": f.FailureRate, "rateLimitRate": f.RateLimitRate, "permanentRate": f.PermanentRate,
+	} {
+		if math.IsNaN(v) || v < 0 || v > 1 {
+			return fmt.Errorf("%s must be between 0 and 1", name)
+		}
+	}
+	if f.FailureRate+f.RateLimitRate+f.PermanentRate > 1 {
+		return errors.New("the rates must add up to at most 1")
+	}
+	return nil
 }
 
 // Request is the provider request body.
@@ -74,6 +104,7 @@ type Server struct {
 	now  func() time.Time
 
 	mu        sync.Mutex
+	faults    Faults
 	messageID map[string]string // Idempotency-Key -> messageId
 	accepted  map[string]int64
 	rejected  map[string]int64
@@ -86,6 +117,7 @@ type Server struct {
 func New(cfg Config, reg prometheus.Registerer) *Server {
 	s := &Server{
 		cfg:       cfg,
+		faults:    Faults{FailureRate: cfg.FailureRate, RateLimitRate: cfg.RateLimitRate, PermanentRate: cfg.PermanentFailureRate},
 		rand:      rand.Float64,
 		now:       time.Now,
 		messageID: make(map[string]string),
@@ -102,13 +134,17 @@ func New(cfg Config, reg prometheus.Registerer) *Server {
 }
 
 // Handler returns the HTTP handler: POST to any path delivers, GET /stats and GET /healthz
-// report state.
+// report state, and GET and PUT /admin/faults read and change fault injection.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("GET /stats", s.handleStats)
+	mux.HandleFunc("GET /admin/faults", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, s.currentFaults())
+	})
+	mux.HandleFunc("PUT /admin/faults", s.handleSetFaults)
 	mux.HandleFunc("POST /", s.handleSend)
 	return mux
 }
@@ -130,17 +166,18 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		return // client gave up
 	}
 
+	f := s.currentFaults()
 	switch roll := s.rand(); {
-	case roll < s.cfg.RateLimitRate:
+	case roll < f.RateLimitRate:
 		s.record(req.Channel, "rate_limited", false)
 		w.Header().Set("Retry-After", strconv.Itoa(max(1, int(s.cfg.RetryAfter.Seconds()))))
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limit exceeded"})
 		return
-	case roll < s.cfg.RateLimitRate+s.cfg.FailureRate:
+	case roll < f.RateLimitRate+f.FailureRate:
 		s.record(req.Channel, "failed", false)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "simulated provider failure"})
 		return
-	case roll < s.cfg.RateLimitRate+s.cfg.FailureRate+s.cfg.PermanentFailureRate:
+	case roll < f.RateLimitRate+f.FailureRate+f.PermanentRate:
 		s.record(req.Channel, "rejected", false)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "simulated permanent rejection"})
 		return
@@ -153,6 +190,41 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		Status:    "accepted",
 		Timestamp: s.now().UTC().Format(time.RFC3339Nano),
 	})
+}
+
+func (s *Server) currentFaults() Faults {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.faults
+}
+
+// handleSetFaults replaces the fault injection probabilities. All three fields are required, so
+// a partial body cannot silently reset a rate to 0.
+func (s *Server) handleSetFaults(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		FailureRate   *float64 `json:"failureRate"`
+		RateLimitRate *float64 `json:"rateLimitRate"`
+		PermanentRate *float64 `json:"permanentRate"`
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if body.FailureRate == nil || body.RateLimitRate == nil || body.PermanentRate == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failureRate, rateLimitRate and permanentRate are required"})
+		return
+	}
+	f := Faults{FailureRate: *body.FailureRate, RateLimitRate: *body.RateLimitRate, PermanentRate: *body.PermanentRate}
+	if err := f.validate(); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	s.mu.Lock()
+	s.faults = f
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, f)
 }
 
 // sleep simulates provider latency. It returns false if the request was cancelled meanwhile.

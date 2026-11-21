@@ -104,7 +104,7 @@ func TestStats(t *testing.T) {
 	}
 	now = now.Add(time.Second)
 	post(t, h, validBody, "")
-	s.cfg.FailureRate = 1
+	s.faults.FailureRate = 1
 	post(t, h, validBody, "")
 	now = now.Add(time.Second)
 
@@ -134,5 +134,63 @@ func TestSecondCounter(t *testing.T) {
 	c.add(15) // gap: older seconds are forgotten
 	if c.count(14) != 0 || c.count(15) != 1 {
 		t.Errorf("after gap: 14=%d 15=%d", c.count(14), c.count(15))
+	}
+}
+
+func TestFaultsCanChangeAtRuntime(t *testing.T) {
+	s := newServer(Config{FailureRate: 0.25}, 0.5)
+	h := s.Handler()
+
+	get := func() Faults {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/admin/faults", nil))
+		var f Faults
+		if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &f) != nil {
+			t.Fatalf("GET /admin/faults: %d %s", rec.Code, rec.Body.String())
+		}
+		return f
+	}
+	put := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/admin/faults", strings.NewReader(body)))
+		return rec
+	}
+
+	if f := get(); f != (Faults{FailureRate: 0.25}) {
+		t.Fatalf("initial faults = %+v, want the configured ones", f)
+	}
+	if rec := post(t, h, validBody, ""); rec.Code != http.StatusAccepted {
+		t.Fatalf("before the change: %d", rec.Code)
+	}
+
+	if rec := put(`{"failureRate":1,"rateLimitRate":0,"permanentRate":0}`); rec.Code != http.StatusOK {
+		t.Fatalf("PUT: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := post(t, h, validBody, ""); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("after failureRate=1: %d, want 500", rec.Code)
+	}
+	if rec := put(`{"failureRate":0,"rateLimitRate":0,"permanentRate":1}`); rec.Code != http.StatusOK {
+		t.Fatalf("PUT: %d", rec.Code)
+	}
+	if rec := post(t, h, validBody, ""); rec.Code != http.StatusBadRequest {
+		t.Fatalf("after permanentRate=1: %d, want 400", rec.Code)
+	}
+
+	for _, bad := range []string{
+		`{`,
+		`{"failureRate":0.5}`, // partial: the others would silently become 0
+		`{"failureRate":1.5,"rateLimitRate":0,"permanentRate":0}`,
+		`{"failureRate":-0.1,"rateLimitRate":0,"permanentRate":0}`,
+		`{"failureRate":0.6,"rateLimitRate":0.6,"permanentRate":0}`,
+		`{"failureRate":0,"rateLimitRate":0,"permanentRate":0,"latency":"1s"}`,
+	} {
+		if rec := put(bad); rec.Code != http.StatusBadRequest {
+			t.Errorf("PUT %s: %d, want 400", bad, rec.Code)
+		}
+	}
+	if f := get(); f != (Faults{PermanentRate: 1}) {
+		t.Errorf("a rejected PUT changed the faults: %+v", f)
 	}
 }

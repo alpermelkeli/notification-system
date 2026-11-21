@@ -47,6 +47,7 @@ curl -XPOST localhost:8081/any-path -H 'Idempotency-Key: n-1' \
   -d '{"to":"+905551234567","channel":"sms","content":"hi"}'
 # 202 {"messageId":"...","status":"accepted","timestamp":"..."}
 curl localhost:8081/stats        # accepted/rejected per channel + rate in the last second
+curl -X PUT localhost:8081/admin/faults -d '{"failureRate":1,"rateLimitRate":0,"permanentRate":0}'  # change faults live
 ```
 
 `make help` lists all developer targets (`make run-api`, `make infra`, `make logs`, ...).
@@ -419,7 +420,7 @@ stop the process with a message listing every problem. Copy [`.env.example`](.en
 | `TRACE_SAMPLE_RATIO` | `1` | all | Share of new traces recorded (0–1); spans with a parent follow the parent's decision |
 | `MOCK_ADDR` | `:8081` | mockprovider | Listen address |
 | `MOCK_LATENCY` / `MOCK_LATENCY_JITTER` | `50ms` / `100ms` | mockprovider | Simulated latency: base + uniform `[0, jitter)` |
-| `MOCK_FAILURE_RATE` | `0` | mockprovider | Probability of HTTP 500 |
+| `MOCK_FAILURE_RATE` | `0` | mockprovider | Probability of HTTP 500 (initial value; `PUT /admin/faults` changes all three rates at runtime) |
 | `MOCK_RATE_LIMIT_RATE` | `0` | mockprovider | Probability of HTTP 429 with `Retry-After` |
 | `MOCK_PERMANENT_RATE` | `0` | mockprovider | Probability of HTTP 400 (a permanent failure: not retried, dead-lettered) |
 | `MOCK_RETRY_AFTER` | `1s` | mockprovider | `Retry-After` value for 429 |
