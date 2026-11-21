@@ -17,6 +17,15 @@ func (s *Store) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
 	return pgx.BeginFunc(ctx, s.pool, fn)
 }
 
+// Every status change sets updated_at to clock_timestamp(), the time of the change, not now(),
+// the start of its transaction. Status events carry updated_at as "at", and clients keep the
+// latest per notification (ADR-0011). A dispatcher transaction can start before a concurrent
+// transition of the same row commits and lock the row only afterwards; with now() its "queued"
+// would carry the earlier time and lose to the older status. The row lock orders the changes of
+// one row, so clock_timestamp() orders their "at" the same way, as long as the primary's clock
+// does not step back. The history row of a change gets the same time, so GET .../history and the
+// events agree.
+
 // transition describes one guarded status change.
 type transition struct {
 	from []domain.Status
@@ -63,15 +72,15 @@ WITH prev AS (
        FOR UPDATE
 ), upd AS (
     UPDATE notifications n
-       SET status = $4, updated_at = now()` + t.set + `
+       SET status = $4, updated_at = clock_timestamp()` + t.set + `
       FROM prev
      WHERE n.id = prev.id AND n.created_at = prev.created_at
        AND prev.status = ANY($3) AND ($6::uuid IS NULL OR prev.lease_token = $6)
  RETURNING ` + columns("n") + `, prev.status AS prev_status
 ), hist AS (
     INSERT INTO notification_status_history
-           (notification_id, notification_created_at, from_status, to_status, attempt, reason)
-    SELECT id, created_at, prev_status, status, attempts, $5 FROM upd
+           (notification_id, notification_created_at, from_status, to_status, attempt, reason, created_at)
+    SELECT id, created_at, prev_status, status, attempts, $5, updated_at FROM upd
 )
 SELECT ` + columns("") + ` FROM upd`
 
@@ -180,7 +189,7 @@ func (s *Store) Claim(ctx context.Context, id uuid.UUID, createdAt time.Time, le
 		// count.
 		row, renewErr := scanNotification(s.pool.QueryRow(ctx, `
 			UPDATE notifications n
-			   SET lease_until = now() + make_interval(secs => $3), updated_at = now()
+			   SET lease_until = now() + make_interval(secs => $3), updated_at = clock_timestamp()
 			 WHERE id = $1 AND created_at = $2 AND status = 'processing' AND lease_token = $4
 			RETURNING `+columns("n"), id, createdAt, lease.Seconds(), token))
 		switch {
@@ -300,15 +309,15 @@ WITH b AS (
         AS b(id, created_at, prev_status, kafka_partition, kafka_offset)
 ), upd AS (
     UPDATE notifications n
-       SET status = 'queued', queued_at = now(), updated_at = now(),
+       SET status = 'queued', queued_at = now(), updated_at = clock_timestamp(),
            kafka_partition = b.kafka_partition, kafka_offset = b.kafka_offset
       FROM b
      WHERE n.id = b.id AND n.created_at = b.created_at AND n.status = b.prev_status
  RETURNING `+columns("n")+`, b.prev_status
 ), hist AS (
     INSERT INTO notification_status_history
-           (notification_id, notification_created_at, from_status, to_status, attempt, reason)
-    SELECT id, created_at, prev_status, 'queued', attempts, 'dispatched' FROM upd
+           (notification_id, notification_created_at, from_status, to_status, attempt, reason, created_at)
+    SELECT id, created_at, prev_status, 'queued', attempts, 'dispatched', updated_at FROM upd
 )
 SELECT `+columns("")+` FROM upd`,
 			ids, createdAts, prev, partitions, offsets)
@@ -365,14 +374,14 @@ WITH prev AS (
            next_attempt_at = CASE WHEN n.attempts >= $2 THEN n.next_attempt_at ELSE now() END,
            last_error = CASE WHEN n.attempts >= $2 THEN 'lease expired on the last attempt'
                              ELSE 'lease expired' END,
-           lease_until = NULL, lease_token = NULL, updated_at = now()
+           lease_until = NULL, lease_token = NULL, updated_at = clock_timestamp()
       FROM prev
      WHERE n.id = prev.id AND n.created_at = prev.created_at
  RETURNING `+columns("n")+`, prev.status AS prev_status
 ), hist AS (
     INSERT INTO notification_status_history
-           (notification_id, notification_created_at, from_status, to_status, attempt, reason)
-    SELECT id, created_at, prev_status, status, attempts, last_error FROM upd
+           (notification_id, notification_created_at, from_status, to_status, attempt, reason, created_at)
+    SELECT id, created_at, prev_status, status, attempts, last_error, updated_at FROM upd
 )
 SELECT `+columns("")+` FROM upd`, limit, maxAttempts)
 	if err != nil {
@@ -442,14 +451,14 @@ WITH c AS (
        FOR UPDATE OF n SKIP LOCKED
 ), upd AS (
     UPDATE notifications n
-       SET status = 'pending', next_attempt_at = now(), updated_at = now()`+clearQueued+`
+       SET status = 'pending', next_attempt_at = now(), updated_at = clock_timestamp()`+clearQueued+`
       FROM prev
      WHERE n.id = prev.id AND n.created_at = prev.created_at
  RETURNING `+columns("n")+`, prev.status AS prev_status
 ), hist AS (
     INSERT INTO notification_status_history
-           (notification_id, notification_created_at, from_status, to_status, attempt, reason)
-    SELECT id, created_at, prev_status, 'pending', attempts, 'kafka record consumed without claim' FROM upd
+           (notification_id, notification_created_at, from_status, to_status, attempt, reason, created_at)
+    SELECT id, created_at, prev_status, 'pending', attempts, 'kafka record consumed without claim', updated_at FROM upd
 )
 SELECT `+columns("")+` FROM upd`,
 		channels, priorities, partitions, offsets, grace.Seconds(), limit)
@@ -481,14 +490,14 @@ WITH prev AS (
        FOR UPDATE SKIP LOCKED
 ), upd AS (
     UPDATE notifications n
-       SET status = 'pending', next_attempt_at = now(), updated_at = now()`+clearQueued+`
+       SET status = 'pending', next_attempt_at = now(), updated_at = clock_timestamp()`+clearQueued+`
       FROM prev
      WHERE n.id = prev.id AND n.created_at = prev.created_at
  RETURNING `+columns("n")+`, prev.status AS prev_status
 ), hist AS (
     INSERT INTO notification_status_history
-           (notification_id, notification_created_at, from_status, to_status, attempt, reason)
-    SELECT id, created_at, prev_status, 'pending', attempts, 'stuck in queued' FROM upd
+           (notification_id, notification_created_at, from_status, to_status, attempt, reason, created_at)
+    SELECT id, created_at, prev_status, 'pending', attempts, 'stuck in queued', updated_at FROM upd
 )
 SELECT `+columns("")+` FROM upd`, olderThan.Seconds(), limit)
 	if err != nil {

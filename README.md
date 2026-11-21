@@ -139,7 +139,8 @@ Limits:
 - 1000 subscriptions per connection, 100 ids per message, and 10 messages handled per second.
 - Snapshot reads are batched, and at most 4 run at once per instance.
 - A client that falls 256 events behind is closed with `1008`.
-- 10 000 connections per instance; further ones are closed with `1013`. On shutdown, connections are closed with `1001`; the
+- 10 000 connections per instance; further ones are closed with `1013`.
+- Browsers connect from the API's own origin, or from `WS_ALLOWED_ORIGINS`. On shutdown, connections are closed with `1001`; the
 client reconnects, subscribes again and gets fresh snapshots. Metrics: `notifier_ws_connections`,
 `notifier_ws_messages_total{type}`, `notifier_ws_disconnects_total{reason}`.
 
@@ -389,6 +390,7 @@ stop the process with a message listing every problem. Copy [`.env.example`](.en
 | `IDEMPOTENCY_TTL` | `72h` | api | How long an `Idempotency-Key` is remembered. Must not exceed `RETENTION_DAYS` |
 | `MAX_SCHEDULE_AHEAD` | `168h` | api | Latest allowed `scheduledAt`. Must be at least one day shorter than `RETENTION_DAYS` |
 | `REQUEST_TIMEOUT` | `10s` | api | Deadline for each API request; exceeded requests return `503 timeout` |
+| `WS_ALLOWED_ORIGINS` | *(empty)* | api | Extra browser origins allowed to open `/v1/ws`, comma-separated host patterns (`app.example.com`, `*.example.com`) or with a scheme (`https://app.example.com`), matched against the origin's host and non-default port (`*.example.com` excludes `example.com` itself); the API's own origin is always allowed. Set it behind a proxy that rewrites `Host` |
 | `RETENTION_DAYS` | `30` | dispatcher | Daily partitions older than this are dropped |
 | `PARTITION_PREMAKE_DAYS` | `7` | migrate, dispatcher | Partitions kept ready ahead of today |
 | `MAINTENANCE_INTERVAL` | `1h` | dispatcher | How often partition and key maintenance runs |

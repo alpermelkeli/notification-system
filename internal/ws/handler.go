@@ -96,22 +96,34 @@ type Handler struct {
 	store   Store
 	logger  *slog.Logger
 	metrics *metrics.WebSocket
+	accept  *websocket.AcceptOptions
+}
+
+// HandlerOptions configures a Handler.
+type HandlerOptions struct {
+	// AllowedOrigins are browser origins allowed besides the API's own, as path.Match patterns of
+	// the host ("*.example.com") or of scheme and host ("https://app.example.com"). Needed when a
+	// proxy in front of the API changes the Host header, or a web app on another domain connects.
+	AllowedOrigins []string
 }
 
 // NewHandler returns the WebSocket endpoint of hub. Snapshots are read from store.
-func NewHandler(hub *Hub, store Store, logger *slog.Logger) *Handler {
-	return &Handler{hub: hub, store: store, logger: logger, metrics: hub.metrics}
+func NewHandler(hub *Hub, store Store, logger *slog.Logger, opts HandlerOptions) *Handler {
+	return &Handler{
+		hub: hub, store: store, logger: logger, metrics: hub.metrics,
+		accept: &websocket.AcceptOptions{OriginPatterns: opts.AllowedOrigins},
+	}
 }
 
 // ServeHTTP upgrades the request and serves the connection until either side closes it.
-// Browsers may only connect from the API's own origin (the library's default check); clients
-// without an Origin header, such as CLI tools and services, are accepted.
+// Browsers may connect from the API's own origin and from AllowedOrigins; clients without an
+// Origin header, such as CLI tools and services, are accepted.
 //
 // Four goroutines serve a connection. The reader only reads, so pongs are always processed; the
 // processor handles requests one at a time, at most requestRate per second; the pinger checks
 // the peer; this goroutine writes and decides when the connection ends.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	conn, err := websocket.Accept(w, r, nil)
+	conn, err := websocket.Accept(w, r, h.accept)
 	if err != nil {
 		return // Accept has answered the request
 	}

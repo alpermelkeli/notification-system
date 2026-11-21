@@ -40,7 +40,7 @@ func TestWebSocketFollowsABatchToDelivery(t *testing.T) {
 	consumed := make(chan struct{})
 	go func() { hub.Consume(ctx, consumer); close(consumed) }()
 	defer func() { cancel(); <-consumed }()
-	srv := httptest.NewServer(ws.NewHandler(hub, store, quiet))
+	srv := httptest.NewServer(ws.NewHandler(hub, store, quiet, ws.HandlerOptions{}))
 	defer srv.Close()
 	defer hub.Shutdown()
 

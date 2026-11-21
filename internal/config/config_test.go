@@ -238,3 +238,20 @@ func TestLoadRequiresADayOfMarginForSchedules(t *testing.T) {
 		t.Error("less than a day of margin should be rejected")
 	}
 }
+
+func TestLoadWebSocketOrigins(t *testing.T) {
+	cfg, err := load(env(nil))
+	if err != nil || cfg.WSAllowedOrigins != nil {
+		t.Fatalf("default: %v, %v; want only the API's own origin", cfg.WSAllowedOrigins, err)
+	}
+	cfg, err = load(env(map[string]string{"WS_ALLOWED_ORIGINS": " app.example.com , https://*.example.org,localhost:3000 "}))
+	if err != nil || !reflect.DeepEqual(cfg.WSAllowedOrigins, []string{"app.example.com", "https://*.example.org", "localhost:3000"}) {
+		t.Errorf("parsed %v, %v", cfg.WSAllowedOrigins, err)
+	}
+	for _, bad := range []string{"[bad", "https://app.example.com/", "app.example.com/ws", "ws://app.example.com", "https://", "*"} {
+		if _, err := load(env(map[string]string{"WS_ALLOWED_ORIGINS": "app.example.com," + bad})); err == nil ||
+			!strings.Contains(err.Error(), "WS_ALLOWED_ORIGINS") {
+			t.Errorf("%q: got %v, want a start-up error", bad, err)
+		}
+	}
+}

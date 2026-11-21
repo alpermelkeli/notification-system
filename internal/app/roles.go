@@ -91,7 +91,7 @@ func RunAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	api.New(store, logger, api.Options{
 		MaxScheduleAhead: cfg.MaxScheduleAhead, RequestTimeout: cfg.RequestTimeout, Metrics: httpMetrics,
 		Events:    events.NewPublisher(eventClient, metrics.NewEvents(reg), logger),
-		WebSocket: ws.NewHandler(hub, store, logger),
+		WebSocket: ws.NewHandler(hub, store, logger, ws.HandlerOptions{AllowedOrigins: cfg.WSAllowedOrigins}),
 	}).Routes(router)
 
 	var wg sync.WaitGroup

@@ -43,15 +43,10 @@ Living document. Update phase status as work lands. Time budget ≈ 12h of focus
 | Readiness of multi-channel workers | `/readyz` checks every channel's Kafka client (`kafka-sms`, `kafka-email`, `kafka-push`) | [0009](adr/0009-observability.md) |
 
 ## Phase 9 starting point
-Phase 8 left these follow-ups from its review, none blocking:
-- Status events order by `updated_at = now()`, the transaction start. A relay transaction that
-  began before a concurrent transition committed can stamp `queued` earlier than it. Using
-  `clock_timestamp()` in the guarded transitions would make `at` reflect commit order more
-  closely (ADR-0011).
-- Browsers may only open `/v1/ws` from the API's own origin. Behind a TLS proxy that rewrites
-  `Host`, an `OriginPatterns` setting (env, README, `.env.example`) would be needed.
-- Item keys of a batch sent without a batch key are checked after template validation, so their
-  retry fails if the template changed incompatibly (ADR-0010).
+Phase 8's review follow-ups on event ordering (`clock_timestamp()`) and browser origins
+(`WS_ALLOWED_ORIGINS`) are done. One remains, not blocking: item keys of a batch sent without a
+batch key are checked after template validation, so their retry fails if the template changed
+incompatibly (ADR-0010).
 
 ## Open questions
 | Phase | Question | Notes |

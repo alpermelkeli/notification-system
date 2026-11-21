@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -55,6 +56,10 @@ type Config struct {
 	MaxScheduleAhead time.Duration
 	// RequestTimeout bounds each public API request.
 	RequestTimeout time.Duration
+	// WSAllowedOrigins are extra browser origins allowed to open /v1/ws, as host patterns
+	// ("app.example.com", "*.example.com") or with a scheme ("https://app.example.com"). The API's
+	// own origin is always allowed (B-4, ADR-0011).
+	WSAllowedOrigins []string
 
 	// Retry is the delivery retry policy (ADR-0005): the worker's backoff, and the attempt budget
 	// that both the worker and the dispatcher's reaper enforce.
@@ -175,6 +180,7 @@ func load(lookup lookupFunc) (Config, error) {
 		MaintenanceInterval:  p.duration("MAINTENANCE_INTERVAL", time.Hour),
 		MaxScheduleAhead:     p.duration("MAX_SCHEDULE_AHEAD", 7*24*time.Hour),
 		RequestTimeout:       p.duration("REQUEST_TIMEOUT", 10*time.Second),
+		WSAllowedOrigins:     p.originPatterns("WS_ALLOWED_ORIGINS"),
 
 		Retry: Retry{
 			BaseDelay:   p.duration("RETRY_BASE_DELAY", 5*time.Second),
@@ -357,6 +363,48 @@ func (p *parser) channels(key string) []domain.Channel {
 		}
 	}
 	return out
+}
+
+// originPatterns parses an optional list of origin patterns for the WebSocket library: path.Match
+// patterns of an origin's host[:port] ("*.example.com"), or of scheme://host[:port]
+// ("https://app.example.com"). A pattern the library could never match (a path, a trailing slash,
+// another scheme) or one that allows every site ("*") stops the process instead of refusing every
+// browser at run time.
+func (p *parser) originPatterns(key string) []string {
+	if _, ok := p.raw(key); !ok {
+		return nil
+	}
+	var out []string
+	for _, pat := range p.list(key, nil) {
+		if err := checkOriginPattern(pat); err != nil {
+			p.errs = append(p.errs, fmt.Errorf("%s: %q %w", key, pat, err))
+			continue
+		}
+		out = append(out, pat)
+	}
+	return out
+}
+
+func checkOriginPattern(pat string) error {
+	host := pat
+	if scheme, rest, ok := strings.Cut(pat, "://"); ok {
+		if s := strings.ToLower(scheme); s != "http" && s != "https" {
+			return errors.New("must use the http or https scheme")
+		}
+		host = rest
+	}
+	switch {
+	case host == "":
+		return errors.New("has no host")
+	case strings.Contains(host, "/"):
+		return errors.New("must be a host[:port] without a path or trailing slash")
+	case host == "*":
+		return errors.New("would allow every site")
+	}
+	if _, err := path.Match(host, ""); err != nil {
+		return fmt.Errorf("is not a valid pattern: %w", err)
+	}
+	return nil
 }
 
 func (p *parser) list(key string, def []string) []string {
