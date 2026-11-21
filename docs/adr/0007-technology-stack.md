@@ -11,7 +11,7 @@ library and small, well-maintained libraries over frameworks.
 ## Decision
 | Concern | Choice | Why |
 |---------|--------|-----|
-| Language | Go 1.25 | Latest stable; `log/slog`, enhanced `net/http` routing |
+| Language | Go 1.26 (`go 1.26` in `go.mod`) | Minimum required by current releases of franz-go, go-redis and client_golang. Go 1.25 left support when 1.27 shipped. `log/slog`, enhanced `net/http` routing |
 | HTTP router | `go-chi/chi/v5` | `net/http`-compatible, idiomatic middleware |
 | PostgreSQL | PostgreSQL 17 + `jackc/pgx/v5` (pgxpool) | Fast native driver, `LISTEN/NOTIFY`, `COPY` for batches |
 | Migrations | `pressly/goose/v3` (SQL files) | Versioned SQL, embeddable, runs as a compose job |
@@ -31,6 +31,10 @@ library and small, well-maintained libraries over frameworks.
 `worker` and `migrate`. docker-compose runs postgres, kafka, redis, the migrate and
 topic-init jobs, an nginx load balancer in front of api (ADR-0008), api, dispatcher, worker,
 jaeger and a mock provider (ADR-0006). Ids are UUIDv7 (`google/uuid`).
+
+**Amendment (2026-11-21, Phase 2):** the language row originally said Go 1.25. Bootstrapping the
+module showed that the current releases of franz-go, go-redis and client_golang require Go 1.26,
+so the target moved to 1.26 instead of pinning older library versions.
 
 ## Consequences
 - ✅ A small, mainstream dependency set that reviewers will recognise.

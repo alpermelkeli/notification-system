@@ -54,7 +54,8 @@ locally.
 
 ### Local demonstration (docker-compose)
 - An **nginx** load balancer (`lb`, port 8080) proxies HTTP and WebSocket traffic to the `api`
-  service. Docker DNS resolves `api` to all replicas.
+  service. Docker DNS resolves `api` to all replicas, and nginx re-resolves it every 5 s
+  (`server api:8080 resolve`, nginx ≥ 1.27.3), so scaling up or down needs no restart.
 - Horizontal scaling is shown with:
   ```bash
   docker compose up --build --scale api=3 --scale worker=3
@@ -70,7 +71,6 @@ locally.
   `--scale`).
 - ✅ Each autoscaling signal matches what actually constrains that component: CPU/RPS for the
   API, lag for workers. The provider quota is acknowledged as the true ceiling.
-- ⚠️ nginx resolves upstream replicas at start-up. After changing `--scale`, restart `lb`. A
-  production setup uses a managed LB or service discovery.
+- ⚠️ nginx is a single local LB instance. A production setup uses a managed, redundant LB.
 - ⚠️ Read-replica lag means a status read can be slightly stale. This is documented in the API
   docs.
