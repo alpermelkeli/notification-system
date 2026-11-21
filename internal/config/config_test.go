@@ -57,7 +57,7 @@ func TestLoadEngineDefaults(t *testing.T) {
 	w := cfg.Worker
 	if !reflect.DeepEqual(w.Channels, []domain.Channel{domain.ChannelSMS, domain.ChannelEmail, domain.ChannelPush}) ||
 		w.Concurrency != 20 || w.ProviderURL != "http://localhost:8081/" || w.ProviderTimeout != 10*time.Second ||
-		w.Lease != 30*time.Second || w.RateLimitBurst != 10 || w.RetryDelay != 5*time.Second ||
+		w.Lease != 30*time.Second || w.RateLimitBurst != 1 || w.RetryDelay != 5*time.Second ||
 		w.MaxAttempts != 5 || w.AgingRate != 2 || w.MinShareEvery != 10 {
 		t.Errorf("worker defaults = %+v", w)
 	}

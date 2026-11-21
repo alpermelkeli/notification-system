@@ -157,7 +157,7 @@ func load(lookup lookupFunc) (Config, error) {
 				domain.ChannelEmail: p.integer("RATE_LIMIT_EMAIL", 100, 1, 100_000),
 				domain.ChannelPush:  p.integer("RATE_LIMIT_PUSH", 100, 1, 100_000),
 			},
-			RateLimitBurst: p.integer("RATE_LIMIT_BURST", 10, 1, 10_000),
+			RateLimitBurst: p.integer("RATE_LIMIT_BURST", 1, 1, 10_000),
 			RetryDelay:     p.duration("RETRY_DELAY", 5*time.Second),
 			MaxAttempts:    p.integer("MAX_ATTEMPTS", 5, 1, 100),
 			AgingRate:      p.float("SCHEDULER_AGING_RATE", 2, 0, 1000),

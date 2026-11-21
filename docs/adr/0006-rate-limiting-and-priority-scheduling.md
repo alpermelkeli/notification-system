@@ -28,8 +28,8 @@ a send slot becomes available**. Kafka has no native priority (ADR-0002).
 
 ## Decision
 **Rate limiting**
-- The key is `ratelimit:{channel}:{provider}`, with a limit of 100/s and a small burst (default 10). This
-  keeps the per-second count at or below the limit in practice. Configurable via env.
+- The key is `ratelimit:{channel}:{provider}`, with a limit of 100/s and a small burst (default 10,
+  changed to 1 in Phase 5, see the amendment). Configurable via env.
 - A worker acquires a token **before** each provider call. When denied, it waits for the
   `RetryAfter` returned by GCRA. Messages are never dropped or re-queued because of the limiter.
 - If Redis is unavailable, the worker **fails closed**: it pauses sending and reports not-ready.
@@ -104,6 +104,24 @@ Kafka batch fetch → route by topic → priority heaps → aging scheduler → 
   provider latency: 100 msg/s × ~200 ms ≈ 20 in flight. When a send completes, its offset is
   marked in the partition watermark tracker (ADR-0002).
 - All weights, caps, the aging rate and the minimum share are configurable via env.
+
+**Amendment (2026-11-21, Phase 5): implementation notes.**
+- The `{provider}` part of the keys is the host of `PROVIDER_URL`. `redis_rate` adds its own
+  `rate:` prefix to the GCRA key.
+- The cool-down is set with `SET NX PX` plus `PEXPIRE ... GT`, so a shorter `Retry-After` never
+  shortens a cool-down already in place.
+- **The default burst is 1, not 10.** After an idle period GCRA grants the burst at once and then
+  the steady rate, so one wall-clock second can hold up to `rate + burst - 1` sends. A compose
+  burst test measured 106 sends in one second at provider side with burst 10, which breaks
+  "max 100 msg/s". With burst 1, sends are spaced 10 ms apart: the same test peaked at 91/s and
+  sent 1100 SMS in about 12.8 s. Burst 1 leaves GCRA no slack, so every late token request (timer
+  and Redis round-trip latency) is lost throughput; the sustained rate is about 90% of the limit,
+  which is the headroom this ADR asks for anyway. `RATE_LIMIT_BURST=2` would reach the full rate
+  at the cost of an occasional 101st send within one second. `RATE_LIMIT_BURST` stays
+  configurable for providers that tolerate short bursts.
+- A pick can find nothing after the token was granted (the partition was revoked meanwhile). That
+  token is lost, and so is the token of a record skipped as stale. Both are rare and only cost
+  throughput.
 
 ## Consequences
 - ✅ 100 msg/s per channel holds regardless of the number of worker replicas.
