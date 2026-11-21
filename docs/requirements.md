@@ -43,8 +43,8 @@ Left open by the brief ("thinking and design by candidate"). Our design must be 
 | ID | Requirement | Status | Where |
 |----|-------------|--------|-------|
 | FR-4.1 | Real-time metrics endpoint: queue depth, success/failure rates, latency | [ ] | |
-| FR-4.2 | Structured logging with correlation IDs | [ ] | |
-| FR-4.3 | Health check endpoint | [ ] | |
+| FR-4.2 | Structured logging with correlation IDs | [~] | `internal/logging`, `internal/httpx/middleware.go` (HTTP; Kafka propagation in Phase 5) |
+| FR-4.3 | Health check endpoint | [x] | `internal/health`, `/healthz` + `/readyz` on every role |
 
 ## External provider (webhook.site)
 - `POST https://webhook.site/{uuid}` with body `{ "to": "...", "channel": "sms", "content": "..." }`
@@ -59,14 +59,14 @@ Left open by the brief ("thinking and design by candidate"). Our design must be 
 | B-3 | Template system with variable substitution | [ ] |
 | B-4 | WebSocket real-time status updates | [ ] |
 | B-5 | Distributed tracing | [ ] |
-| B-6 | GitHub Actions CI/CD (test + lint) | [ ] |
+| B-6 | GitHub Actions CI/CD (test + lint) | [x] |
 
 ## Deliverables
 | ID | Deliverable | Status |
 |----|-------------|--------|
 | D-1 | Repo with **clean commit history** | [~] |
 | D-2 | README: setup, architecture overview, API examples | [~] |
-| D-3 | `docker-compose up` one-command setup | [ ] |
+| D-3 | `docker-compose up` one-command setup | [~] |
 | D-4 | Swagger / OpenAPI spec | [ ] |
 | D-5 | Versioned DB migrations | [ ] |
-| D-6 | Test suite runnable with a single command | [ ] |
+| D-6 | Test suite runnable with a single command | [x] |

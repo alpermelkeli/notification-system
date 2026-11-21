@@ -39,14 +39,32 @@ judged on architecture, reliability, code quality, tests, docs and **commit hist
 - Run `reviewer` on the combined diff before each phase commit.
 
 ## Commands
-_Filled in during Phase 2 (skeleton)._ Expected:
 ```bash
-docker compose up --build   # full stack
-make run-api / make run-worker
-make test                   # unit + integration
-make lint
-make migrate-up
+make help          # list all targets
+make up            # docker compose up -d --build (API via nginx on :8080)
+make up-scaled     # 3 API + 3 worker replicas (scaling demo)
+make infra         # only postgres, kafka, redis, mock provider (for `make run-*`)
+make run-api       # also run-dispatcher, run-worker, run-mockprovider
+make test          # go test -race ./... (must be green before every commit)
+make test-short    # unit tests only, no Docker
+make lint          # golangci-lint v2 (.golangci.yml)
+make down / clean  # stop / stop and delete volumes
 ```
 
 ## Layout
-_Filled in once the skeleton lands (Phase 2)._
+```
+cmd/notifier/          single binary; subcommands api | dispatcher | worker | healthcheck | version
+cmd/mockprovider/      local fake of webhook.site (fault injection, /stats)
+internal/app/          role wiring (RunAPI, RunDispatcher, RunWorker), shared router, graceful HTTP server
+internal/config/       env -> typed Config (all errors reported at once)
+internal/logging/      slog JSON logger; correlation ID carried in context.Context
+internal/httpx/        error envelope, JSON helpers, middleware (correlation id, instance id, logging, recovery)
+internal/health/       /healthz (liveness) and /readyz (concurrent dependency checks)
+internal/platform/     lazy PostgreSQL / Kafka / Redis clients + readiness checks
+internal/mockprovider/ mock provider handler
+deploy/                nginx LB config, Kafka topic creation script
+docs/                  requirements, plan, conventions, ADRs, capacity planning, diagrams
+```
+Packages added by later phases: `internal/domain`, `internal/storage` + `migrations/` (Phase 3),
+`internal/api` + `api/openapi.yaml` (Phase 4), `internal/dispatcher`, `internal/worker`,
+`internal/ratelimit`, `internal/provider` (Phases 5–6).
