@@ -50,7 +50,7 @@ func TestLoadEngineDefaults(t *testing.T) {
 	}
 	if cfg.Dispatcher != (Dispatcher{
 		BatchSize: 500, PollInterval: 500 * time.Millisecond, ReaperInterval: 30 * time.Second,
-		ReaperGrace: time.Minute, ReaperStuckAfter: 24 * time.Hour,
+		ReaperGrace: time.Minute, ReaperStuckAfter: 24 * time.Hour, DepthInterval: 15 * time.Second,
 	}) {
 		t.Errorf("dispatcher defaults = %+v", cfg.Dispatcher)
 	}
@@ -62,6 +62,9 @@ func TestLoadEngineDefaults(t *testing.T) {
 	}
 	if cfg.Retry != (Retry{BaseDelay: 5 * time.Second, MaxDelay: 5 * time.Minute, MaxAttempts: 5}) {
 		t.Errorf("retry defaults = %+v", cfg.Retry)
+	}
+	if cfg.Tracing != (Tracing{SampleRatio: 1}) {
+		t.Errorf("tracing defaults = %+v, want disabled", cfg.Tracing)
 	}
 	if w.Breaker != (Breaker{ConsecutiveFailures: 5, FailureRatio: 0.5, MinRequests: 20, Window: time.Minute, OpenTimeout: 30 * time.Second}) {
 		t.Errorf("breaker defaults = %+v", w.Breaker)
@@ -75,15 +78,17 @@ func TestLoadEngineDefaults(t *testing.T) {
 
 func TestLoadEngineOverrides(t *testing.T) {
 	cfg, err := load(env(map[string]string{
-		"WORKER_CHANNELS":      "SMS, push,sms",
-		"PROVIDER_URL":         "https://webhook.site/abc",
-		"RATE_LIMIT_EMAIL":     "600",
-		"SCHEDULER_AGING_RATE": "0.5",
-		"SCHEDULER_MIN_SHARE":  "0",
-		"REAPER_GRACE":         "2m",
-		"RETRY_BASE_DELAY":     "1s",
-		"RETRY_MAX_DELAY":      "30s",
-		"MAX_ATTEMPTS":         "8",
+		"WORKER_CHANNELS":             "SMS, push,sms",
+		"PROVIDER_URL":                "https://webhook.site/abc",
+		"RATE_LIMIT_EMAIL":            "600",
+		"SCHEDULER_AGING_RATE":        "0.5",
+		"SCHEDULER_MIN_SHARE":         "0",
+		"REAPER_GRACE":                "2m",
+		"RETRY_BASE_DELAY":            "1s",
+		"RETRY_MAX_DELAY":             "30s",
+		"MAX_ATTEMPTS":                "8",
+		"OTEL_EXPORTER_OTLP_ENDPOINT": "http://jaeger:4318",
+		"TRACE_SAMPLE_RATIO":          "0.1",
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -97,20 +102,26 @@ func TestLoadEngineOverrides(t *testing.T) {
 	if cfg.Retry != (Retry{BaseDelay: time.Second, MaxDelay: 30 * time.Second, MaxAttempts: 8}) {
 		t.Errorf("retry = %+v", cfg.Retry)
 	}
+	if cfg.Tracing != (Tracing{Endpoint: "http://jaeger:4318", SampleRatio: 0.1}) {
+		t.Errorf("tracing = %+v", cfg.Tracing)
+	}
 }
 
 func TestLoadRejectsInvalidEngineSettings(t *testing.T) {
 	_, err := load(env(map[string]string{
-		"WORKER_CHANNELS":       "sms,fax",
-		"PROVIDER_URL":          "webhook.site/abc",
-		"SCHEDULER_AGING_RATE":  "fast",
-		"RATE_LIMIT_SMS":        "0",
-		"BREAKER_FAILURE_RATIO": "1.5",
+		"WORKER_CHANNELS":             "sms,fax",
+		"PROVIDER_URL":                "webhook.site/abc",
+		"SCHEDULER_AGING_RATE":        "fast",
+		"RATE_LIMIT_SMS":              "0",
+		"BREAKER_FAILURE_RATIO":       "1.5",
+		"OTEL_EXPORTER_OTLP_ENDPOINT": "jaeger:4318",
+		"TRACE_SAMPLE_RATIO":          "2",
 	}))
 	if err == nil {
 		t.Fatal("expected an error")
 	}
-	for _, key := range []string{"WORKER_CHANNELS", "PROVIDER_URL", "SCHEDULER_AGING_RATE", "RATE_LIMIT_SMS", "BREAKER_FAILURE_RATIO"} {
+	for _, key := range []string{"WORKER_CHANNELS", "PROVIDER_URL", "SCHEDULER_AGING_RATE", "RATE_LIMIT_SMS", "BREAKER_FAILURE_RATIO",
+		"OTEL_EXPORTER_OTLP_ENDPOINT", "TRACE_SAMPLE_RATIO"} {
 		if !strings.Contains(err.Error(), key) {
 			t.Errorf("error does not mention %s: %v", key, err)
 		}
@@ -167,6 +178,7 @@ func TestLoadOverrides(t *testing.T) {
 		Retry:      defaults.Retry,
 		Dispatcher: defaults.Dispatcher,
 		Worker:     defaults.Worker,
+		Tracing:    defaults.Tracing,
 	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Errorf("got  %+v\nwant %+v", cfg, want)
