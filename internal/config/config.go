@@ -47,6 +47,10 @@ type Config struct {
 	PartitionPremakeDays int
 	// MaintenanceInterval is how often the dispatcher runs partition and key maintenance.
 	MaintenanceInterval time.Duration
+	// MaxScheduleAhead bounds how far in the future a notification may be scheduled (B-2).
+	MaxScheduleAhead time.Duration
+	// RequestTimeout bounds each public API request.
+	RequestTimeout time.Duration
 }
 
 // Load reads the configuration from the process environment.
@@ -83,12 +87,21 @@ func load(lookup lookupFunc) (Config, error) {
 		RetentionDays:        p.integer("RETENTION_DAYS", 30, 1, 3650),
 		PartitionPremakeDays: p.integer("PARTITION_PREMAKE_DAYS", 7, 1, 90),
 		MaintenanceInterval:  p.duration("MAINTENANCE_INTERVAL", time.Hour),
+		MaxScheduleAhead:     p.duration("MAX_SCHEDULE_AHEAD", 7*24*time.Hour),
+		RequestTimeout:       p.duration("REQUEST_TIMEOUT", 10*time.Second),
 	}
 
 	// A live idempotency key must never point at a notification whose partition was dropped.
 	if cfg.IdempotencyTTL > time.Duration(cfg.RetentionDays)*24*time.Hour {
 		p.errs = append(p.errs, fmt.Errorf("IDEMPOTENCY_TTL (%v) must not exceed RETENTION_DAYS (%d days)",
 			cfg.IdempotencyTTL, cfg.RetentionDays))
+	}
+
+	// A scheduled notification must be delivered, retries included, before its partition is
+	// dropped, so keep at least a day of margin.
+	if cfg.MaxScheduleAhead > time.Duration(cfg.RetentionDays-1)*24*time.Hour {
+		p.errs = append(p.errs, fmt.Errorf("MAX_SCHEDULE_AHEAD (%v) must be at least one day shorter than RETENTION_DAYS (%d days)",
+			cfg.MaxScheduleAhead, cfg.RetentionDays))
 	}
 
 	if err := errors.Join(p.errs...); err != nil {

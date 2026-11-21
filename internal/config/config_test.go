@@ -43,16 +43,17 @@ func TestLoadDefaults(t *testing.T) {
 
 func TestLoadOverrides(t *testing.T) {
 	cfg, err := load(env(map[string]string{
-		"LOG_LEVEL":        "DEBUG",
-		"LOG_FORMAT":       "text",
-		"INSTANCE_ID":      "api-1",
-		"SHUTDOWN_TIMEOUT": "3s",
-		"HTTP_ADDR":        ":18080",
-		"KAFKA_BROKERS":    " k1:9092, ,k2:9092 ",
-		"REDIS_ADDR":       "redis:6379",
-		"DATABASE_URL":     "postgres://x",
-		"IDEMPOTENCY_TTL":  "24h",
-		"RETENTION_DAYS":   "7",
+		"LOG_LEVEL":          "DEBUG",
+		"LOG_FORMAT":         "text",
+		"INSTANCE_ID":        "api-1",
+		"SHUTDOWN_TIMEOUT":   "3s",
+		"HTTP_ADDR":          ":18080",
+		"KAFKA_BROKERS":      " k1:9092, ,k2:9092 ",
+		"REDIS_ADDR":         "redis:6379",
+		"DATABASE_URL":       "postgres://x",
+		"IDEMPOTENCY_TTL":    "24h",
+		"RETENTION_DAYS":     "7",
+		"MAX_SCHEDULE_AHEAD": "72h",
 	}))
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -72,6 +73,8 @@ func TestLoadOverrides(t *testing.T) {
 		RetentionDays:        7,
 		PartitionPremakeDays: 7,
 		MaintenanceInterval:  time.Hour,
+		MaxScheduleAhead:     72 * time.Hour,
+		RequestTimeout:       10 * time.Second,
 	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Errorf("got  %+v\nwant %+v", cfg, want)
@@ -113,5 +116,21 @@ func TestLoadRejectsTTLLongerThanRetention(t *testing.T) {
 	_, err := load(env(map[string]string{"IDEMPOTENCY_TTL": "72h", "RETENTION_DAYS": "2"}))
 	if err == nil || !strings.Contains(err.Error(), "IDEMPOTENCY_TTL") {
 		t.Fatalf("err = %v, want an IDEMPOTENCY_TTL vs RETENTION_DAYS error", err)
+	}
+}
+
+func TestLoadRejectsScheduleBeyondRetention(t *testing.T) {
+	_, err := load(env(map[string]string{"MAX_SCHEDULE_AHEAD": "240h", "RETENTION_DAYS": "10", "IDEMPOTENCY_TTL": "24h"}))
+	if err == nil || !strings.Contains(err.Error(), "MAX_SCHEDULE_AHEAD") {
+		t.Fatalf("err = %v, want a MAX_SCHEDULE_AHEAD vs RETENTION_DAYS error", err)
+	}
+}
+
+func TestLoadRequiresADayOfMarginForSchedules(t *testing.T) {
+	if _, err := load(env(map[string]string{"MAX_SCHEDULE_AHEAD": "216h", "RETENTION_DAYS": "10", "IDEMPOTENCY_TTL": "24h"})); err != nil {
+		t.Errorf("9 days ahead with 10 days retention should be accepted: %v", err)
+	}
+	if _, err := load(env(map[string]string{"MAX_SCHEDULE_AHEAD": "217h", "RETENTION_DAYS": "10", "IDEMPOTENCY_TTL": "24h"})); err == nil {
+		t.Error("less than a day of margin should be rejected")
 	}
 }
