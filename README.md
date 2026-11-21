@@ -4,7 +4,7 @@ An event-driven, multi-channel notification service written in Go. It accepts no
 requests over HTTP, processes them asynchronously through prioritized queue workers, and delivers
 them via SMS, Email and Push providers with rate limiting, retries and real-time status tracking.
 
-> **Status:** 🚧 Phase 3 done: every role runs under docker-compose, and the domain model, schema, migrations and repository are in place and tested against PostgreSQL. The HTTP API (Phase 4) and the processing engine (Phase 5) come next. See [`docs/plan.md`](docs/plan.md).
+> **Status:** 🚧 Phase 4 done: the v1 API accepts, validates, stores, lists and cancels notifications (OpenAPI + Swagger UI). Notifications stay `pending` until the processing engine (dispatcher → Kafka → workers → provider) lands in Phase 5. See [`docs/plan.md`](docs/plan.md).
 
 ## Features (target)
 - **Notification API:** single and batch create (up to 1000), status by ID / batch ID, cancel, filtered + paginated listing
@@ -152,7 +152,61 @@ duplicate window is a worker crash after the provider accepted a request but bef
 was persisted (see ADR-0004).
 
 ## API
-_OpenAPI spec and examples coming in Phase 4._
+Contract: [`api/openapi.yaml`](api/openapi.yaml) (OpenAPI 3.1, written before the handlers and
+linted in CI). With the stack running, browse it at **http://localhost:8080/docs** (Swagger UI).
+
+| Method & path | Purpose | Success |
+|---------------|---------|---------|
+| `POST /v1/notifications` | Create one notification (`Idempotency-Key` supported) | `202` |
+| `POST /v1/notifications/batch` | Create 1–1000 notifications, all-or-nothing validation | `202` |
+| `GET /v1/notifications/{id}` | Status and details | `200` |
+| `GET /v1/notifications/{id}/history` | Every status change with attempt and reason | `200` |
+| `POST /v1/notifications/{id}/cancel` | Cancel while `pending`, `queued` or `retrying` | `200` |
+| `POST /v1/notifications/{id}/retry` | Replay a `failed` notification | `202` |
+| `GET /v1/notifications` | Filter by `status`, `channel`, `batchId`, `createdFrom`/`createdTo`; cursor pagination | `200` |
+| `GET /v1/batches/{id}` | Batch with per-status counts | `200` |
+
+```bash
+# Create a high-priority OTP; repeating it with the same key returns the same notification
+curl -i -XPOST localhost:8080/v1/notifications \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: otp-482913' \
+  -d '{"recipient":"+905551234567","channel":"sms","content":"Your code is 482913","priority":"high"}'
+# HTTP/1.1 202 Accepted
+# Location: /v1/notifications/01a1fd17-4a0b-7869-8fa8-a36f9d5fb75a
+# {"id":"01a1fd17-...","channel":"sms","priority":"high","status":"pending","attempts":0,...}
+
+# Batch
+curl -XPOST localhost:8080/v1/notifications/batch -H 'Content-Type: application/json' -d '{
+  "notifications": [
+    {"recipient":"user@example.com","channel":"email","content":"Flash sale!","priority":"low"},
+    {"recipient":"fcm-token-123456","channel":"push","content":"Flash sale!","priority":"low",
+     "idempotencyKey":"campaign-42-user-7"}]}'
+curl localhost:8080/v1/batches/<batchId>                          # {"total":2,"statusCounts":{"pending":2},...}
+curl 'localhost:8080/v1/notifications?batchId=<batchId>&limit=50'  # {"items":[...],"nextCursor":"..."}
+
+# Validation errors list every violation
+curl -XPOST localhost:8080/v1/notifications -H 'Content-Type: application/json' \
+  -d '{"recipient":"0555","channel":"sms","content":""}'
+# 422 {"error":{"code":"validation_failed","message":"request validation failed","details":[
+#   {"field":"recipient","message":"must be an E.164 phone number, e.g. +905551234567"},
+#   {"field":"content","message":"is required"}]}}
+```
+
+**Validation rules (FR-2.4):**
+
+| Channel | Recipient | Content |
+|---------|-----------|---------|
+| `sms` | E.164 (`+905551234567`) | ≤ 10 segments: 1530 GSM-7 chars, or 670 if UCS-2 is needed (e.g. `ş`, `ı`, emoji) |
+| `email` | bare address (`user@example.com`, ≤ 254 bytes) | ≤ 64 KiB |
+| `push` | device token, 8–4096 printable ASCII chars | ≤ 4 KiB (APNs/FCM payload limit) |
+
+`scheduledAt` (optional) may be at most `MAX_SCHEDULE_AHEAD` (7 days) ahead; a past time means
+"as soon as possible", so idempotent retries keep working after the schedule passes. Unknown
+JSON fields are rejected. Status codes: `400` malformed request, `404` unknown id, `409`
+`invalid_state` or `idempotency_key_reused` (for batch items, `details` names the item), `413`
+body over 256 KiB (10 MiB for batches), `415` non-JSON body, `422` validation, `503` timeout.
+SMS segment counting follows carrier packing (an escape sequence or surrogate pair is never split
+across segments).
 
 ## Configuration
 All configuration comes from environment variables, parsed once at start-up. Invalid values
@@ -172,6 +226,8 @@ stop the process with a message listing every problem. Copy [`.env.example`](.en
 | `REDIS_ADDR` | `localhost:6379` | worker | Redis address |
 | `REDIS_PASSWORD` | _(empty)_ | worker | Redis password |
 | `IDEMPOTENCY_TTL` | `72h` | api | How long an `Idempotency-Key` is remembered. Must not exceed `RETENTION_DAYS` |
+| `MAX_SCHEDULE_AHEAD` | `168h` | api | Latest allowed `scheduledAt`. Must be at least one day shorter than `RETENTION_DAYS` |
+| `REQUEST_TIMEOUT` | `10s` | api | Deadline for each API request; exceeded requests return `503 timeout` |
 | `RETENTION_DAYS` | `30` | dispatcher | Daily partitions older than this are dropped |
 | `PARTITION_PREMAKE_DAYS` | `7` | migrate, dispatcher | Partitions kept ready ahead of today |
 | `MAINTENANCE_INTERVAL` | `1h` | dispatcher | How often partition and key maintenance runs |
