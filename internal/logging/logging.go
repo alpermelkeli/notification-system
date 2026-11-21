@@ -1,5 +1,7 @@
 // Package logging builds the structured slog logger and carries the correlation ID through
-// context.Context, so every log line written with a request or job context includes it.
+// context.Context, so every log line written with a request or job context includes it, and the
+// trace and span ids when the context holds a recorded span (B-5), so a log line leads to its
+// trace.
 package logging
 
 import (
@@ -7,10 +9,16 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
-// CorrelationIDKey is the log attribute name of the correlation ID (FR-4.2).
-const CorrelationIDKey = "correlation_id"
+// Log attribute names of the request context (FR-4.2, B-5).
+const (
+	CorrelationIDKey = "correlation_id"
+	TraceIDKey       = "trace_id"
+	SpanIDKey        = "span_id"
+)
 
 type ctxKey struct{}
 
@@ -70,7 +78,7 @@ func parseLevel(s string) slog.Level {
 	}
 }
 
-// contextHandler adds the correlation ID from the record's context.
+// contextHandler adds the correlation ID and the trace context from the record's context.
 type contextHandler struct {
 	slog.Handler
 }
@@ -78,6 +86,9 @@ type contextHandler struct {
 func (h contextHandler) Handle(ctx context.Context, r slog.Record) error {
 	if id := CorrelationID(ctx); id != "" {
 		r.AddAttrs(slog.String(CorrelationIDKey, id))
+	}
+	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() && sc.IsSampled() {
+		r.AddAttrs(slog.String(TraceIDKey, sc.TraceID().String()), slog.String(SpanIDKey, sc.SpanID().String()))
 	}
 	return h.Handler.Handle(ctx, r)
 }

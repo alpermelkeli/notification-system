@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 func decode(t *testing.T, b *bytes.Buffer) map[string]any {
@@ -82,5 +84,25 @@ func TestTextFormat(t *testing.T) {
 	New(&buf, Options{Format: "text"}).Info("hello")
 	if !strings.Contains(buf.String(), "msg=hello") {
 		t.Errorf("unexpected text output: %s", buf.String())
+	}
+}
+
+func TestTraceContextIsLogged(t *testing.T) {
+	traceID, _ := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
+	spanID, _ := trace.SpanIDFromHex("00f067aa0ba902b7")
+	sampled := trace.NewSpanContext(trace.SpanContextConfig{TraceID: traceID, SpanID: spanID, TraceFlags: trace.FlagsSampled})
+
+	var buf bytes.Buffer
+	New(&buf, Options{}).InfoContext(trace.ContextWithSpanContext(context.Background(), sampled), "x")
+	m := decode(t, &buf)
+	if m[TraceIDKey] != traceID.String() || m[SpanIDKey] != spanID.String() {
+		t.Errorf("trace ids = %v/%v", m[TraceIDKey], m[SpanIDKey])
+	}
+
+	buf.Reset()
+	unsampled := sampled.WithTraceFlags(0)
+	New(&buf, Options{}).InfoContext(trace.ContextWithSpanContext(context.Background(), unsampled), "x")
+	if _, ok := decode(t, &buf)[TraceIDKey]; ok {
+		t.Error("an unsampled trace has nothing to look up and must not be logged")
 	}
 }
