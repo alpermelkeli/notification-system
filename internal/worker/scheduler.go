@@ -49,6 +49,8 @@ type record struct {
 	msg           queue.Message
 	correlationID string
 	part          *partition
+	// tokenAt is when the record's rate-limit token was granted.
+	tokenAt time.Time
 }
 
 // item is one fetched work record waiting in a priority buffer.

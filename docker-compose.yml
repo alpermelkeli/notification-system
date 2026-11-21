@@ -143,6 +143,9 @@ services:
   worker:
     <<: *app
     command: ["worker"]
+    # A worker finishes its in-flight sends before exiting; each is bounded by LEASE_DURATION
+    # (30s). A SIGKILL between the provider's accept and the outcome write would send it again.
+    stop_grace_period: 40s
     depends_on:
       migrate: { condition: service_completed_successfully }
       redis: { condition: service_healthy }

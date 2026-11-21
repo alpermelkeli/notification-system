@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,10 +24,11 @@ var discard = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 // fakeStore keeps notifications in memory with the same guards as the real store.
 type fakeStore struct {
-	mu       sync.Mutex
-	rows     map[uuid.UUID]*domain.Notification
-	outcomes map[uuid.UUID]string // "sent", "retrying 5s", "failed"
-	claimErr error
+	mu         sync.Mutex
+	rows       map[uuid.UUID]*domain.Notification
+	outcomes   map[uuid.UUID]string // "sent", "retrying 5s", "failed"
+	claimErr   error
+	claimDelay time.Duration
 }
 
 func newFakeStore() *fakeStore {
@@ -53,6 +55,10 @@ func (f *fakeStore) outcome(id uuid.UUID) string {
 }
 
 func (f *fakeStore) Claim(_ context.Context, id uuid.UUID, _ time.Time, _ time.Duration) (domain.Notification, error) {
+	f.mu.Lock()
+	delay := f.claimDelay
+	f.mu.Unlock()
+	time.Sleep(delay)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.claimErr != nil {
@@ -90,6 +96,10 @@ func (f *fakeStore) MarkRetrying(_ context.Context, l domain.Lease, d time.Durat
 	return f.finish(l, domain.StatusRetrying, "retrying "+d.String())
 }
 
+func (f *fakeStore) Release(_ context.Context, l domain.Lease, _ time.Duration, _ string) (domain.Notification, error) {
+	return f.finish(l, domain.StatusRetrying, "released")
+}
+
 func (f *fakeStore) MarkFailed(_ context.Context, l domain.Lease, _ string) (domain.Notification, error) {
 	return f.finish(l, domain.StatusFailed, "failed")
 }
@@ -122,11 +132,13 @@ func (s *fakeSender) sent() []string {
 type fakeLimiter struct {
 	tokens    chan struct{}
 	err       error
+	waits     atomic.Int64
 	mu        sync.Mutex
 	cooldowns []time.Duration
 }
 
 func (l *fakeLimiter) Wait(ctx context.Context, _ domain.Channel) error {
+	l.waits.Add(1)
 	if l.err != nil {
 		return l.err
 	}
@@ -456,5 +468,31 @@ func TestShutdownFinishesInFlightSends(t *testing.T) {
 	<-stopped
 	if h.store.outcome(n.ID) != "sent m" || h.committedAt(normalTopic, 0) != 1 {
 		t.Errorf("after shutdown: outcome %q, committed %d", h.store.outcome(n.ID), h.committedAt(normalTopic, 0))
+	}
+}
+
+// TestSlowClaimTakesAFreshToken: a token granted before a slow claim is stale; sends whose
+// claims finished together would otherwise reach the provider in a burst above the rate.
+func TestSlowClaimTakesAFreshToken(t *testing.T) {
+	h := newHarness(t, nil, Options{})
+	h.store.claimDelay = 100 * time.Millisecond
+	n := h.store.add(domain.PriorityNormal, domain.StatusQueued, 0)
+	h.feed(t, n, 0)
+	eventually(t, "delivery", func() bool { return h.store.outcome(n.ID) == "sent m" })
+	if w := h.limiter.waits.Load(); w != 2 {
+		t.Errorf("limiter waits = %d, want 2 (before the pick and again after the slow claim)", w)
+	}
+}
+
+func TestHugeRetryAfterIsCapped(t *testing.T) {
+	h := newHarness(t, nil, Options{RetryDelay: time.Second})
+	h.sender.fn = func(provider.Message) (provider.Result, error) {
+		return provider.Result{}, &provider.Error{StatusCode: http.StatusTooManyRequests, RetryAfter: 24 * time.Hour}
+	}
+	n := h.store.add(domain.PriorityNormal, domain.StatusQueued, 0)
+	h.feed(t, n, 0)
+	eventually(t, "outcome", func() bool { return h.store.outcome(n.ID) != "" })
+	if got := h.store.outcome(n.ID); got != "retrying 1m0s" {
+		t.Errorf("outcome %q, want the delay capped at one minute", got)
 	}
 }

@@ -8,7 +8,11 @@ import (
 
 	"github.com/alpermelkeli/notification-system/internal/domain"
 	"github.com/alpermelkeli/notification-system/internal/provider"
+	"github.com/alpermelkeli/notification-system/internal/ratelimit"
 )
+
+// staleToken is how old a token may be when the claim finishes; older tokens are replaced.
+const staleToken = 50 * time.Millisecond
 
 // persistRetries bounds retries of an outcome write that failed because PostgreSQL was
 // unavailable. If all fail, the lease expires and the reaper retries the notification.
@@ -31,6 +35,23 @@ func (w *Worker) process(ctx context.Context, r record) {
 	}
 	lease, _ := n.Lease()
 	log = log.With("attempt", n.Attempts)
+
+	// The token was granted before the claim. If the claim was slow (e.g. it waited for the
+	// dispatcher's commit), sends whose claims finished together would reach the provider in a
+	// burst above the rate, so take a fresh token (ADR-0006).
+	if time.Since(r.tokenAt) > staleToken {
+		if err := w.limiter.Wait(ctx, w.channel); err != nil {
+			// No token, no send. Hand the attempt back; it is retried without consuming it.
+			log.WarnContext(ctx, "no rate-limit token after claim; releasing", "err", err)
+			if err := w.persist(ctx, func() error {
+				_, err := w.store.Release(ctx, lease, w.opts.RetryDelay, "rate limiter unavailable")
+				return err
+			}); err != nil {
+				log.ErrorContext(ctx, "release not persisted; the lease will expire and be retried", "err", err)
+			}
+			return
+		}
+	}
 
 	res, sendErr := w.sender.Send(ctx, provider.Message{
 		IdempotencyKey: n.ID.String(),
@@ -70,7 +91,7 @@ func (w *Worker) retryDelay(ctx context.Context, sendErr error) time.Duration {
 	delay := w.opts.RetryDelay
 	var pe *provider.Error
 	if errors.As(sendErr, &pe) && pe.StatusCode == http.StatusTooManyRequests {
-		cool := pe.RetryAfter
+		cool := min(pe.RetryAfter, ratelimit.MaxCooldown) // a bogus Retry-After must not park the row for days
 		if cool <= 0 {
 			cool = time.Second
 		}

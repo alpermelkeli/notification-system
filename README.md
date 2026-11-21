@@ -268,7 +268,7 @@ stop the process with a message listing every problem. Copy [`.env.example`](.en
 | `WORKER_CONCURRENCY` | `20` | worker | Sends in flight per channel |
 | `PROVIDER_URL` | `http://localhost:8081/` | worker | Delivery provider endpoint, e.g. `https://webhook.site/<uuid>`. Compose defaults to the mock provider |
 | `PROVIDER_TIMEOUT` | `10s` | worker | Timeout of each provider request |
-| `LEASE_DURATION` | `30s` | worker | Claim lifetime; must be at least `PROVIDER_TIMEOUT` + 5s |
+| `LEASE_DURATION` | `30s` | worker | Claim lifetime; must be at least `PROVIDER_TIMEOUT` + 5s. On shutdown a worker finishes in-flight sends, each bounded by the lease, so the worker's compose `stop_grace_period` (40s) must exceed it |
 | `RATE_LIMIT_SMS` / `_EMAIL` / `_PUSH` | `100` | worker | Messages per second per channel, across all workers (FR-2.2) |
 | `RATE_LIMIT_BURST` | `1` | worker | Sends allowed back to back after an idle period; above 1 a second can exceed the limit by `burst - 1` |
 | `RETRY_DELAY` | `5s` | worker | Delay before a failed attempt is retried (exponential backoff in Phase 6) |

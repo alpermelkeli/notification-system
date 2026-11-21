@@ -42,6 +42,11 @@ Phase 6 replaces it with ADR-0005: exponential backoff with jitter, retryable vs
 classification, the DLQ topic and the per-channel circuit breaker (`Release` already exists for
 it).
 
+Also from the Phase 5 review: while PostgreSQL is unavailable, every claim fails fast and its
+record is committed past, so the workers drain the Kafka backlog and recovery waits for the
+reaper (re-publishing in `queued_at` order, not by priority). Phase 6 should back off and retry
+the claim on an unavailability error instead, so the watermark holds.
+
 ## Open questions
 | Phase | Question | Notes |
 |-------|----------|-------|

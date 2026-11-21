@@ -137,6 +137,11 @@ the 100 `high` were done within 1.4 s of submission despite the `low` backlog.
   hash tag, so one script can use both keys. `{provider}` is the host of `PROVIDER_URL`.
 - The cool-down is set with `SET NX PX` plus `PEXPIRE ... GT`, so a shorter `Retry-After` never
   shortens a cool-down already in place.
+- The token is granted before the claim. If the claim took longer than 50 ms (e.g. it waited for
+  the dispatcher's commit), the worker takes a fresh token before sending. Otherwise sends whose
+  claims finished together would reach the provider in a burst of up to `WORKER_CONCURRENCY` per
+  replica above the rate. If no fresh token can be had (Redis down), the claim is released
+  without consuming the attempt.
 - A token can go unused: when a pick finds nothing after the wait (the partition was revoked
   meanwhile), and when a record is skipped as stale. Both are rare and cost only throughput,
   never the limit.

@@ -33,6 +33,7 @@ type Store interface {
 	MarkSent(ctx context.Context, l domain.Lease, providerMessageID string) (domain.Notification, error)
 	MarkRetrying(ctx context.Context, l domain.Lease, delay time.Duration, cause string) (domain.Notification, error)
 	MarkFailed(ctx context.Context, l domain.Lease, cause string) (domain.Notification, error)
+	Release(ctx context.Context, l domain.Lease, delay time.Duration, reason string) (domain.Notification, error)
 }
 
 // Sender delivers a message. *provider.Client implements it.
@@ -123,6 +124,9 @@ type Worker struct {
 
 	tracker  *tracker
 	inFlight sync.WaitGroup
+	// commitMu serialises commits with revocations: a periodic commit computed before a revoke
+	// must not reach the broker after the revoke's commit and rewind the partition's offset.
+	commitMu sync.Mutex
 
 	fetch  fetchControl
 	commit committer
@@ -174,7 +178,9 @@ func (w *Worker) Run(ctx context.Context, cl *kgo.Client) {
 		return commitSync(ctx, cl, offsets)
 	}
 	w.run(ctx, func(ctx context.Context) bool {
-		fetches := cl.PollFetches(ctx)
+		// Bounded polls keep each batch near the high-water mark; a plain PollFetches can return
+		// megabytes of claim-checks per partition.
+		fetches := cl.PollRecords(ctx, w.opts.HighWater)
 		if fetches.IsClientClosed() || ctx.Err() != nil {
 			cl.AllowRebalance()
 			return false
@@ -276,6 +282,7 @@ func (w *Worker) schedule(ctx context.Context) {
 			continue
 		}
 
+		it.rec.tokenAt = time.Now()
 		w.tracker.start(it.rec.part)
 		w.inFlight.Add(1)
 		go func(r record) {
@@ -324,6 +331,13 @@ func (w *Worker) commitLoop(ctx context.Context) {
 
 // commitNow commits the watermarks of the given partitions (all when nil) that moved.
 func (w *Worker) commitNow(ctx context.Context, only map[string][]int32) {
+	w.commitMu.Lock()
+	defer w.commitMu.Unlock()
+	w.commitLocked(ctx, only)
+}
+
+// commitLocked is commitNow for callers holding commitMu.
+func (w *Worker) commitLocked(ctx context.Context, only map[string][]int32) {
 	offsets := w.tracker.committable(only)
 	if len(offsets) == 0 {
 		return
@@ -354,8 +368,10 @@ func (w *Worker) revoke(ctx context.Context, revoked map[string][]int32) {
 	}
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	w.commitNow(cctx, revoked)
+	w.commitMu.Lock()
+	w.commitLocked(cctx, revoked)
 	w.tracker.detach(revoked)
+	w.commitMu.Unlock()
 	w.logger.Info("partitions revoked", "partitions", revoked, "dropped_buffered", dropped)
 }
 
