@@ -55,9 +55,12 @@ Living document. Update phase status as work lands. Time budget ≈ 12h of focus
 
 ## Phase 9 starting point
 Phase 8's review follow-ups on event ordering (`clock_timestamp()`) and browser origins
-(`WS_ALLOWED_ORIGINS`) are done. One remains, not blocking: item keys of a batch sent without a
-batch key are checked after template validation, so their retry fails if the template changed
-incompatibly (ADR-0010).
+(`WS_ALLOWED_ORIGINS`) are done. The remaining one is kept as a documented limitation: item keys
+of a batch sent without a batch key are checked after template validation, so their retry fails
+if the template changed incompatibly (ADR-0010). Fixing it would add a bulk key lookup and a
+"known duplicate" mode to batch creation, on the idempotency path, for a case that needs four
+conditions at once; clients that retry batches send the `Idempotency-Key` header, which already
+covers it.
 
 ## Open questions
 | Phase | Question | Notes |
