@@ -21,6 +21,7 @@ a burst of 1000, priorities, scheduling, templates, retries, a provider outage, 
 | What | Where |
 |------|-------|
 | Playground | http://localhost:8080/playground |
+| Live status demo (WebSocket) | http://localhost:8080/ws-demo |
 | API reference (Swagger UI) | http://localhost:8080/docs |
 | Traces (Jaeger) | http://localhost:16686 |
 | Metrics (Prometheus) | http://localhost:9091 |

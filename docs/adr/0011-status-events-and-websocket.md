@@ -108,7 +108,7 @@ response body that follows may echo the recipient; the REST API shows the full e
   - a ping every 30 s, from its own goroutine, detects dead peers. The reader only reads, so
     pongs are processed even while a request is handled.
 - **Origin:** browsers connect from the API's own origin, the library's default, which serves the
-  playground at `/playground` (see the amendment below). `WS_ALLOWED_ORIGINS` adds origins as host patterns
+  demo page at `/ws-demo` and the playground at `/playground` (see the amendment below). `WS_ALLOWED_ORIGINS` adds origins as host patterns
   (`*.example.com`) or with a scheme (`https://app.example.com`), matched against the origin's
   host and non-default port; `*.example.com` excludes the apex. Patterns that could never match
   (a path, another scheme) or that allow every site (`*`) stop the process. It is needed when a proxy in
@@ -122,7 +122,9 @@ response body that follows may echo the recipient; the REST API shows the full e
   `notifier_ws_messages_total{type}`, `notifier_ws_disconnects_total{reason}` and
   `notifier_ws_events_received_total`.
 
-**Amendment (2026-11-21, Phase 9): the playground replaces `/ws-demo`.**
+**Amendment (2026-11-21, Phase 9): the playground, next to `/ws-demo`.**
+- `/ws-demo`, the demo page of this ADR, stays as it is and is always served. The playground
+  is an extra, off by default.
 - `/playground` draws the pipeline as a map (API, PostgreSQL, dispatcher, the Kafka topics of
   each channel, workers, rate limiters, provider, the failure track) and moves each followed
   notification along it as its status events arrive. A panel narrates each status change of the

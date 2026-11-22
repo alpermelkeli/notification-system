@@ -130,6 +130,11 @@ func (h *Handler) Routes(r chi.Router) {
 		w.Header().Set("Content-Security-Policy", docsCSP)
 		_, _ = w.Write([]byte(swaggerUI))
 	})
+	r.Get("/ws-demo", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Content-Security-Policy", demoCSP)
+		_, _ = w.Write([]byte(demoPage))
+	})
 }
 
 // v1Routes mounts the request/response endpoints of /v1.

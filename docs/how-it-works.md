@@ -75,6 +75,7 @@ See [ADR-0011](adr/0011-status-events-and-websocket.md) for the design.
 - **Protocol:** a client opens `GET /v1/ws` and subscribes to notification ids and batch ids. It
   first gets the current state (a snapshot), then every change. Updates may arrive out of order,
   so clients keep the latest `at` per notification.
+- **Demo page:** http://localhost:8080/ws-demo sends a notification and follows it live. It is always served.
 - **Playground:** http://localhost:8080/playground draws the pipeline, moves each notification along it live and runs scenarios against the system (compose enables it with `DEMO_ENABLED`).
 
 ```bash

@@ -60,7 +60,7 @@ internal/app/          role wiring (RunAPI, RunDispatcher, RunWorker, RunMigrate
 internal/domain/       channels, priorities, status state machine, templates, UUIDv7 ids, domain errors (no I/O)
 internal/storage/      PostgreSQL repository: create/batch/idempotency, guarded transitions, list, partitions
 migrations/            goose SQL migrations, embedded (forward-only, never edited after merge)
-internal/api/          v1 HTTP handlers, templates, request validation, error mapping, Swagger UI (/docs)
+internal/api/          v1 HTTP handlers, templates, request validation, error mapping, Swagger UI (/docs), /ws-demo
 api/                   openapi.yaml (spec-first contract, Redocly-linted) embedded as package apispec
 internal/config/       env -> typed Config (all errors reported at once)
 internal/logging/      slog JSON logger; correlation ID carried in context.Context, trace/span ids added from it
