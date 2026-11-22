@@ -191,6 +191,10 @@ above): 30 000 `low` notifications, 10 000 per channel, in 30 batches of 1000, 4
 | `high`, no backlog, p50 / p99 (§10) | ≈ 300 ms / < 1 s | 145–170 / 210–385 ms | 160–176 / 200–230 ms |
 | `high` right behind the burst, p99 (§1, §10) | < 1 s | 240–310 ms | 260–300 ms |
 
+Both setups ran on the same machine, sharing its CPUs, the single PostgreSQL and the single Kafka.
+Delivery is capped by the shared rate limit, so extra replicas add fault tolerance, not speed;
+on one machine they only add contention, which is why the three-replica column is slightly slower.
+
 - **Dispatcher.** Measured as the burst size over the time from the first batch request to the
   last `queued_at`. That time includes the ingestion, which the dispatcher cannot outrun, so the
   figure is a lower bound of its rate.
