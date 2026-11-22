@@ -103,14 +103,6 @@ func (w *Worker) process(runCtx context.Context, r record, adm admission) bool {
 	base := context.WithoutCancel(runCtx)
 	log = log.With("attempt", n.Attempts)
 
-	// The breaker admitted this send before the claim. If it stopped admitting since (sends in
-	// flight failed), do not add to the provider's trouble: hand the attempt back (ADR-0005).
-	if w.circuit.revoked(adm) {
-		log.InfoContext(runCtx, "circuit breaker opened after the claim; releasing")
-		w.finish(span, w.release(base, log, c, w.circuit.timeout, "circuit breaker open"), nil)
-		return true
-	}
-
 	sendDeadline := c.leaseEnd.Add(-outcomeReserve)
 	// The token was granted before the claim. If the claim was slow (e.g. it waited for the
 	// dispatcher's commit), sends whose claims finished together would reach the provider in a
@@ -130,6 +122,15 @@ func (w *Worker) process(runCtx context.Context, r record, adm admission) bool {
 	}
 	// Leave at the token's fixed offset, so the time the claim took does not bunch the sends.
 	time.Sleep(time.Until(tokenAt.Add(sendOffset)))
+
+	// The breaker admitted this send before the claim. If it stopped admitting since (sends in
+	// flight failed), do not add to the provider's trouble: hand the attempt back (ADR-0005).
+	// Checked last, after the claim, any fresh token and the offset.
+	if w.circuit.revoked(adm) {
+		log.InfoContext(runCtx, "circuit breaker opened after the claim; releasing")
+		w.finish(span, w.release(base, log, c, w.circuit.timeout, "circuit breaker open"), nil)
+		return true
+	}
 
 	sctx, cancel := context.WithDeadline(base, sendDeadline)
 	sent := time.Now()
