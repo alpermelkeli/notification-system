@@ -41,7 +41,7 @@ observability, the data model and scaling. The decisions themselves are in the [
   re-published, however long it waits. Rows queued for more than 24 h fall back to `pending`.
 - **Worker** ([`internal/worker`](../internal/worker)): one consumer group member per channel. Records
   are routed into one min-heap per priority (pausing a topic when its heap is full). For each send
-  the worker waits for a free sender (20 per channel), then for a rate-limit slot, and only then
+  the worker waits for a free sender (32 per channel), then for a rate-limit slot, and only then
   picks the head with the highest *capped-aging* score. It claims the row (the claim waits on the
   dispatcher's row lock if the record arrived before its commit), calls the provider with the
   notification id as `Idempotency-Key`, and persists the outcome. Offsets are committed per
@@ -51,9 +51,10 @@ observability, the data model and scaling. The decisions themselves are in the [
   fixed 50 ms after its slot, so the claim in between, which takes a variable time, cannot bunch
   sends at the provider. A `429` sets a fleet-wide cool-down. If Redis is down nothing is sent
   (fail closed).
-- Measured on the compose stack (1000 `low` SMS, then 100 `high`): all 1100 sent in 11.1 s with one
-  worker and 11.4 s with three (the floor at 100/s is 11.0 s). The provider never saw more than 100
-  SMS in a second, and the 100 `high` were delivered within 1.4 s despite the backlog.
+- Measured with the load test (`make loadtest`, 10 000 `low` per channel, then 30 `high` SMS
+  behind them): each channel drains at 99/s with one worker or three, the provider sees at most
+  100 requests in a second (101–102 now and then, from jitter between token and arrival), and the `high` ones are sent
+  within p99 260 ms despite the backlog. Details in the [capacity plan](capacity-planning.md#measured).
 - **Delivery outcome** ([ADR-0005](adr/0005-delivery-retry-and-failure-handling.md)):
   `2xx` is `sent`. Timeouts, connection errors, `5xx`, `408` and `425` are retried with exponential
   backoff and equal jitter (`RETRY_BASE_DELAY` doubling up to `RETRY_MAX_DELAY`). A `429` pauses the

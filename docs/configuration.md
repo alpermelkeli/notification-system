@@ -66,7 +66,7 @@ stop the process with a message listing every problem. Copy [`.env.example`](../
 | `REAPER_GRACE` | `1m` | dispatcher | `queued` rows younger than this are never requeued |
 | `REAPER_STUCK_AFTER` | `24h` | dispatcher | Age fallback for `queued` rows the offset rule cannot judge |
 | `WORKER_CHANNELS` | `sms,email,push` | worker | Channels this process delivers (one consumer group member each) |
-| `WORKER_CONCURRENCY` | `20` | worker | Sends in flight per channel |
+| `WORKER_CONCURRENCY` | `32` | worker | Sends in flight per channel; size it as rate × (50 ms send offset + provider latency + claim) |
 | `PROVIDER_URL` | `http://localhost:8081/` | worker | Delivery provider endpoint, e.g. `https://webhook.site/<uuid>`. Compose defaults to the mock provider |
 | `PROVIDER_TIMEOUT` | `10s` | worker | Timeout of each provider request |
 | `LEASE_DURATION` | `30s` | worker | Claim lifetime; must be at least `PROVIDER_TIMEOUT` + 15s (up to 5s for the claim, 2s for a fresh rate-limit token, 5s reserved for writing the outcome). On shutdown a worker finishes in-flight sends, each bounded by the lease, so the worker's compose `stop_grace_period` (40s) must exceed it |
