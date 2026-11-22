@@ -13,7 +13,7 @@ Living document. Update phase status as work lands. Time budget ≈ 12h of focus
 | 6 | Delivery & retry: backoff, classification, DLQ, circuit breaker | done |
 | 7 | Observability: metrics endpoint, correlation IDs, tracing | done |
 | 8 | Bonus: scheduling, templates, WebSocket | done |
-| 9 | Hardening: integration/e2e tests, load test vs capacity-planning numbers, `--scale` demo, README polish, final review | next |
+| 9 | Hardening: integration/e2e tests, load test vs capacity-planning numbers, `--scale` demo, README polish, final review | done |
 
 ## Resolved decisions (Phase 1)
 | Question | Decision | ADR |
@@ -52,6 +52,10 @@ Living document. Update phase status as work lands. Time budget ≈ 12h of focus
 - Load test (`make loadtest`) with measured values in `docs/capacity-planning.md`, run on one
   and on three API and worker replicas, including a worker stopped mid-drain. It led to the two
   amendments above.
+- Final review: reviewer findings fixed (breaker checked right before the send, token time taken
+  on grant, `WORKER_CONCURRENCY` default 32, the load test proves it reaches the mock provider);
+  a fresh `docker compose up --build` on new volumes passes the smoke checks and a short load
+  test.
 
 ## Phase 9 starting point
 Phase 8's review follow-ups on event ordering (`clock_timestamp()`) and browser origins

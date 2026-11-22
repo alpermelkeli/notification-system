@@ -64,9 +64,9 @@ Left open by the brief ("thinking and design by candidate"). Our design must be 
 ## Deliverables
 | ID | Deliverable | Status |
 |----|-------------|--------|
-| D-1 | Repo with **clean commit history** | [~] |
-| D-2 | README: setup, architecture overview, API examples | [~] |
-| D-3 | `docker-compose up` one-command setup | [~] |
+| D-1 | Repo with **clean commit history** | [x] |
+| D-2 | README: setup, architecture overview, API examples | [x] |
+| D-3 | `docker-compose up` one-command setup | [x] |
 | D-4 | Swagger / OpenAPI spec | [x] |
 | D-5 | Versioned DB migrations | [x] |
 | D-6 | Test suite runnable with a single command | [x] |
