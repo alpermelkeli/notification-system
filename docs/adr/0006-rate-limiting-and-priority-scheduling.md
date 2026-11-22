@@ -66,8 +66,9 @@ Kafka batch fetch → route by topic → priority heaps → aging scheduler → 
 ```
 - Kafka distributes work. Partition counts (6/6/3) size **throughput and parallelism only**;
   they are not a priority mechanism.
-- The application scheduler inside each worker is the **only** place where priority is
-  enforced. The dispatcher publishes due rows in FIFO order (ADR-0003).
+- The application scheduler inside each worker is where priority is enforced between records
+  waiting to be sent. The dispatcher publishes due rows in FIFO order (ADR-0003); since Phase 9
+  it takes due `high` rows first, so they do not wait behind a burst (ADR-0003 amendment).
 
 **Priority scheduling: capped aging (per channel, inside each worker)**
 - Fetched batches are routed by topic into one buffer per priority (high-water mark 50
@@ -103,7 +104,8 @@ Kafka batch fetch → route by topic → priority heaps → aging scheduler → 
   handled by the retry mechanism itself (out-of-band backoff with jitter, circuit breaker, fleet
   cool-down on `429`; ADR-0005), not by the scheduler.
 - Picked records go to a bounded sender pool (default 20 goroutines per channel), sized for
-  provider latency: 100 msg/s × ~200 ms ≈ 20 in flight. When a send completes, its offset is
+  provider latency: 100 msg/s × ~200 ms ≈ 20 in flight. (Phase 9: 32, because a sender is also
+  held for the 50 ms send offset; see the last amendment.) When a send completes, its offset is
   marked in the partition watermark tracker (ADR-0002).
 - All weights, caps, the aging rate and the minimum share are configurable via env.
 
@@ -138,13 +140,34 @@ the 100 `high` were done within 1.4 s of submission despite the `low` backlog.
 - The cool-down is set with `SET NX PX` plus `PEXPIRE ... GT`, so a shorter `Retry-After` never
   shortens a cool-down already in place.
 - The token is granted before the claim. If the claim took longer than 50 ms (e.g. it waited for
-  the dispatcher's commit), the worker takes a fresh token before sending. Otherwise sends whose
+  the dispatcher's commit), the worker takes a fresh token before sending. Since Phase 9 every
+  send also leaves a fixed 50 ms after its token (see the amendment below). Otherwise sends whose
   claims finished together would reach the provider in a burst of up to `WORKER_CONCURRENCY` per
   replica above the rate. If no fresh token can be had (Redis down), the claim is released
   without consuming the attempt.
 - A token can go unused: when a pick finds nothing after the wait (the partition was revoked
   meanwhile), and when a record is skipped as stale. Both are rare and cost only throughput,
   never the limit.
+
+**Amendment (2026-11-22, Phase 9): sends leave at a fixed offset after their token.**
+
+*Measurement.* The load test (`make loadtest`: 30 000 notifications, 10 000 per channel) counts
+the requests the mock provider receives in each wall-clock second. The limiter granted 100
+tokens per second (the burst drained at 99/s), but the busiest second at the provider held 102
+to 103 requests per channel. The claim sits between the token and the send and takes anywhere
+from a few to 50 ms, so sends left unevenly and a few slid into the neighbouring second.
+
+*Decision.* A send leaves exactly 50 ms (`sendOffset`) after its token: the worker sleeps for
+whatever the claim did not use. A claim that takes longer still gets a fresh token, which then
+gets the same offset. Sends now leave as evenly spaced as the tokens.
+
+*Result.* The busiest second dropped to 100 for most channels and runs, and 101 in a few (a
+few milliseconds of jitter on the HTTP path, with slots exactly 10 ms apart). The load test
+reports 101 as a warning rather than hiding it; a provider that enforces a strict per-second
+window could answer one 429 now and then, which the fleet cool-down handles. Every send gets
+up to 50 ms more latency (high priority with no backlog: p50 113 ms before, 160 ms after), and a
+sender is held 50 ms longer, so the default `WORKER_CONCURRENCY` rose from 20 to 32
+(100/s × (0.05 + 0.2 + ~0.01) s ≈ 26 in flight for a 200 ms provider).
 
 ## Consequences
 - ✅ 100 msg/s per channel holds regardless of the number of worker replicas.

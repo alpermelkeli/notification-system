@@ -178,12 +178,14 @@ func (d *fakeDeadLetters) ids() []uuid.UUID {
 type fakeSender struct {
 	mu    sync.Mutex
 	order []string
+	at    []time.Time
 	fn    func(provider.Message) (provider.Result, error)
 }
 
 func (s *fakeSender) Send(_ context.Context, m provider.Message) (provider.Result, error) {
 	s.mu.Lock()
 	s.order = append(s.order, m.CorrelationID)
+	s.at = append(s.at, time.Now())
 	fn := s.fn
 	s.mu.Unlock()
 	if fn != nil {
@@ -205,6 +207,7 @@ type fakeLimiter struct {
 	waits     atomic.Int64
 	mu        sync.Mutex
 	cooldowns []time.Duration
+	granted   []time.Time
 }
 
 func (l *fakeLimiter) Wait(ctx context.Context, _ domain.Channel) error {
@@ -212,15 +215,23 @@ func (l *fakeLimiter) Wait(ctx context.Context, _ domain.Channel) error {
 	if l.err != nil {
 		return l.err
 	}
-	if l.tokens == nil {
-		return nil
+	if l.tokens != nil {
+		select {
+		case <-l.tokens:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
-	select {
-	case <-l.tokens:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	l.mu.Lock()
+	l.granted = append(l.granted, time.Now())
+	l.mu.Unlock()
+	return nil
+}
+
+func (l *fakeLimiter) grants() []time.Time {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.granted)
 }
 
 func (l *fakeLimiter) Cooldown(_ context.Context, _ domain.Channel, d time.Duration) error {
@@ -550,6 +561,45 @@ func TestFailedOutcomeWhoseAnswerWasLostIsDeadLettered(t *testing.T) {
 	eventually(t, "dead letter", func() bool { return len(h.dead.ids()) == 1 })
 	if got := h.store.outcome(n.ID); got != "failed" {
 		t.Errorf("outcome %q", got)
+	}
+}
+
+// TestSendLeavesAtTheOffsetAfterItsToken: a fast claim does not send early; the send waits until
+// sendOffset after the token, so claim times do not bunch sends (ADR-0006).
+func TestSendLeavesAtTheOffsetAfterItsToken(t *testing.T) {
+	lim := &fakeLimiter{}
+	h := newHarness(t, lim, Options{})
+	h.feed(t, h.store.add(domain.PriorityNormal, domain.StatusQueued, 0), 0)
+	eventually(t, "sent", func() bool { return len(h.sender.sent()) == 1 })
+	grants := lim.grants()
+	h.sender.mu.Lock()
+	sentAt := h.sender.at[0]
+	h.sender.mu.Unlock()
+	if len(grants) != 1 {
+		t.Fatalf("%d tokens taken, want 1", len(grants))
+	}
+	if d := sentAt.Sub(grants[0]); d < sendOffset {
+		t.Errorf("sent %v after the token, want at least %v", d, sendOffset)
+	}
+}
+
+// TestSlowClaimSendsAtTheOffsetAfterAFreshToken: a claim slower than the offset takes a fresh
+// token, and the send then waits for the offset after that one.
+func TestSlowClaimSendsAtTheOffsetAfterAFreshToken(t *testing.T) {
+	lim := &fakeLimiter{}
+	h := newHarness(t, lim, Options{})
+	h.store.claimDelay = 2 * sendOffset
+	h.feed(t, h.store.add(domain.PriorityNormal, domain.StatusQueued, 0), 0)
+	eventually(t, "sent", func() bool { return len(h.sender.sent()) == 1 })
+	grants := lim.grants()
+	h.sender.mu.Lock()
+	sentAt := h.sender.at[0]
+	h.sender.mu.Unlock()
+	if len(grants) != 2 {
+		t.Fatalf("%d tokens taken, want 2 (one before the claim, a fresh one after it)", len(grants))
+	}
+	if d := sentAt.Sub(grants[1]); d < sendOffset {
+		t.Errorf("sent %v after the fresh token, want at least %v", d, sendOffset)
 	}
 }
 

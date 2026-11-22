@@ -51,6 +51,10 @@ cover: ## Run tests with coverage and print the summary
 	go test -race -count=1 -coverprofile=coverage.out ./...
 	go tool cover -func=coverage.out | tail -1
 
+.PHONY: loadtest
+loadtest: ## Load-test the running stack against docs/capacity-planning.md (needs `make up`)
+	go run ./cmd/loadtest
+
 .PHONY: lint
 lint: ## Run golangci-lint
 	golangci-lint run ./...

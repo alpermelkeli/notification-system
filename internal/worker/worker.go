@@ -317,7 +317,9 @@ func (w *Worker) schedule(ctx context.Context) {
 			sleep(ctx, breakerPoll)
 			continue
 		}
-		if err := w.limiter.Wait(ctx, w.channel); err != nil {
+		err = w.limiter.Wait(ctx, w.channel)
+		granted := time.Now() // before the lock, so contention does not shift the send offset
+		if err != nil {
 			adm.done(errNotAttempted)
 			<-slots
 			if ctx.Err() != nil {
@@ -341,7 +343,7 @@ func (w *Worker) schedule(ctx context.Context) {
 			continue
 		}
 
-		it.rec.tokenAt = time.Now()
+		it.rec.tokenAt = granted
 		w.opts.Metrics.Picked(w.channel, pr, it.rec.tokenAt.Sub(it.dueAt))
 		w.tracker.start(it.rec.part)
 		w.inFlight.Add(1)

@@ -1,8 +1,8 @@
 # Capacity planning
 
 Back-of-the-envelope estimates that justify the architecture (ADR-0001) and the scaling
-strategy (ADR-0008). Numbers are deliberately rounded. They will be checked against a load test
-in Phase 9, and measured values will be added next to them.
+strategy (ADR-0008). Numbers are deliberately rounded. The load test (`make loadtest`) checked
+them in Phase 9; the results are under [Measured](#measured).
 
 ## 1. The throughput ceiling is set by the provider, not by us
 
@@ -120,12 +120,14 @@ A 3-broker cluster with modest disks (≥ 500 GB each) has ample headroom. Parti
 ## 6. Worker concurrency (Little's law)
 
 ```
-in-flight requests = arrival rate × latency
-                   = 100 msg/s × 0.2 s (p50 provider latency)  = 20
-                   = 100 msg/s × 1.0 s (p99 provider latency)  = 100
+in-flight sends = arrival rate × time a sender is held
+                = 100 msg/s × (0.05 s send offset + 0.2 s p50 provider + ~0.01 s claim/write) ≈ 26
+                = 100 msg/s × (0.05 s + 1.0 s p99 provider + ~0.01 s)                        ≈ 106
 ```
-- The default sender pool is 20 per channel (ADR-0006). Size it as `rate × p99 latency` for a
-  slow provider. It is configurable.
+- A sender is held from the claim to the outcome write, including the fixed 50 ms between the
+  rate-limit token and the send (ADR-0006, Phase 9 amendment). The default pool is 32 per
+  channel, some headroom over 26. Size it for p99 latency for a slow provider; it is
+  configurable (`WORKER_CONCURRENCY`).
 - One worker replica per channel can sustain the full 100 msg/s. Extra replicas add **fault
   tolerance**, not throughput.
 
@@ -172,3 +174,39 @@ This is far above the delivery ceiling. Run 2 instances for availability, not fo
 | Scheduler + rate-limit token | ≤ 10 ms |
 | Provider call | ~200 ms (p50) |
 | **End-to-end** | **≈ 300 ms p50, target < 1 s p99** |
+
+## Measured
+
+`make loadtest` ([Testing](testing.md#load-test)) on a laptop (Apple Silicon, Docker Desktop),
+against the compose stack and the mock provider (50–150 ms latency instead of the 200 ms assumed
+above): 30 000 `low` notifications, 10 000 per channel, in 30 batches of 1000, 4 at a time.
+
+| Estimate | Planned | Measured: 1 API, 1 worker | Measured: 3 APIs, 3 workers |
+|----------|---------|---------------------------|-----------------------------|
+| Ingestion (§2) | ≥ 5 000/s | 27 000–40 000/s | 20 000–27 000/s |
+| Dispatcher (§8, 2 instances), lower bound | 10 000–25 000 rows/s | ≥ 14 000–21 000 rows/s | ≥ 10 000–14 000 rows/s |
+| Delivery per channel (§1) | 100/s | 98.5–99.9/s | 97.5–99.6/s |
+| Busiest second at the provider | ≤ 100 | 100–101 | 100–101 |
+| Drain of 10 000 per channel (§1) | 100 s | 101–102 s | 101–103 s |
+| `high`, no backlog, p50 / p99 (§10) | ≈ 300 ms / < 1 s | 145–170 / 210–385 ms | 160–176 / 200–230 ms |
+| `high` right behind the burst, p99 (§1, §10) | < 1 s | 240–310 ms | 260–300 ms |
+
+Both setups ran on the same machine, sharing its CPUs, the single PostgreSQL and the single Kafka.
+Delivery is capped by the shared rate limit, so extra replicas add fault tolerance, not speed;
+on one machine they only add contention, which is why the three-replica column is slightly slower.
+
+- **Dispatcher.** Measured as the burst size over the time from the first batch request to the
+  last `queued_at`. That time includes the ingestion, which the dispatcher cannot outrun, so the
+  figure is a lower bound of its rate.
+- **Rate limit.** The first run showed 102–103 requests in one second at the provider while the
+  limiter granted exactly 100 per second; the variable claim time between token and send bunched
+  the sends. Sends now leave at a fixed offset after their token ([ADR-0006](adr/0006-rate-limiting-and-priority-scheduling.md),
+  Phase 9 amendment). A second at 101 remains now and then (jitter on the HTTP path).
+- **Scaling.** Three workers deliver no faster than one (§6): extra replicas add fault
+  tolerance. With one of three workers stopped 45 s into the drain, every notification was still
+  sent, the rate stayed at the limit and the drain took the same 102 s.
+- **`high` behind a burst.** The API accepts a burst faster than the dispatcher publishes it.
+  In FIFO order a `high` notification created right after the burst waited behind it: p99 670–850
+  ms with one worker and 1.1–1.6 s with three, almost all of it `pending`. The dispatcher now
+  takes due `high` rows first ([ADR-0003](adr/0003-dispatch-without-separate-outbox.md), Phase 9
+  amendment), which brought it to the values in the table.

@@ -255,11 +255,34 @@ type KafkaPosition struct {
 // landed. It returns only after every record is acknowledged.
 type PublishFunc func(context.Context, []domain.Notification) ([]KafkaPosition, error)
 
+// selectDue locks up to limit due rows matching the constant condition cond, in next_attempt_at
+// order.
+func selectDue(ctx context.Context, tx pgx.Tx, cond string, statuses []string, limit int) ([]domain.Notification, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT `+columns("")+` FROM notifications
+		 WHERE status = ANY($1) AND next_attempt_at <= now() AND `+cond+`
+		 ORDER BY next_attempt_at
+		 LIMIT $2
+		   FOR UPDATE SKIP LOCKED`, statuses, limit)
+	if err != nil {
+		return nil, fmt.Errorf("select due: %w", err)
+	}
+	due, err := collectNotifications(rows)
+	if err != nil {
+		return nil, fmt.Errorf("scan due: %w", err)
+	}
+	return due, nil
+}
+
 // DispatchDue implements one dispatcher iteration (ADR-0003). It locks up to limit due
-// notifications in next_attempt_at order (FIFO, skipping rows locked by other dispatchers),
-// passes them to publish while holding the locks, and marks them queued, with their Kafka
-// positions, only if publish succeeds. If publish fails, the transaction rolls back and the rows
-// stay due.
+// notifications, skipping rows locked by other dispatchers: due `high` rows first, then the rest,
+// each in next_attempt_at order (FIFO). It passes them to publish while holding the locks, and
+// marks them queued, with their Kafka positions, only if publish succeeds. If publish fails, the
+// transaction rolls back and the rows stay due.
+//
+// Taking `high` first keeps a high-priority notification from waiting behind a burst that the
+// API accepted faster than the dispatcher publishes. Publishing is not rate-limited, so the other
+// rows wait at most for the `high` rows due at the same time.
 //
 // A crash between a successful publish and the commit re-publishes the rows later; workers
 // discard the duplicates through the guarded claim (ADR-0004). It returns the rows as queued.
@@ -270,18 +293,18 @@ func (s *Store) DispatchDue(ctx context.Context, limit int, publish PublishFunc)
 	}
 	var queued []domain.Notification
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `
-			SELECT `+columns("")+` FROM notifications
-			 WHERE status = ANY($1) AND next_attempt_at <= now()
-			 ORDER BY next_attempt_at
-			 LIMIT $2
-			   FOR UPDATE SKIP LOCKED`, statusStrings(t.from), limit)
+		// Two statements, because FOR UPDATE cannot be combined with UNION. Each uses its own
+		// partial index (notifications_due_high_idx, notifications_due_idx).
+		due, err := selectDue(ctx, tx, `priority = 'high'`, statusStrings(t.from), limit)
 		if err != nil {
-			return fmt.Errorf("select due: %w", err)
+			return err
 		}
-		due, err := collectNotifications(rows)
-		if err != nil {
-			return fmt.Errorf("scan due: %w", err)
+		if rest := limit - len(due); rest > 0 {
+			more, err := selectDue(ctx, tx, `priority <> 'high'`, statusStrings(t.from), rest)
+			if err != nil {
+				return err
+			}
+			due = append(due, more...)
 		}
 		if len(due) == 0 {
 			return nil
@@ -303,7 +326,7 @@ func (s *Store) DispatchDue(ctx context.Context, limit int, publish PublishFunc)
 			ids[i], createdAts[i], prev[i] = d.ID, d.CreatedAt, string(d.Status)
 			partitions[i], offsets[i] = positions[i].Partition, positions[i].Offset
 		}
-		rows, err = tx.Query(ctx, `
+		rows, err := tx.Query(ctx, `
 WITH b AS (
     SELECT * FROM unnest($1::uuid[], $2::timestamptz[], $3::text[], $4::integer[], $5::bigint[])
         AS b(id, created_at, prev_status, kafka_partition, kafka_offset)

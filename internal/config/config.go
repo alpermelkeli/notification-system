@@ -219,7 +219,7 @@ func load(lookup lookupFunc) (Config, error) {
 		},
 		Worker: Worker{
 			Channels:        p.channels("WORKER_CHANNELS"),
-			Concurrency:     p.integer("WORKER_CONCURRENCY", 20, 1, 1000),
+			Concurrency:     p.integer("WORKER_CONCURRENCY", 32, 1, 1000),
 			ProviderURL:     p.url("PROVIDER_URL", "http://localhost:8081/"),
 			ProviderTimeout: p.duration("PROVIDER_TIMEOUT", 10*time.Second),
 			Lease:           p.duration("LEASE_DURATION", 30*time.Second),

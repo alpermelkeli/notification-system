@@ -22,8 +22,11 @@ import (
 	"github.com/alpermelkeli/notification-system/internal/telemetry"
 )
 
-// staleToken is how old a token may be when the claim finishes; older tokens are replaced.
-const staleToken = 50 * time.Millisecond
+// sendOffset is how long after its rate-limit token a send leaves. The claim sits between the two
+// and takes a variable time; sending at a fixed offset keeps the sends as evenly spaced as the
+// tokens, so no wall-clock second at the provider holds more than the rate (ADR-0006). A token
+// older than this when the claim finishes is replaced.
+const sendOffset = 50 * time.Millisecond
 
 // Claim retry while PostgreSQL is unavailable: each try is bounded by claimTimeout, and the waits
 // double from claimBackoffMin to claimBackoffMax.
@@ -100,19 +103,12 @@ func (w *Worker) process(runCtx context.Context, r record, adm admission) bool {
 	base := context.WithoutCancel(runCtx)
 	log = log.With("attempt", n.Attempts)
 
-	// The breaker admitted this send before the claim. If it stopped admitting since (sends in
-	// flight failed), do not add to the provider's trouble: hand the attempt back (ADR-0005).
-	if w.circuit.revoked(adm) {
-		log.InfoContext(runCtx, "circuit breaker opened after the claim; releasing")
-		w.finish(span, w.release(base, log, c, w.circuit.timeout, "circuit breaker open"), nil)
-		return true
-	}
-
 	sendDeadline := c.leaseEnd.Add(-outcomeReserve)
 	// The token was granted before the claim. If the claim was slow (e.g. it waited for the
 	// dispatcher's commit), sends whose claims finished together would reach the provider in a
 	// burst above the rate, so take a fresh token (ADR-0006).
-	if time.Since(r.tokenAt) > staleToken {
+	tokenAt := r.tokenAt
+	if time.Since(tokenAt) > sendOffset {
 		wctx, cancel := context.WithTimeout(base, min(tokenWaitMax, time.Until(sendDeadline)))
 		err := w.limiter.Wait(wctx, w.channel)
 		cancel()
@@ -122,6 +118,18 @@ func (w *Worker) process(runCtx context.Context, r record, adm admission) bool {
 			w.finish(span, w.release(base, log, c, w.opts.Retry.BaseDelay, "no rate-limit token"), nil)
 			return true
 		}
+		tokenAt = time.Now()
+	}
+	// Leave at the token's fixed offset, so the time the claim took does not bunch the sends.
+	time.Sleep(time.Until(tokenAt.Add(sendOffset)))
+
+	// The breaker admitted this send before the claim. If it stopped admitting since (sends in
+	// flight failed), do not add to the provider's trouble: hand the attempt back (ADR-0005).
+	// Checked last, after the claim, any fresh token and the offset.
+	if w.circuit.revoked(adm) {
+		log.InfoContext(runCtx, "circuit breaker opened after the claim; releasing")
+		w.finish(span, w.release(base, log, c, w.circuit.timeout, "circuit breaker open"), nil)
+		return true
 	}
 
 	sctx, cancel := context.WithDeadline(base, sendDeadline)

@@ -26,7 +26,7 @@ teams and API consumers.
 |----|-------------|--------|-------|
 | FR-2.1 | Async processing via queue workers | [x] | `internal/dispatcher` (relay, reaper), `internal/worker`, `internal/integration` |
 | FR-2.2 | Rate limit: max **100 msg/s per channel** | [x] | `internal/ratelimit` (reserving GCRA in Redis, shared by all workers), measured in compose |
-| FR-2.3 | Priority queues: high / normal / low | [x] | 9 channel × priority topics, `internal/worker/scheduler.go` (capped aging + minimum share) |
+| FR-2.3 | Priority queues: high / normal / low | [x] | 9 channel × priority topics, `internal/worker/scheduler.go` (capped aging + minimum share), due `high` dispatched first (`DispatchDue` in `internal/storage/transitions.go`) |
 | FR-2.4 | Content validation (char limits, required fields) | [x] | `internal/domain/validate.go` (per-channel rules), `internal/api/request.go` |
 | FR-2.5 | Idempotency — no duplicate sends | [x] | `Idempotency-Key` in `internal/api`, `internal/storage/idempotency.go`, guarded + fenced `Claim`, provider `Idempotency-Key` header (`internal/provider`) |
 
@@ -64,9 +64,9 @@ Left open by the brief ("thinking and design by candidate"). Our design must be 
 ## Deliverables
 | ID | Deliverable | Status |
 |----|-------------|--------|
-| D-1 | Repo with **clean commit history** | [~] |
-| D-2 | README: setup, architecture overview, API examples | [~] |
-| D-3 | `docker-compose up` one-command setup | [~] |
+| D-1 | Repo with **clean commit history** | [x] |
+| D-2 | README: setup, architecture overview, API examples | [x] |
+| D-3 | `docker-compose up` one-command setup | [x] |
 | D-4 | Swagger / OpenAPI spec | [x] |
 | D-5 | Versioned DB migrations | [x] |
 | D-6 | Test suite runnable with a single command | [x] |

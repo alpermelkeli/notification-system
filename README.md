@@ -105,6 +105,7 @@ Go 1.26+ is needed only for local development.
 make test        # all tests with the race detector (integration tests start containers)
 make test-short  # unit tests only, no Docker
 make lint        # golangci-lint
+make loadtest    # 30 000 notifications against the running stack, checked against the capacity plan
 make help        # every target: run a single role, infrastructure only, logs, ...
 ```
 
