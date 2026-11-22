@@ -1,6 +1,6 @@
 # Requirements & Traceability
 
-Source: Insider One — Software Engineer Assessment 2026, "Event-Driven Notification System"
+Source: Software Engineer Assessment 2026, "Event-Driven Notification System"
 (original PDF lives at `docs/assesment.pdf`, git-ignored). Language: **Go 1.2x**. Budget: ~12h.
 
 Status legend: `[ ]` todo · `[~]` in progress · `[x]` done. Keep the "Where" column pointing at code/tests.

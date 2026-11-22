@@ -1,10 +1,27 @@
-# Notification System
+<h1 align="center">Notification System</h1>
 
-A notification service in Go. Other teams send it SMS, email and push notifications over HTTP; it
-queues them, sends them through a provider at no more than 100 messages per second per channel,
-retries the ones that fail, and reports every status change live.
+<p align="center">
+  An event-driven SMS, email and push notification service in Go: it accepts bursts over HTTP,
+  delivers at 100 messages per second per channel, retries what fails and streams every status
+  change live.
+</p>
 
-Built for the Insider One "Event-Driven Notification System" assessment.
+<p align="center">
+  <a href="https://github.com/alpermelkeli/notification-system/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/alpermelkeli/notification-system/actions/workflows/ci.yml/badge.svg?branch=main"></a>
+  <a href="go.mod"><img alt="Go 1.26" src="https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white"></a>
+  <a href="docs/adr/0001-architecture-overview.md"><img alt="PostgreSQL 17" src="https://img.shields.io/badge/PostgreSQL-17-4169E1?logo=postgresql&logoColor=white"></a>
+  <a href="docs/adr/0002-kafka-topology-and-consumer-model.md"><img alt="Kafka 4.1" src="https://img.shields.io/badge/Kafka-4.1-231F20?logo=apachekafka&logoColor=white"></a>
+  <a href="docs/adr/0006-rate-limiting-and-priority-scheduling.md"><img alt="Redis 7" src="https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white"></a>
+  <a href="api/openapi.yaml"><img alt="OpenAPI 3.1" src="https://img.shields.io/badge/OpenAPI-3.1-6BA539?logo=openapiinitiative&logoColor=white"></a>
+  <a href="#load-test-results"><img alt="Load test: 30k passed" src="https://img.shields.io/badge/load%20test-30k%20passed-2EA44F"></a>
+</p>
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/playground-dark.png">
+    <img alt="The playground at /playground: the live pipeline map, every channel delivering at 100 of 100 messages per second" src="docs/images/playground-light.png" width="900">
+  </picture>
+</p>
 
 ## Run it
 
@@ -120,3 +137,24 @@ make help        # every target: run a single role, infrastructure only, logs, .
 | [Capacity planning](docs/capacity-planning.md) | Back-of-the-envelope numbers |
 | [Requirements](docs/requirements.md) | The brief's requirements and where each is implemented |
 | [ADRs](docs/adr/) | Architecture decisions |
+
+## Load test results
+
+`make loadtest` sends 30 000 notifications (10 000 per channel) to the running stack in one burst,
+measures it and checks it against the [capacity plan](docs/capacity-planning.md#measured). Every
+check passes, with one API and one worker and with three of each (`make up-scaled`):
+
+| Check | Target | 1 API, 1 worker | 3 APIs, 3 workers | |
+|-------|--------|-----------------|-------------------|---|
+| Burst accepted by the API | ≥ 5 000/s | 27 000–40 000/s | 20 000–27 000/s | ✅ |
+| Delivery per channel | 100/s | 98.5–99.9/s | 97.5–99.6/s | ✅ |
+| 10 000 per channel drained | 100 s | 101–102 s | 101–103 s | ✅ |
+| Every notification sent, none lost | 30 000 | 30 000 | 30 000 | ✅ |
+| `high` priority, created to sent (p99) | < 1 s | 210–385 ms | 200–230 ms | ✅ |
+| `high` right behind the 30 000, p99 | < 1 s | 240–310 ms | 260–300 ms | ✅ |
+
+The rate limiter grants exactly 100 slots per second per channel, shared by every worker; the
+busiest second at the provider held 100 requests (101 now and then, from network jitter). Three replicas are not faster than one, because delivery is
+capped by that limit; they add fault tolerance. With one of three workers stopped in the middle
+of the drain, every notification was still sent in the same time.
+
