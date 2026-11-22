@@ -67,7 +67,8 @@ Kafka batch fetch → route by topic → priority heaps → aging scheduler → 
 - Kafka distributes work. Partition counts (6/6/3) size **throughput and parallelism only**;
   they are not a priority mechanism.
 - The application scheduler inside each worker is the **only** place where priority is
-  enforced. The dispatcher publishes due rows in FIFO order (ADR-0003).
+  enforced. The dispatcher publishes due rows in FIFO order (ADR-0003). (Phase 9: it takes due
+  `high` rows first, so they do not wait behind a burst; see the ADR-0003 amendment.)
 
 **Priority scheduling: capped aging (per channel, inside each worker)**
 - Fetched batches are routed by topic into one buffer per priority (high-water mark 50

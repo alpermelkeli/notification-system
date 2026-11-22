@@ -14,8 +14,8 @@ observability, the data model and scaling. The decisions themselves are in the [
 1. **API** validates the request, enforces `Idempotency-Key`, inserts the notification
    (`status=pending`) and returns `202 Accepted`. It never publishes work to Kafka; the
    dispatcher does.
-2. **Dispatcher** claims due rows (`FOR UPDATE SKIP LOCKED`, FIFO by `next_attempt_at`), publishes
-   them to Kafka and marks them `queued`. The same mechanism handles new, scheduled and retrying
+2. **Dispatcher** claims due rows (`FOR UPDATE SKIP LOCKED`, due `high` rows first, then FIFO by
+   `next_attempt_at`), publishes them to Kafka and marks them `queued`. The same mechanism handles new, scheduled and retrying
    notifications.
 3. **Kafka** carries claim-check messages on 9 work topics (`notifications.{channel}.{priority}`),
    plus `notifications.dlq` and `notification.events`.
@@ -172,7 +172,8 @@ Schema: [`migrations/`](../migrations) (goose, forward-only, embedded in the bin
   fenced by the `lease_token` of its claim. Racing transitions (a Kafka redelivery, a late worker
   whose lease was reaped and the row claimed again, a cancel during dispatch) have exactly one
   winner, and each of these races has an integration test.
-- Indexes: partial indexes on `next_attempt_at` (due work), `lease_until` (expired leases),
+- Indexes: partial indexes on `next_attempt_at` (due work, and due `high` work on its own),
+  `lease_until` (expired leases),
   `queued_at` (age fallback for `queued` rows) and `(channel, priority, kafka_partition,
   kafka_offset)` (queued rows behind the committed offset), `(status, id)` for filtered lists and
   `(batch_id, id)` for batches. Batches older than the retention are deleted by the same

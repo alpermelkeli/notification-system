@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -182,6 +183,48 @@ func TestDispatchOrderAndLimit(t *testing.T) {
 		if got[i] != ids[i] {
 			t.Fatalf("published %v, want the 3 oldest in FIFO order %v", got, ids[:3])
 		}
+	}
+}
+
+// TestDispatchTakesHighFirst checks that due high rows are published before older normal and
+// low rows, and that the rest still go in FIFO order after them.
+func TestDispatchTakesHighFirst(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	mk := func(p domain.Priority) string {
+		t.Helper()
+		in := sms("hi")
+		in.Priority = p
+		n, _, err := s.CreateNotification(ctx, in, Origin{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(2 * time.Millisecond) // distinct next_attempt_at
+		return n.ID.String()
+	}
+	low1, normal1, low2 := mk(domain.PriorityLow), mk(domain.PriorityNormal), mk(domain.PriorityLow)
+	high1, high2 := mk(domain.PriorityHigh), mk(domain.PriorityHigh)
+
+	publish := func(got *[]string) PublishFunc {
+		return func(_ context.Context, ns []domain.Notification) ([]KafkaPosition, error) {
+			for _, x := range ns {
+				*got = append(*got, x.ID.String())
+			}
+			return positions(ns), nil
+		}
+	}
+	var first, second []string
+	if _, err := s.DispatchDue(ctx, 3, publish(&first)); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{high1, high2, low1}; !slices.Equal(first, want) {
+		t.Errorf("first round published %v, want both high then the oldest other %v", first, want)
+	}
+	if _, err := s.DispatchDue(ctx, 3, publish(&second)); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{normal1, low2}; !slices.Equal(second, want) {
+		t.Errorf("second round published %v, want the rest in FIFO order %v", second, want)
 	}
 }
 

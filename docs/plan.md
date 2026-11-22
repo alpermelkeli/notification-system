@@ -40,6 +40,8 @@ Living document. Update phase status as work lands. Time budget ≈ 12h of focus
 | Observability | Per-role Prometheus registries; queue depth and consumer lag sampled by the dispatcher; the request's `traceparent` stored with the row and carried in Kafka headers, so one trace covers every attempt; trace ids in logs | [0009](adr/0009-observability.md) |
 | Templates (B-3) | Stored templates (`/v1/templates`), `{{name}}` substitution only, rendered and validated at creation; rows record `template_id` and `template_version` | [0010](adr/0010-templates.md) |
 | Status events and WebSocket (B-4) | Rows published best-effort to `notification.events` after each commit; every API instance reads all events without a group and fans them out to `/v1/ws` subscribers of notification and batch ids, with a snapshot on subscribe; `coder/websocket` | [0011](adr/0011-status-events-and-websocket.md) |
+| Rate limit at the provider (load test) | Sends leave a fixed 50 ms after their token, so the variable claim time cannot bunch them into one second | [0006 amendment](adr/0006-rate-limiting-and-priority-scheduling.md) |
+| `high` waiting behind a burst in the dispatcher (load test) | The dispatcher takes due `high` rows first (migration 00005 adds their partial index) | [0003 amendment](adr/0003-dispatch-without-separate-outbox.md) |
 | Readiness of multi-channel workers | `/readyz` checks every channel's Kafka client (`kafka-sms`, `kafka-email`, `kafka-push`) | [0009](adr/0009-observability.md) |
 
 ## Phase 9 progress
@@ -47,6 +49,9 @@ Living document. Update phase status as work lands. Time budget ≈ 12h of focus
   ADR-0011 amended.
 - README reduced to an overview; details moved to `docs/how-it-works.md`, `docs/api.md`,
   `docs/configuration.md` and `docs/testing.md`.
+- Load test (`make loadtest`) with measured values in `docs/capacity-planning.md`, run on one
+  and on three API and worker replicas, including a worker stopped mid-drain. It led to the two
+  amendments above.
 
 ## Phase 9 starting point
 Phase 8's review follow-ups on event ordering (`clock_timestamp()`) and browser origins

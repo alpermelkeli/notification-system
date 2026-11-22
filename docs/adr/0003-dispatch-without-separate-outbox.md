@@ -28,7 +28,7 @@ notifications when a schedule (B-2) or retry backoff (FR-3.1) becomes due.
 BEGIN;
 SELECT id, created_at, channel, priority, attempts, next_attempt_at, correlation_id FROM notifications
  WHERE status IN ('pending','retrying') AND next_attempt_at <= now()
- ORDER BY next_attempt_at          -- FIFO: priority is enforced only by the worker scheduler
+ ORDER BY next_attempt_at          -- FIFO (Phase 9: due `high` rows first, see the amendment)
  LIMIT 500
  FOR UPDATE SKIP LOCKED;
 -- publish batch to Kafka (idempotent producer, acks=all) and wait for acks
@@ -109,6 +109,32 @@ to the Kafka admin API.
   reaper recovered it.)
 - Each reaper step changes at most 1000 rows per statement and 10 statements per run; the next run
   continues after a mass failure.
+
+**Amendment (2026-11-22, Phase 9): due `high` rows are dispatched first.**
+
+*Measurement.* The load test (`make loadtest`) sends 30 000 `low` notifications, then 30 `high`
+SMS right behind them. The API accepted the burst in about 1 s; the dispatcher (two instances)
+published it in 1.5 to 3 s, at 10 000 to 21 000 rows per second, as the capacity plan expects.
+In FIFO order the first `high` notifications waited behind the burst: p99 1.1 to 1.6 s from
+created to sent with three workers, of which about 0.9 s was spent `pending`, against a target
+under 1 s. From `queued` to `sent` took p99 220 ms. "Publishing runs far above the delivery
+rate" holds on average, but not while the API accepts a burst faster than the dispatcher
+publishes.
+
+*Decision.* Each iteration first locks up to `DISPATCH_BATCH_SIZE` due `high` rows, then fills
+the rest of the batch with the other due rows, both in `next_attempt_at` order and with
+`FOR UPDATE SKIP LOCKED`. They are two statements, because PostgreSQL does not allow
+`FOR UPDATE` with `UNION`. Migration 00005 adds a partial index holding only due `high` rows
+(`notifications_due_high_idx`), so the first statement stays cheap however many `normal` and `low`
+rows wait after a burst. `normal` and `low` stay in FIFO order between themselves; ordering them
+is still the worker scheduler's job (ADR-0006).
+
+*Starvation.* `normal` and `low` wait only while more `high` rows are due than one batch holds,
+i.e. while `high` alone arrives faster than the dispatcher publishes (more than 10 000/s). The
+delivery limit of 100/s per channel would make such a backlog useless anyway.
+
+*Result* (same test): `high` behind the burst p99 239 ms with one worker and 259 ms with three;
+the wait for the dispatcher fell to p99 16 to 75 ms. The burst drained in the same time.
 
 ## Consequences
 - ✅ No dual write: the row *is* the publish intent, so it cannot be lost.
