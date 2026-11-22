@@ -50,15 +50,20 @@ event stream for status consumers (B-4). Kafka has no per-message priority.
     partitions it owns, which stays close to global only while each replica owns partitions of
     all three priority topics, i.e. while the replica count is at most the partition count;
   - how evenly work moves when a replica leaves, and how much is re-read after a crash (commits
-    advance per partition, so a slow record holds back only its own partition);
-  - room to grow: partitions can be added but never removed, and a higher provider quota or a
-    second provider (capacity plan, section 1) would need more replicas.
+    advance per partition, so a slow record holds back only its own partition).
 
-  All three priorities get the same count. `low` carries bulk traffic that needs less urgency,
-  not less parallelism, and urgency is the scheduler's job. With fewer `low` partitions, replicas
-  beyond that count would own no `low` partition and deliver only `high` and `normal`. Six lets
-  up to six replicas each own a share of every priority. `notifications.dlq` (audit and replay
-  only) has 3.
+  Fault tolerance does not depend on it: a replica in the group with no partition waits as a
+  standby and takes over in the rebalance when another leaves. Six divides evenly by 1, 2, 3 and
+  6, so the usual 1 to 3 replicas each own the same share of every priority topic, and every
+  replica sees every priority. All three priorities get the same count: `low` carries bulk
+  traffic that needs less urgency, not less parallelism, and urgency is the scheduler's job.
+  `notifications.dlq` (audit and replay only) has 3.
+
+  Work topics can be grown later without care: a new count moves keys to other partitions, but
+  nothing relies on per-key order there, since each record is a claim-check and the guarded claim
+  in PostgreSQL decides (ADR-0004). `notification.events` is different: it is keyed so that a
+  notification's events stay in order, so growing it can briefly reorder the events of
+  notifications in flight (clients can still order them by `at`).
 - **Work messages are claim-checks:** `{id, created_at, channel, priority, attempt, due_at}`
   (`created_at` enables partition pruning, ADR-0008) plus headers
   `correlation_id` and `traceparent`. The content is loaded from PostgreSQL inside the claim
