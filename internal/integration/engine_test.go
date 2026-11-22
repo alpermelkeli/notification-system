@@ -117,11 +117,7 @@ func createTopics(ctx context.Context) error {
 	}
 	for _, c := range domain.Channels {
 		for _, p := range domain.Priorities {
-			partitions := int32(6)
-			if p == domain.PriorityLow {
-				partitions = 3
-			}
-			resp, err := adm.CreateTopic(ctx, partitions, 1, nil, queue.Topic(c, p))
+			resp, err := adm.CreateTopic(ctx, 6, 1, nil, queue.Topic(c, p))
 			if err == nil {
 				err = resp.Err
 			}
