@@ -64,7 +64,7 @@ around our own capacity:
 Kafka batch fetch → route by topic → priority heaps → aging scheduler → Redis limiter → provider → DB outcome → watermark commit
    (distribute)                     (bounded, pause)   (prioritise)     (rate limit)
 ```
-- Kafka distributes work. Partition counts (6/6/3) size **throughput and parallelism only**;
+- Kafka distributes work. Partition counts (6/6/6) size **throughput and parallelism only**;
   they are not a priority mechanism.
 - The application scheduler inside each worker is where priority is enforced between records
   waiting to be sent. The dispatcher publishes due rows in FIFO order (ADR-0003); since Phase 9

@@ -33,14 +33,32 @@ event stream for status consumers (B-4). Kafka has no per-message priority.
 |-------|-------------------|-----|---------|
 | `notifications.{sms,email,push}.high` | 6 | notification id | Work: transactional traffic (OTP, alerts) |
 | `notifications.{sms,email,push}.normal` | 6 | notification id | Work: default traffic |
-| `notifications.{sms,email,push}.low` | 3 | notification id | Work: bulk / marketing |
+| `notifications.{sms,email,push}.low` | 6 | notification id | Work: bulk / marketing |
 | `notifications.dlq` | 3 | notification id | Terminally failed notifications (audit/replay) |
 | `notification.events` | 6 | notification id | Status-change events, ordered per notification |
 
 - Replication factor is 1 locally and 3 in production. Retention is 7 days. Topics are created
   by an init job in docker-compose.
-- **Partition counts size throughput and parallelism; they do not implement priority.**
-  Priority is enforced by the worker scheduler (ADR-0006).
+- **Partition counts size parallelism; they do not implement priority.** Priority is enforced
+  by the worker scheduler (ADR-0006).
+- **Why 6 partitions per work topic.** Delivery is capped by the shared Redis limiter at 100/s per
+  channel (ADR-0006), and one partition carries far more than that, so the count adds no
+  throughput. It sets:
+  - how many worker replicas can share a topic: a partition is read by one group member at a
+    time, so with N partitions at most N replicas get work from that topic;
+  - whether every replica sees every priority: priority is applied inside each replica over the
+    partitions it owns, which stays close to global only while each replica owns partitions of
+    all three priority topics, i.e. while the replica count is at most the partition count;
+  - how evenly work moves when a replica leaves, and how much is re-read after a crash (commits
+    advance per partition, so a slow record holds back only its own partition);
+  - room to grow: partitions can be added but never removed, and a higher provider quota or a
+    second provider (capacity plan, section 1) would need more replicas.
+
+  All three priorities get the same count. `low` carries bulk traffic that needs less urgency,
+  not less parallelism, and urgency is the scheduler's job. With fewer `low` partitions, replicas
+  beyond that count would own no `low` partition and deliver only `high` and `normal`. Six lets
+  up to six replicas each own a share of every priority. `notifications.dlq` (audit and replay
+  only) has 3.
 - **Work messages are claim-checks:** `{id, created_at, channel, priority, attempt, due_at}`
   (`created_at` enables partition pruning, ADR-0008) plus headers
   `correlation_id` and `traceparent`. The content is loaded from PostgreSQL inside the claim
@@ -48,9 +66,9 @@ event stream for status consumers (B-4). Kafka has no per-message priority.
 - **Producer:** idempotent producer, `acks=all`.
 - **Consumers:** one consumer group per channel (`workers.sms`, `workers.email`,
   `workers.push`), subscribing to that channel's three priority topics. Kafka distributes the
-  channel's partitions (6 + 6 + 3 = 15) across all worker replicas in the group and rebalances
-  them when replicas join or leave. Example: with 3 SMS worker replicas, each owns about 5 SMS
-  partitions. The range assignor splits *each topic* across members, so every replica owns
+  channel's partitions (6 + 6 + 6 = 18) across all worker replicas in the group and rebalances
+  them when replicas join or leave. Example: with 3 SMS worker replicas, each owns 6 SMS
+  partitions, 2 of each priority. The range assignor splits *each topic* across members, so every replica owns
   partitions from all three priorities (as long as there are no more replicas than a topic's
   partition count) and can apply priority locally.
 

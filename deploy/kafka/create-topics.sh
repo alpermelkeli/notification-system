@@ -16,7 +16,7 @@ create() { # name partitions
 for channel in sms email push; do
   create "notifications.${channel}.high" 6
   create "notifications.${channel}.normal" 6
-  create "notifications.${channel}.low" 3
+  create "notifications.${channel}.low" 6
 done
 create notifications.dlq 3
 create notification.events 6

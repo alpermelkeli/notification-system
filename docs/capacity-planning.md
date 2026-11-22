@@ -115,7 +115,7 @@ sends). A retry storm reduces *goodput*, not safety.
 | Message rate (work + events) at ceiling | ~300 + ~1 200 msg/s, trivial for Kafka |
 
 A 3-broker cluster with modest disks (≥ 500 GB each) has ample headroom. Partition counts
-(6/6/3 per channel) are sized for consumer parallelism, not for throughput.
+(6/6/6 per channel) are sized for consumer parallelism, not for throughput.
 
 ## 6. Worker concurrency (Little's law)
 
