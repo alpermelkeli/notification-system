@@ -3,7 +3,7 @@
 Guidance for Claude Code (and other agents) working in this repository.
 
 ## Project
-Event-driven, multi-channel (SMS / Email / Push) notification system in **Go** — Insider One
+Event-driven, multi-channel (SMS / Email / Push) notification system in **Go** — a
 Software Engineer Assessment 2026. Goal: production-quality design and code within ~12h of work,
 judged on architecture, reliability, code quality, tests, docs and **commit history**.
 
