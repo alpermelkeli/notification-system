@@ -1,8 +1,8 @@
 # Capacity planning
 
 Back-of-the-envelope estimates that justify the architecture (ADR-0001) and the scaling
-strategy (ADR-0008). Numbers are deliberately rounded. They will be checked against a load test
-in Phase 9, and measured values will be added next to them.
+strategy (ADR-0008). Numbers are deliberately rounded. The load test (`make loadtest`) checked
+them in Phase 9; the results are under [Measured](#measured).
 
 ## 1. The throughput ceiling is set by the provider, not by us
 
@@ -172,3 +172,31 @@ This is far above the delivery ceiling. Run 2 instances for availability, not fo
 | Scheduler + rate-limit token | ≤ 10 ms |
 | Provider call | ~200 ms (p50) |
 | **End-to-end** | **≈ 300 ms p50, target < 1 s p99** |
+
+## Measured
+
+`make loadtest` ([Testing](testing.md#load-test)) on a laptop (Apple Silicon, Docker Desktop),
+against the compose stack and the mock provider (50–150 ms latency instead of the 200 ms assumed
+above): 30 000 `low` notifications, 10 000 per channel, in 30 batches of 1000, 4 at a time.
+
+| Estimate | Planned | Measured: 1 API, 1 worker | Measured: 3 APIs, 3 workers |
+|----------|---------|---------------------------|-----------------------------|
+| Ingestion (§2) | ≥ 5 000/s | 27 000–40 000/s | 20 000–23 000/s |
+| Dispatcher (§8, 2 instances) | 10 000–25 000 rows/s | 18 000–21 000 rows/s | 10 000–14 000 rows/s |
+| Delivery per channel (§1) | 100/s | 98.7–99.3/s | 98.7–99.0/s |
+| Busiest second at the provider | ≤ 100 | 100–101 | 100–101 |
+| Drain of 10 000 per channel (§1) | 100 s | 101–102 s | 102 s |
+| `high`, no backlog, p50 / p99 (§10) | ≈ 300 ms / < 1 s | 160 / 215 ms | 170 / 210–230 ms |
+| `high` right behind the burst, p99 (§1, §10) | < 1 s | 670–850 ms | 1.1–1.6 s |
+
+- **Rate limit.** The first run showed 102–103 requests in one second at the provider while the
+  limiter granted exactly 100 per second; the variable claim time between token and send bunched
+  the sends. Sends now leave at a fixed offset after their token ([ADR-0006](adr/0006-rate-limiting-and-priority-scheduling.md),
+  Phase 9 amendment). A second at 101 remains now and then (jitter on the HTTP path).
+- **Scaling.** Three workers deliver no faster than one (§6): extra replicas add fault
+  tolerance. With one of three workers stopped 45 s into the drain, every notification was still
+  sent, the rate stayed at the limit and the drain took the same 102 s.
+- **`high` behind a burst.** Almost all of that latency is the wait for the dispatcher (p99
+  900 ms of 1.1 s); from `queued` to `sent` takes p99 220 ms. The API accepted the burst faster
+  than the dispatcher publishes, and the dispatcher works in FIFO order (ADR-0003), so a `high`
+  notification created right after the burst waits behind it.

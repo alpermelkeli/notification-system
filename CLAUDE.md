@@ -49,6 +49,7 @@ make run-api       # also run-dispatcher, run-worker, run-mockprovider
 make test          # go test -race ./... (must be green before every commit)
 make test-short    # unit tests only, no Docker (storage integration tests are skipped)
 make lint          # golangci-lint v2 (.golangci.yml)
+make loadtest      # load-test the running stack (`make up` or `make up-scaled` first)
 make down / clean  # stop / stop and delete volumes
 ```
 
@@ -56,6 +57,7 @@ make down / clean  # stop / stop and delete volumes
 ```
 cmd/notifier/          single binary; subcommands api | dispatcher | worker | migrate | healthcheck | version
 cmd/mockprovider/      local fake of webhook.site (fault injection, /stats)
+cmd/loadtest/          load test of a running stack against the capacity plan (`make loadtest`)
 internal/app/          role wiring (RunAPI, RunDispatcher, RunWorker, RunMigrate), shared router, graceful HTTP server
 internal/domain/       channels, priorities, status state machine, templates, UUIDv7 ids, domain errors (no I/O)
 internal/storage/      PostgreSQL repository: create/batch/idempotency, guarded transitions, list, partitions
