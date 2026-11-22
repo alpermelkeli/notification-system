@@ -26,7 +26,7 @@ teams and API consumers.
 |----|-------------|--------|-------|
 | FR-2.1 | Async processing via queue workers | [x] | `internal/dispatcher` (relay, reaper), `internal/worker`, `internal/integration` |
 | FR-2.2 | Rate limit: max **100 msg/s per channel** | [x] | `internal/ratelimit` (reserving GCRA in Redis, shared by all workers), measured in compose |
-| FR-2.3 | Priority queues: high / normal / low | [x] | 9 channel × priority topics, `internal/worker/scheduler.go` (capped aging + minimum share) |
+| FR-2.3 | Priority queues: high / normal / low | [x] | 9 channel × priority topics, `internal/worker/scheduler.go` (capped aging + minimum share), due `high` dispatched first (`DispatchDue` in `internal/storage/transitions.go`) |
 | FR-2.4 | Content validation (char limits, required fields) | [x] | `internal/domain/validate.go` (per-channel rules), `internal/api/request.go` |
 | FR-2.5 | Idempotency — no duplicate sends | [x] | `Idempotency-Key` in `internal/api`, `internal/storage/idempotency.go`, guarded + fenced `Claim`, provider `Idempotency-Key` header (`internal/provider`) |
 
