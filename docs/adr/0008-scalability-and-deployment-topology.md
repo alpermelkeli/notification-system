@@ -60,7 +60,7 @@ locally.
   ```bash
   docker compose up --build --scale api=3 --scale worker=3
   ```
-  The README shows requests being spread across API replicas (`X-Instance-ID` response header)
+  `docs/how-it-works.md` shows requests being spread across API replicas (`X-Instance-ID` response header)
   and Kafka partitions being split among workers (per-instance metrics), while total sends stay
   at ≤ 100 msg/s per channel.
 - Production manifests (Kubernetes HPA/KEDA) are **documented, not shipped.** They are out of

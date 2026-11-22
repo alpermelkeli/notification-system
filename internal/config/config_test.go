@@ -255,3 +255,28 @@ func TestLoadWebSocketOrigins(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadDemo(t *testing.T) {
+	cfg, err := load(env(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Demo != (Demo{}) {
+		t.Errorf("the playground must be off by default: %+v", cfg.Demo)
+	}
+	cfg, err = load(env(map[string]string{
+		"DEMO_ENABLED": "true", "DEMO_PROMETHEUS_URL": "http://prometheus:9090",
+		"DEMO_PROVIDER_ADMIN_URL": "http://mockprovider:8081",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Demo{Enabled: true, PrometheusURL: "http://prometheus:9090", ProviderAdminURL: "http://mockprovider:8081"}
+	if cfg.Demo != want {
+		t.Errorf("Demo = %+v, want %+v", cfg.Demo, want)
+	}
+	_, err = load(env(map[string]string{"DEMO_ENABLED": "yes please", "DEMO_PROMETHEUS_URL": "prometheus:9090"}))
+	if err == nil || !strings.Contains(err.Error(), "DEMO_ENABLED") || !strings.Contains(err.Error(), "DEMO_PROMETHEUS_URL") {
+		t.Errorf("invalid demo settings: %v", err)
+	}
+}

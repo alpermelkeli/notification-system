@@ -42,6 +42,12 @@ Living document. Update phase status as work lands. Time budget ≈ 12h of focus
 | Status events and WebSocket (B-4) | Rows published best-effort to `notification.events` after each commit; every API instance reads all events without a group and fans them out to `/v1/ws` subscribers of notification and batch ids, with a snapshot on subscribe; `coder/websocket` | [0011](adr/0011-status-events-and-websocket.md) |
 | Readiness of multi-channel workers | `/readyz` checks every channel's Kafka client (`kafka-sms`, `kafka-email`, `kafka-push`) | [0009](adr/0009-observability.md) |
 
+## Phase 9 progress
+- `/playground`: live pipeline map, step-by-step narration and ten self-checking scenarios;
+  ADR-0011 amended.
+- README reduced to an overview; details moved to `docs/how-it-works.md`, `docs/api.md`,
+  `docs/configuration.md` and `docs/testing.md`.
+
 ## Phase 9 starting point
 Phase 8's review follow-ups on event ordering (`clock_timestamp()`) and browser origins
 (`WS_ALLOWED_ORIGINS`) are done. One remains, not blocking: item keys of a batch sent without a

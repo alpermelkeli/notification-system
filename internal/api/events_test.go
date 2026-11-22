@@ -109,4 +109,5 @@ func TestWebSocketRouteAndDemoPage(t *testing.T) {
 		!strings.Contains(res.Body.String(), "/v1/ws") {
 		t.Errorf("demo page: CSP %q", csp)
 	}
+
 }

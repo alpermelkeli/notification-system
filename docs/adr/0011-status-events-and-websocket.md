@@ -108,7 +108,7 @@ response body that follows may echo the recipient; the REST API shows the full e
   - a ping every 30 s, from its own goroutine, detects dead peers. The reader only reads, so
     pongs are processed even while a request is handled.
 - **Origin:** browsers connect from the API's own origin, the library's default, which serves the
-  demo page at `/ws-demo`. `WS_ALLOWED_ORIGINS` adds origins as host patterns
+  demo page at `/ws-demo` and the playground at `/playground` (see the amendment below). `WS_ALLOWED_ORIGINS` adds origins as host patterns
   (`*.example.com`) or with a scheme (`https://app.example.com`), matched against the origin's
   host and non-default port; `*.example.com` excludes the apex. Patterns that could never match
   (a path, another scheme) or that allow every site (`*`) stop the process. It is needed when a proxy in
@@ -121,6 +121,34 @@ response body that follows may echo the recipient; the REST API shows the full e
   and HTTP metrics middleware; it has its own metrics: `notifier_ws_connections`,
   `notifier_ws_messages_total{type}`, `notifier_ws_disconnects_total{reason}` and
   `notifier_ws_events_received_total`.
+
+**Amendment (2026-11-21, Phase 9): the playground, next to `/ws-demo`.**
+- `/ws-demo`, the demo page of this ADR, stays as it is and is always served. The playground
+  is an extra, off by default.
+- `/playground` draws the pipeline as a map (API, PostgreSQL, dispatcher, the Kafka topics of
+  each channel, workers, rate limiters, provider, the failure track) and moves each followed
+  notification along it as its status events arrive. A panel narrates each status change of the
+  selected notification from `/v1/notifications/{id}/history`, and scenarios (a single send, a
+  burst of 1000, priority, scheduling, templates, cancel, idempotency, retry, outage, dead letter
+  and replay) run against the live system and check their result.
+- It is a local demo, served only when `DEMO_ENABLED=true` (compose sets it; the default is off),
+  because anyone who can open it can create load and change the mock provider's faults.
+- The browser can reach only the API. Two JSON endpoints outside `/v1` fill the gaps:
+  `/playground/api/stats` runs a fixed set of PromQL queries against `DEMO_PROMETHEUS_URL` and
+  caches the summary for a second; `/playground/api/faults` forwards to the mock provider's new
+  `GET`/`PUT /admin/faults` at `DEMO_PROVIDER_ADMIN_URL`. They are not part of the public API
+  contract, so they are not in the OpenAPI spec. Upstream failures are answered with 500 or 504,
+  never 502 or 503, which nginx would count against the API replica. The failure scenarios are
+  turned off when `PROVIDER_URL` is not on the mock provider's host, and the page resets the
+  faults to 0 when a scenario ends or the page is closed during one.
+- The page follows a batch through the ids it draws (at most 80), not the batch id: the
+  dispatcher publishes a batch of 1000 within milliseconds, more than the 256 events a
+  connection may queue. It resubscribes only unfinished ids after a reconnect and paces its
+  subscribe messages under the 10 per second limit.
+- The page is plain JavaScript and hand-written SVG embedded with `go:embed`, under a CSP that
+  allows only its own files (`'self'`). No JavaScript library is added. Inter and JetBrains Mono
+  are vendored as woff2 files with their SIL Open Font License texts; they are fonts, not code,
+  and need no change to ADR-0007.
 
 ## Consequences
 - ✅ Any instance serves any client. Scaling the API needs no sticky sessions, and losing an

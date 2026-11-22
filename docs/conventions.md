@@ -7,7 +7,7 @@
 - `context.Context` is the first parameter of anything doing I/O; respect cancellation and deadlines.
 - Errors: wrap with `fmt.Errorf("doing x: %w", err)`; define sentinel / typed errors in the domain; map to HTTP status only at the transport layer.
 - Logging: `log/slog` JSON handler; every log line in a request/job carries `correlation_id`. Never log secrets or full message content at info level.
-- Config: environment variables only, parsed once at startup into a typed struct; document every variable in README + `.env.example`.
+- Config: environment variables only, parsed once at startup into a typed struct; document every variable in `docs/configuration.md` + `.env.example`.
 - Graceful shutdown on SIGINT/SIGTERM for HTTP server and workers.
 
 ## Testing
@@ -33,4 +33,4 @@
 
 ## Architecture decisions
 - Every significant decision gets an ADR in `docs/adr/NNNN-title.md` using `0000-template.md`.
-- The README "Architecture" and "Design decisions" sections summarize accepted ADRs.
+- The README's "How it works" section summarizes the key ADRs; `docs/how-it-works.md` lists them all.

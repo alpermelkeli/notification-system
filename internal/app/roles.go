@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"sync"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -19,6 +21,7 @@ import (
 	"github.com/alpermelkeli/notification-system/internal/health"
 	"github.com/alpermelkeli/notification-system/internal/metrics"
 	"github.com/alpermelkeli/notification-system/internal/platform"
+	"github.com/alpermelkeli/notification-system/internal/playground"
 	"github.com/alpermelkeli/notification-system/internal/provider"
 	"github.com/alpermelkeli/notification-system/internal/queue"
 	"github.com/alpermelkeli/notification-system/internal/ratelimit"
@@ -93,6 +96,7 @@ func RunAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		Events:    events.NewPublisher(eventClient, metrics.NewEvents(reg), logger),
 		WebSocket: ws.NewHandler(hub, store, logger, ws.HandlerOptions{AllowedOrigins: cfg.WSAllowedOrigins}),
 	}).Routes(router)
+	mountPlayground(router, cfg, logger)
 
 	var wg sync.WaitGroup
 	defer wg.Wait() // the consumer loop uses the client, which an earlier defer closes
@@ -311,4 +315,30 @@ func serveAdmin(ctx context.Context, cfg config.Config, logger *slog.Logger, che
 		return fmt.Errorf("admin server: %w", err)
 	}
 	return nil
+}
+
+// mountPlayground serves /playground when DEMO_ENABLED is set (ADR-0011). The failure scenarios
+// change the mock provider's faults, so they are turned off when the workers deliver somewhere
+// else (PROVIDER_URL on another host): the faults would not affect delivery, and the scenarios
+// would wait for failures that never come.
+func mountPlayground(r chi.Router, cfg config.Config, logger *slog.Logger) {
+	if !cfg.Demo.Enabled {
+		return
+	}
+	admin := cfg.Demo.ProviderAdminURL
+	if admin != "" && hostOf(admin) != hostOf(cfg.Worker.ProviderURL) {
+		logger.Warn("playground failure scenarios off: PROVIDER_URL is not the mock provider",
+			"provider_host", hostOf(cfg.Worker.ProviderURL), "admin_host", hostOf(admin))
+		admin = ""
+	}
+	playground.New(logger, playground.Options{PrometheusURL: cfg.Demo.PrometheusURL, ProviderAdminURL: admin}).Routes(r)
+	logger.Info("playground enabled", "path", playground.PathPage)
+}
+
+func hostOf(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return u.Host
 }

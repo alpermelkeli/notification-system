@@ -17,6 +17,7 @@ import (
 	"github.com/alpermelkeli/notification-system/internal/health"
 	"github.com/alpermelkeli/notification-system/internal/httpx"
 	"github.com/alpermelkeli/notification-system/internal/metrics"
+	"github.com/alpermelkeli/notification-system/internal/playground"
 	"github.com/alpermelkeli/notification-system/internal/telemetry"
 )
 
@@ -40,13 +41,15 @@ func baseRouter(logger *slog.Logger, instance string, checks []health.Check, reg
 	r := chi.NewRouter()
 	// Order matters: the correlation ID must exist before anything logs or traces, the span
 	// before the request log (so the log line carries the trace id), and the recoverer sits
-	// inside the request logger so a recovered panic is logged as a 500.
+	// inside the request logger so a recovered panic is logged as a 500. The playground's stats
+	// endpoint is polled every 2 s by each open page; like the probes, it gets no span, request
+	// log or HTTP metrics, so it does not drown the real traffic.
 	r.Use(
 		httpx.CorrelationID,
 		httpx.InstanceID(instance),
-		telemetry.HTTPMiddleware(pathLiveness, pathReadiness, pathMetrics, pathWebSocket),
-		m.Middleware(pathWebSocket),
-		httpx.RequestLogger(logger, pathLiveness, pathReadiness, pathMetrics),
+		telemetry.HTTPMiddleware(pathLiveness, pathReadiness, pathMetrics, pathWebSocket, playground.PathStats),
+		m.Middleware(pathWebSocket, playground.PathStats),
+		httpx.RequestLogger(logger, pathLiveness, pathReadiness, pathMetrics, playground.PathStats),
 		httpx.Recoverer(logger),
 	)
 	r.NotFound(func(w http.ResponseWriter, _ *http.Request) {
