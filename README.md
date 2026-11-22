@@ -85,10 +85,17 @@ curl -XPOST localhost:8080/v1/notifications/batch -H 'Content-Type: application/
     {"recipient":"user@example.com","channel":"email","content":"Flash sale!","priority":"low"},
     {"recipient":"fcm-token-123456","channel":"push","content":"Flash sale!","priority":"low"}]}'
 curl localhost:8080/v1/batches/<batchId>
+
+# Follow status changes live over WebSocket (or open http://localhost:8080/ws-demo)
+websocat ws://localhost:8080/v1/ws
+{"type":"subscribe","notificationIds":["<id>"],"batchIds":["<batchId>"]}
+# {"type":"status","snapshot":true,"event":{"notificationId":"<id>","status":"queued",...}}
+# {"type":"status","event":{"notificationId":"<id>","status":"sent","attempts":1,...}}
 ```
 
-Every endpoint, scheduling, templates and the WebSocket protocol: [API guide](docs/api.md) and
-[`api/openapi.yaml`](api/openapi.yaml).
+Every endpoint, scheduling and templates: [API guide](docs/api.md) and
+[`api/openapi.yaml`](api/openapi.yaml). The WebSocket protocol and its limits:
+[How it works](docs/how-it-works.md#live-status-updates).
 
 ## Develop and test
 
