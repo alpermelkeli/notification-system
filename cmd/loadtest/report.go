@@ -83,7 +83,8 @@ func (r report) print(w io.Writer) bool {
 
 	if !r.queued.IsZero() {
 		d := r.queued.Sub(r.burst.start)
-		fmt.Fprintf(w, "  dispatcher published the whole burst to Kafka %.1f s after it started: %.0f per second or more\n",
+		// A lower bound: the time includes the ingestion, which the dispatcher cannot outrun.
+		fmt.Fprintf(w, "  dispatcher had published the whole burst %.1f s after it started: at least %.0f per second\n",
 			d.Seconds(), float64(r.burst.accepted)/d.Seconds())
 	}
 

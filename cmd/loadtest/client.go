@@ -113,6 +113,19 @@ func (c *client) preflight(ctx context.Context) error {
 	if f.FailureRate+f.RateLimitRate+f.PermanentRate > 0 {
 		return fmt.Errorf("the mock provider is injecting faults (%+v); restore it first", f)
 	}
+	// A backlog left by an earlier, interrupted run would distort every measurement.
+	for _, st := range []string{"pending", "queued", "processing", "retrying"} {
+		var page struct {
+			Items []notification `json:"items"`
+		}
+		q := url.Values{"status": {st}, "limit": {"1"}}
+		if err := c.do(ctx, http.MethodGet, c.api+"/v1/notifications?"+q.Encode(), nil, http.StatusOK, &page); err != nil {
+			return err
+		}
+		if len(page.Items) > 0 {
+			return fmt.Errorf("notifications are still %s (an earlier run?); wait until they finish", st)
+		}
+	}
 	return nil
 }
 
@@ -270,6 +283,15 @@ func (c *client) providerStats(ctx context.Context) (providerStats, error) {
 	var s providerStats
 	err := c.do(ctx, http.MethodGet, c.provider+"/stats", nil, http.StatusOK, &s)
 	return s, err
+}
+
+// acceptedSince sums the 202 answers given after before was taken.
+func (s providerStats) acceptedSince(before providerStats) int64 {
+	var n int64
+	for ch, v := range s.Accepted {
+		n += v - before.Accepted[ch]
+	}
+	return n
 }
 
 // rejectedSince sums the simulated 429 and 500 answers given after before was taken.

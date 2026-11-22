@@ -34,6 +34,7 @@ and binary frames.
 The worker engine (scheduler, watermarks, backpressure, rebalance, shutdown, outcome policy,
 circuit breaker, claim retry during a database outage) is unit-tested with fakes, without Kafka,
 including the metrics it records and the span tree of a delivery.
+
 ## Load test
 
 ```bash
@@ -42,14 +43,17 @@ make loadtest    # go run ./cmd/loadtest -h lists the flags (size, concurrency, 
 ```
 [`cmd/loadtest`](../cmd/loadtest) drives the running stack through the public API and checks it
 against the [capacity plan](capacity-planning.md). It refuses to start unless the mock provider
-answers with no faults, so it never sends to webhook.site. In order:
+answers with no faults and no earlier notifications are still in flight. It sends the burst only
+after the mock provider has received the first probes, so a stack whose `PROVIDER_URL` points at
+webhook.site gets those few probes, never the burst. In order:
 1. 30 `high` notifications, 10 per second, with nothing else in the system: created-to-sent
    latency.
 2. A burst of 30 000 `low` notifications in batches of 1000, 4 requests at a time, spread over
-   the three channels: how fast the API accepts them, and when the dispatcher has published them.
+   the three channels: how fast the API accepts them, and when the dispatcher has published them
+   (a lower bound of its rate, since it cannot publish faster than the API accepts).
 3. 30 `high` SMS, 2 per second, right behind the burst: the same latency, split into the wait for
    the dispatcher and queued to sent.
-4. The burst drains. Twice a second the test reads the requests the mock provider received in the
+4. The burst drains. From before the burst, twice a second, the test reads the requests the mock provider received in the
    last wall-clock second, per channel, and at the end it lists every notification for the drain
    rate.
 

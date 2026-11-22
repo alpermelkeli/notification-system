@@ -120,12 +120,14 @@ A 3-broker cluster with modest disks (≥ 500 GB each) has ample headroom. Parti
 ## 6. Worker concurrency (Little's law)
 
 ```
-in-flight requests = arrival rate × latency
-                   = 100 msg/s × 0.2 s (p50 provider latency)  = 20
-                   = 100 msg/s × 1.0 s (p99 provider latency)  = 100
+in-flight sends = arrival rate × time a sender is held
+                = 100 msg/s × (0.05 s send offset + 0.2 s p50 provider + ~0.01 s claim/write) ≈ 26
+                = 100 msg/s × (0.05 s + 1.0 s p99 provider + ~0.01 s)                        ≈ 106
 ```
-- The default sender pool is 20 per channel (ADR-0006). Size it as `rate × p99 latency` for a
-  slow provider. It is configurable.
+- A sender is held from the claim to the outcome write, including the fixed 50 ms between the
+  rate-limit token and the send (ADR-0006, Phase 9 amendment). The default pool is 32 per
+  channel, some headroom over 26. Size it for p99 latency for a slow provider; it is
+  configurable (`WORKER_CONCURRENCY`).
 - One worker replica per channel can sustain the full 100 msg/s. Extra replicas add **fault
   tolerance**, not throughput.
 
@@ -182,13 +184,16 @@ above): 30 000 `low` notifications, 10 000 per channel, in 30 batches of 1000, 4
 | Estimate | Planned | Measured: 1 API, 1 worker | Measured: 3 APIs, 3 workers |
 |----------|---------|---------------------------|-----------------------------|
 | Ingestion (§2) | ≥ 5 000/s | 27 000–40 000/s | 20 000–27 000/s |
-| Dispatcher (§8, 2 instances) | 10 000–25 000 rows/s | 16 000–21 000 rows/s | 10 000–14 000 rows/s |
-| Delivery per channel (§1) | 100/s | 98.5–99.3/s | 98.7–99.6/s |
+| Dispatcher (§8, 2 instances), lower bound | 10 000–25 000 rows/s | ≥ 14 000–21 000 rows/s | ≥ 10 000–14 000 rows/s |
+| Delivery per channel (§1) | 100/s | 98.5–99.9/s | 97.5–99.6/s |
 | Busiest second at the provider | ≤ 100 | 100–101 | 100–101 |
-| Drain of 10 000 per channel (§1) | 100 s | 101–102 s | 101–102 s |
-| `high`, no backlog, p50 / p99 (§10) | ≈ 300 ms / < 1 s | 145–160 / 210 ms | 160–170 / 210–230 ms |
-| `high` right behind the burst, p99 (§1, §10) | < 1 s | 240 ms | 260 ms |
+| Drain of 10 000 per channel (§1) | 100 s | 101–102 s | 101–103 s |
+| `high`, no backlog, p50 / p99 (§10) | ≈ 300 ms / < 1 s | 145–170 / 210–385 ms | 160–176 / 200–230 ms |
+| `high` right behind the burst, p99 (§1, §10) | < 1 s | 240–310 ms | 260–300 ms |
 
+- **Dispatcher.** Measured as the burst size over the time from the first batch request to the
+  last `queued_at`. That time includes the ingestion, which the dispatcher cannot outrun, so the
+  figure is a lower bound of its rate.
 - **Rate limit.** The first run showed 102–103 requests in one second at the provider while the
   limiter granted exactly 100 per second; the variable claim time between token and send bunched
   the sends. Sends now leave at a fixed offset after their token ([ADR-0006](adr/0006-rate-limiting-and-priority-scheduling.md),

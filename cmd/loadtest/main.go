@@ -3,9 +3,10 @@
 // rate limit while the burst drains, how fast it drains, and how long a high-priority
 // notification takes with and without a backlog in front of it.
 //
-// It talks only to the public API and to the mock provider's /stats and /admin/faults, and it
-// refuses to start unless the mock provider answers with no faults, so it never sends to
-// webhook.site.
+// It talks only to the public API and to the mock provider's /stats and /admin/faults. It refuses
+// to start unless the mock provider answers with no faults and no earlier notifications are still
+// in flight, and it sends the burst only after the mock provider has received the first probes,
+// so a stack whose PROVIDER_URL points at webhook.site gets a few probes, never the burst.
 //
 // Usage:
 //
@@ -94,30 +95,43 @@ func run(ctx context.Context, cfg config, out io.Writer) (bool, error) {
 		cfg.total, cfg.batchSize, cfg.concurrency, cfg.limit)
 
 	fmt.Fprintf(out, "1/4 High priority, no backlog: %d notifications, 10 per second\n", cfg.probes)
+	start, err := c.providerStats(ctx)
+	if err != nil {
+		return false, err
+	}
 	idle, err := c.probe(ctx, cfg.probes, 100*time.Millisecond, channels)
 	if err != nil {
 		return false, fmt.Errorf("probe without backlog: %w", err)
 	}
-
-	fmt.Fprintf(out, "2/4 Burst: sending %d low-priority notifications\n", cfg.total)
+	// Only the burst is large; check with the probes that the workers deliver to this mock
+	// provider and not to a PROVIDER_URL set elsewhere (webhook.site).
 	before, err := c.providerStats(ctx)
 	if err != nil {
 		return false, err
 	}
+	if got := before.acceptedSince(start); got < int64(len(idle.latencies)) {
+		return false, fmt.Errorf("the mock provider accepted %d of the %d probes; the workers deliver somewhere else (check PROVIDER_URL), so the burst is not sent",
+			got, len(idle.latencies))
+	}
+
+	// The rate watch starts before the burst: workers send as soon as its first batch is
+	// dispatched.
+	watchCtx, stopWatch := context.WithCancel(ctx)
+	defer stopWatch()
+	watched := make(chan rateWatch, 1)
+	go func() { watched <- c.watchRates(watchCtx, 500*time.Millisecond) }()
+
+	fmt.Fprintf(out, "2/4 Burst: sending %d low-priority notifications\n", cfg.total)
 	burst, err := c.burst(ctx, cfg)
 	if err != nil {
 		return false, fmt.Errorf("burst: %w", err)
 	}
 
-	// The probe and the rate watch run while the burst drains.
+	// The probe runs while the burst drains.
 	fmt.Fprintf(out, "3/4 High priority behind the backlog: %d SMS, 2 per second\n", cfg.probes)
-	watchCtx, stopWatch := context.WithCancel(ctx)
-	watched := make(chan rateWatch, 1)
-	go func() { watched <- c.watchRates(watchCtx, 500*time.Millisecond) }()
 
 	busy, err := c.probe(ctx, cfg.probes, 500*time.Millisecond, []string{"sms"})
 	if err != nil {
-		stopWatch()
 		return false, fmt.Errorf("probe behind the backlog: %w", err)
 	}
 
