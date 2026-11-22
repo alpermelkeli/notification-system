@@ -47,8 +47,10 @@ observability, the data model and scaling. The decisions themselves are in the [
   notification id as `Idempotency-Key`, and persists the outcome. Offsets are committed per
   partition up to the highest contiguous finished record.
 - **Rate limiter** ([`internal/ratelimit`](../internal/ratelimit)): a reserving GCRA in Redis. Each send
-  atomically reserves the channel's next 10 ms slot, shared by all replicas. A `429` sets a
-  fleet-wide cool-down. If Redis is down nothing is sent (fail closed).
+  atomically reserves the channel's next 10 ms slot, shared by all replicas. The send leaves a
+  fixed 50 ms after its slot, so the claim in between, which takes a variable time, cannot bunch
+  sends at the provider. A `429` sets a fleet-wide cool-down. If Redis is down nothing is sent
+  (fail closed).
 - Measured on the compose stack (1000 `low` SMS, then 100 `high`): all 1100 sent in 11.1 s with one
   worker and 11.4 s with three (the floor at 100/s is 11.0 s). The provider never saw more than 100
   SMS in a second, and the 100 `high` were delivered within 1.4 s despite the backlog.
